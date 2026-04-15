@@ -4,63 +4,45 @@ All notable changes to Grafeo, for future reference (and enjoyment).
 
 ## [0.5.39] - Unreleased
 
-Smarter Block-STM conflict partitioning. Runtime metrics with Prometheus export. Push-based vectorized execution for filter, sort, aggregate, limit, and distinct queries. AES-256-GCM encryption at rest.
+Block-STM conflict partitioning, push-based query execution, AES-256-GCM encryption at rest, runtime metrics with Prometheus export, and a writable layered compact store.
 
 ### Added
 
-- **Block-STM conflict partitioning**: re-execution groups conflicting transactions into clusters via union-find, enabling parallel re-execution of disjoint conflict sets.
-- **Encryption at rest** (`encryption` feature): AES-256-GCM for WAL records and `.grafeo` sections. Password-based (Argon2id) or raw-key setup. Counter-based nonces tied to file offsets for crash-safe uniqueness. Zero overhead when disabled.
-- **Push-based pipeline execution**: queries with filter, sort, aggregate, limit, or distinct now execute through a push-based pipeline instead of the Volcano pull loop, reducing per-row overhead on analytical workloads.
-- **Runtime metrics**: query, transaction, session, cache, and GC counters with Prometheus text export. Python `db.metrics()` / `db.metrics_prometheus()` and Node.js equivalents (requires `metrics` feature).
-- **C# enterprise APIs**: `SetSchema` / `ResetSchema` / `CurrentSchema`, backup/restore, compact, projections, CDC toggle, `ClearPlanCache`. `IGrafeoDB` and `ITransaction` interfaces for dependency injection and mocking.
-- **Default query timeout**: 30-second default for all queries (previously no limit). Override with `Config::with_query_timeout()` or disable with `Config::without_query_timeout()`. Timeout errors now include the configured limit and a hint.
-- **Property value size limits**: `max_property_size` config (default 16 MiB) rejects oversized values at the session level. `Value::estimated_size_bytes()` for heap size estimation.
-- **HNSW max_elements bound**: `HnswConfig::with_max_elements(n)` caps index size, preventing unbounded memory growth on large vector workloads.
-- **WAL benchmarks**: Criterion benchmarks for write throughput (sync, batch, nosync), batch commit, and recovery replay.
-- **Layered store** (`compact-store` feature): `compact()` now produces a writable two-layer store (columnar base + LpgStore overlay) instead of a read-only snapshot. Writes go to the overlay, reads merge both layers transparently. `recompact()` merges the overlay back into the columnar base.
-- **CompactStore ID preservation**: `from_graph_store_preserving_ids()` builds a CompactStore that retains original `NodeId`/`EdgeId` values, eliminating the need for ID translation in layered storage.
-- **CompactStore section format**: versioned binary serialization (`GCST` magic, CRC32 integrity) for the `.grafeo` container, with `SectionType::CompactStore` (data section, mmap-able). Column codecs, CSR adjacency, zone maps, and ID maps all round-trip through the format.
+- **Block-STM conflict partitioning**: groups conflicting transactions into disjoint clusters for parallel re-execution.
+- **Encryption at rest** (`encryption` feature): AES-256-GCM for WAL records and `.grafeo` sections. Password-based (Argon2id) or raw-key setup. Zero overhead when disabled.
+- **Push-based pipeline execution**: filter, sort, aggregate, limit, and distinct queries execute through a push pipeline, reducing per-row overhead.
+- **Runtime metrics** (`metrics` feature): query, transaction, session, cache, and GC counters with Prometheus text export. Python `db.metrics()` / `db.metrics_prometheus()` and Node.js equivalents.
+- **C# enterprise APIs**: schema management, backup/restore, compact, projections, CDC toggle, plan cache. `IGrafeoDB` and `ITransaction` interfaces for DI.
+- **Resource limits**: default 30-second query timeout (`Config::with_query_timeout()`), 16 MiB property value size limit (`max_property_size`), HNSW `max_elements` bound.
+- **Layered store** (`compact-store` feature): `compact()` produces a writable two-layer store (columnar base + overlay) instead of a read-only snapshot. `recompact()` merges the overlay back. Versioned section format with CRC32 integrity and ID-preserving builds.
+- **WAL benchmarks**: Criterion benchmarks for write throughput, batch commit, and recovery replay.
 
 ### Changed
 
-- **Cast clippy lints re-enabled**: `cast_possible_truncation`, `cast_sign_loss`, and `cast_possible_wrap` promoted from `allow` to `warn` at workspace level. All sites annotated with per-site `#[allow]` and safety justifications.
-- **`compact()` is now non-destructive**: previously converted the database to read-only mode, dropping the original store. Now creates a `LayeredStore` that remains writable: the columnar base serves cold reads, and a fresh LpgStore overlay captures mutations.
-- **WASM binary size**: 650 KB gzipped (competitive with sql.js). CI threshold: 660 KB warn, 700 KB fail.
-- **Leaner WASM builds**: `grafeo-storage`, `crc32fast`, and `anyhow` are no longer compiled into WASM targets.
-- **Expand locality optimization**: expand operators sort input chunks by source node ID (>1024 rows) before adjacency lookups, improving cache locality on large traversals.
-- **Node.js CI**: test matrix reduced to Node 22/24 (Node 20 still work but are no longer tested).
-- **Release pipeline hardening**: `publish_crate()` now fails explicitly on publish errors instead of silently continuing. Added a pre-publish version consistency gate that compares the tag version against `Cargo.toml`.
-- **CI hardening**: added MSRV verification job (Rust 1.91.1), typos check via `crate-ci/typos`, and made the `supply-chain` audit a required status check (blocks PRs on advisory/license/ban failures).
-- **deny.toml cleanup**: removed stale skips for `windows-sys@0.59` and `windows-targets@0.52` that are no longer in the dependency tree. Updated `rustls-webpki` 0.103.10 to 0.103.12 (RUSTSEC-2026-0098).
-- **Benchmark regression gating**: `core` category benchmarks (allocators, indexes, distance computations) now fail CI on regression, enforcing performance baselines for hot paths.
-- **Dead dependency removed**: `grafeo-adapters` removed from `grafeo-node` Cargo.toml (listed but never imported).
+- **`compact()` is now non-destructive**: creates a writable layered store instead of converting to read-only mode.
+- **Cast clippy lints re-enabled**: `cast_possible_truncation`, `cast_sign_loss`, `cast_possible_wrap` promoted to `warn` workspace-wide.
+- **Leaner WASM builds**: removed `grafeo-storage`, `crc32fast`, `anyhow` from WASM targets. Binary size: 650 KB gzipped. CI threshold: 660 KB warn, 700 KB fail.
+- **Expand locality optimization**: sorts input chunks by source node ID before adjacency lookups on large traversals.
+- **CI hardening**: MSRV verification (1.91.1), typos check, supply-chain audit as required status check, benchmark regression gating for core paths, Node.js matrix reduced to 22/24.
+- **Release pipeline hardening**: explicit publish errors, pre-publish version consistency gate. Removed stale `deny.toml` skips, updated `rustls-webpki` (RUSTSEC-2026-0098).
 
 ### Fixed
 
-- **WAL nonce reuse on restart**: encryption nonces now use file byte offsets instead of an ephemeral counter that reset on restart.
-- **Section nonce collision**: section encryption nonces now use byte offsets instead of iteration counters that collided across duplicate section types.
-- **Distinct hash collisions**: replaced Debug-format hashing with recursive content hashing for List, Map, Vector, and Path values.
-- **Parameters in EXISTS/COUNT/VALUE subqueries**: `$param` references inside subquery expressions were not substituted, causing type mismatches or silently wrong results. Now recursively substituted before planning. ([@temporaryfix](https://github.com/temporaryfix/grafeo/pull/2))
-- **GraphQL float overflow accepted as infinity**: overflowed float literals like `1e999` were tokenized as `inf` instead of returning a parse error.
-- **Silent integer overflow in Cypher, SQL/PGQ, Gremlin, GraphQL parsers**: overflowing integer literals (e.g. `99999999999999999999`) now return a parse error instead of silently producing `0`.
-- **WAL nonce truncation**: file sequence was silently truncated from u64 to u32 when building encryption nonces; now validated with an explicit error.
-- **WAL rotation durability**: old log file is now explicitly fsynced before rotation, preventing data loss on crash.
-- **Arena alignment checks**: bounds and alignment validation in `read_at`/`read_at_mut` promoted from debug-only to release builds.
-- **Python `execute_sql` language mismatch**: standardized all bindings to pass `"sql"` to the engine (Python was passing `"sql-pgq"`).
-- **Arena allocator integer overflow**: alignment and offset calculations in `try_alloc_with_offset`, `alloc_slice`, and `alloc_new_chunk` used unchecked arithmetic that could wrap near `usize::MAX`, enabling out-of-bounds writes. Now uses `checked_add`/`checked_mul`, returning allocation errors on overflow.
-- **Buffer manager TOCTOU race**: `try_allocate` checked the hard limit then called `fetch_add` non-atomically, allowing concurrent threads to collectively exceed the memory budget. Replaced with a `compare_exchange` loop.
-- **DPccp join optimizer overflow**: `BitSet::full(n)` computed `1 << n` which overflows for n >= 64. Now saturates to `u64::MAX` and the optimizer falls back to heuristic ordering for queries with more than 64 relations.
-- **Temporal constructor wrapping on negative input**: `date({month: -1})` silently wrapped the `as u32` cast to 4294967295 instead of returning null. All temporal field conversions now use `u32::try_from`/`i32::try_from`, returning null for out-of-range values.
-- **toInteger/CAST float-to-integer garbage**: `toInteger(NaN)`, `toInteger(Infinity)`, and `toInteger(1e20)` produced arbitrary i64 values via unchecked `f as i64`. Now returns null for NaN, infinity, and values outside i64 range.
-- **Block serializer truncation**: `.len() as u32` and `.len() as u16` casts in the block format writer could silently truncate on overflow. Replaced with `try_from` helpers that produce clear panic messages.
-- **RDF dictionary panic on overflow**: `TermDictionary::get_or_insert` panicked via `expect()` when exceeding u32::MAX entries. Now returns `Option<u32>`, propagating gracefully.
-- **HKDF key derivation without salt**: `derive_dek()` passed `None` as salt to HKDF-SHA256. Now uses a fixed `b"grafeo-v1"` salt for domain separation, preventing cross-protocol key reuse.
-- **CDC history readable without permission**: `Session::history()`, `history_since()`, and `changes_between()` did not check RBAC permissions. Now requires read permission, preventing unauthorized access to mutation history.
-- **SIMD dimension mismatch in release builds**: `compute_distance_simd()` used `debug_assert_eq!` for vector length validation, which is elided in release builds. Promoted to `assert_eq!` to prevent out-of-bounds reads.
-- **SHACL SPARQL injection via crafted IRIs**: the `$this` substitution in SHACL constraint queries embedded IRIs via string concatenation. A crafted IRI containing `>` could break out of the `<...>` wrapper and inject SPARQL. Now validates all IRIs and graph names against a strict character allowlist before embedding.
-- **DPccp join optimizer unbounded enumeration**: the DPccp algorithm enumerated O(2^n) subset pairs with no iteration limit. For 20+ join nodes this could stall query planning. Now enforces a 100K iteration budget, returning the best plan found so far.
-- **Windows memory detection fallback**: `BufferManager` always fell back to 1 GB on Windows instead of detecting actual physical memory. Now calls `GlobalMemoryStatusEx` to read the real system memory size.
-- **Gremlin `range()` overflow**: `range(5, 2)` caused a subtraction overflow panic. Now returns a semantic error when end < start.
+- **WAL encryption nonces**: fixed reuse on restart, collisions across sections, and u64-to-u32 truncation. Old log file now fsynced before rotation.
+- **HKDF key derivation**: added domain-separation salt, preventing cross-protocol key reuse.
+- **Parser overflow hardening**: integer overflow in Cypher, SQL/PGQ, Gremlin, GraphQL now returns errors instead of silently producing `0`. Float overflow (`1e999`) in GraphQL rejected.
+- **Numeric cast safety**: arena allocator, block serializer, buffer manager, DPccp optimizer, temporal constructors, and `toInteger()` all use checked arithmetic instead of unchecked casts.
+- **DPccp join optimizer**: fixed `BitSet` overflow for 64+ relations, added 100K iteration budget to prevent stall on large joins.
+- **DISTINCT hash collisions**: content-based hashing for List, Map, Vector, and Path values.
+- **Parameters in subqueries**: `$param` inside `EXISTS`/`COUNT`/`VALUE` subqueries now substituted correctly. ([@temporaryfix](https://github.com/temporaryfix/grafeo/pull/2))
+- **SHACL SPARQL injection**: IRI validation prevents breakout via crafted `$this` values.
+- **CDC history without permission**: now requires RBAC read permission.
+- **SIMD and arena checks**: promoted debug-only vector length and alignment validation to release builds.
+- **Buffer manager TOCTOU race**: replaced non-atomic check-then-allocate with `compare_exchange` loop.
+- **RDF dictionary panic**: graceful error on u32::MAX entry overflow instead of panic.
+- **Windows memory detection**: reads actual physical memory instead of falling back to 1 GB.
+- **Python `execute_sql` language mismatch**: standardized to `"sql"` across all bindings.
+- **Gremlin `range(5, 2)` overflow**: returns error instead of panic when end < start.
 
 ## [0.5.38] - 2026-04-13
 
