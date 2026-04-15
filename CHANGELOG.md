@@ -26,6 +26,8 @@ Smarter Block-STM conflict partitioning. Runtime metrics with Prometheus export.
 - **WAL nonce reuse on restart**: encryption nonces now use file byte offsets instead of an ephemeral counter that reset on restart.
 - **Section nonce collision**: section encryption nonces now use byte offsets instead of iteration counters that collided across duplicate section types.
 - **Distinct hash collisions**: replaced Debug-format hashing with recursive content hashing for List, Map, Vector, and Path values.
+- **Parameters in EXISTS/COUNT/VALUE subqueries**: `$param` references inside subquery expressions were not substituted, causing type mismatches or silently wrong results. Now recursively substituted before planning. ([@temporaryfix](https://github.com/temporaryfix/grafeo/pull/2))
+- **GraphQL float overflow accepted as infinity**: overflowed float literals like `1e999` were tokenized as `inf` instead of returning a parse error.
 - **Silent integer overflow in Cypher, SQL/PGQ, Gremlin, GraphQL parsers**: overflowing integer literals (e.g. `99999999999999999999`) now return a parse error instead of silently producing `0`.
 - **WAL nonce truncation**: file sequence was silently truncated from u64 to u32 when building encryption nonces; now validated with an explicit error.
 - **WAL rotation durability**: old log file is now explicitly fsynced before rotation, preventing data loss on crash.
