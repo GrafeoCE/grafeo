@@ -2,7 +2,7 @@
 
 All notable changes to Grafeo, for future reference (and enjoyment).
 
-## [0.5.39] - 2026-04-15
+## [0.5.39] - Unreleased
 
 Smarter Block-STM conflict partitioning. Runtime metrics with Prometheus export. Push-based vectorized execution for filter, sort, aggregate, limit, and distinct queries. AES-256-GCM encryption at rest.
 
@@ -43,6 +43,10 @@ Smarter Block-STM conflict partitioning. Runtime metrics with Prometheus export.
 - **toInteger/CAST float-to-integer garbage**: `toInteger(NaN)`, `toInteger(Infinity)`, and `toInteger(1e20)` produced arbitrary i64 values via unchecked `f as i64`. Now returns null for NaN, infinity, and values outside i64 range.
 - **Block serializer truncation**: `.len() as u32` and `.len() as u16` casts in the block format writer could silently truncate on overflow. Replaced with `try_from` helpers that produce clear panic messages.
 - **RDF dictionary panic on overflow**: `TermDictionary::get_or_insert` panicked via `expect()` when exceeding u32::MAX entries. Now returns `Option<u32>`, propagating gracefully.
+- **HKDF key derivation without salt**: `derive_dek()` passed `None` as salt to HKDF-SHA256. Now uses a fixed `b"grafeo-v1"` salt for domain separation, preventing cross-protocol key reuse.
+- **CDC history readable without permission**: `Session::history()`, `history_since()`, and `changes_between()` did not check RBAC permissions. Now requires read permission, preventing unauthorized access to mutation history.
+- **SIMD dimension mismatch in release builds**: `compute_distance_simd()` used `debug_assert_eq!` for vector length validation, which is elided in release builds. Promoted to `assert_eq!` to prevent out-of-bounds reads.
+- **SHACL SPARQL injection via crafted IRIs**: the `$this` substitution in SHACL constraint queries embedded IRIs via string concatenation. A crafted IRI containing `>` could break out of the `<...>` wrapper and inject SPARQL. Now validates all IRIs and graph names against a strict character allowlist before embedding.
 
 ## [0.5.38] - 2026-04-13
 

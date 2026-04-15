@@ -4771,12 +4771,13 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Currently infallible, but returns `Result` for forward compatibility.
+    /// Returns an authorization error if the session lacks read permission.
     #[cfg(feature = "cdc")]
     pub fn history(
         &self,
         entity_id: impl Into<crate::cdc::EntityId>,
     ) -> Result<Vec<crate::cdc::ChangeEvent>> {
+        self.require_permission(crate::auth::StatementKind::Read)?;
         Ok(self.cdc_log.history(entity_id.into()))
     }
 
@@ -4784,13 +4785,14 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Currently infallible, but returns `Result` for forward compatibility.
+    /// Returns an authorization error if the session lacks read permission.
     #[cfg(feature = "cdc")]
     pub fn history_since(
         &self,
         entity_id: impl Into<crate::cdc::EntityId>,
         since_epoch: EpochId,
     ) -> Result<Vec<crate::cdc::ChangeEvent>> {
+        self.require_permission(crate::auth::StatementKind::Read)?;
         Ok(self.cdc_log.history_since(entity_id.into(), since_epoch))
     }
 
@@ -4798,13 +4800,14 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Currently infallible, but returns `Result` for forward compatibility.
+    /// Returns an authorization error if the session lacks read permission.
     #[cfg(feature = "cdc")]
     pub fn changes_between(
         &self,
         start_epoch: EpochId,
         end_epoch: EpochId,
     ) -> Result<Vec<crate::cdc::ChangeEvent>> {
+        self.require_permission(crate::auth::StatementKind::Read)?;
         Ok(self.cdc_log.changes_between(start_epoch, end_epoch))
     }
 }

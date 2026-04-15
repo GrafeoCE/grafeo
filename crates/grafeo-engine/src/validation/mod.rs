@@ -47,16 +47,31 @@ impl SparqlExecutor for SessionSparqlExecutor<'_> {
         query: &str,
         this_binding: &Term,
     ) -> Result<Vec<HashMap<String, Term>>, ShaclError> {
-        // Substitute $this with the N-Triples representation of the focus node
+        // Substitute $this with the N-Triples representation of the focus node.
+        // IRIs are validated to prevent SPARQL injection via crafted terms.
         let this_str = match this_binding {
-            Term::Iri(iri) => format!("<{}>", iri.as_str()),
+            Term::Iri(iri) => {
+                let iri_str = iri.as_str();
+                if !is_safe_iri(iri_str) {
+                    return Err(ShaclError::SparqlError(format!(
+                        "IRI contains characters unsafe for SPARQL embedding: {iri_str}"
+                    )));
+                }
+                format!("<{iri_str}>")
+            }
             Term::BlankNode(bnode) => format!("_:{}", bnode.id()),
             Term::Literal(lit) => {
                 let escaped = escape_ntriples(lit.value());
                 if let Some(lang) = lit.language() {
                     format!("\"{escaped}\"@{}", lang)
                 } else if lit.datatype() != "http://www.w3.org/2001/XMLSchema#string" {
-                    format!("\"{escaped}\"^^<{}>", lit.datatype())
+                    let dt = lit.datatype();
+                    if !is_safe_iri(dt) {
+                        return Err(ShaclError::SparqlError(format!(
+                            "Datatype IRI contains unsafe characters: {dt}"
+                        )));
+                    }
+                    format!("\"{escaped}\"^^<{dt}>")
                 } else {
                     format!("\"{escaped}\"")
                 }
@@ -68,13 +83,15 @@ impl SparqlExecutor for SessionSparqlExecutor<'_> {
 
         // Scope to named data graph via FROM clause when configured
         if let Some(ref graph) = self.graph_name {
-            // Reject graph names containing characters that would break IRI syntax
-            if !graph.contains('>') && !graph.contains('<') && !graph.contains('"') {
-                // Case-insensitive WHERE detection
-                let upper = substituted.to_uppercase();
-                if let Some(pos) = upper.find("WHERE") {
-                    substituted.insert_str(pos, &format!("FROM <{graph}> "));
-                }
+            if !is_safe_iri(graph) {
+                return Err(ShaclError::SparqlError(format!(
+                    "Graph name contains characters unsafe for SPARQL embedding: {graph}"
+                )));
+            }
+            // Case-insensitive WHERE detection
+            let upper = substituted.to_uppercase();
+            if let Some(pos) = upper.find("WHERE") {
+                substituted.insert_str(pos, &format!("FROM <{graph}> "));
             }
         }
 
@@ -103,6 +120,16 @@ impl SparqlExecutor for SessionSparqlExecutor<'_> {
 }
 
 /// Escapes a string for N-Triples literal representation.
+/// Checks whether an IRI string is safe for embedding in a SPARQL query.
+///
+/// Rejects characters that could break out of `<...>` IRI delimiters or
+/// inject additional SPARQL syntax.
+fn is_safe_iri(iri: &str) -> bool {
+    !iri.chars().any(|c| {
+        matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`') || c.is_whitespace()
+    })
+}
+
 fn escape_ntriples(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
