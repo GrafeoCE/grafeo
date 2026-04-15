@@ -20,6 +20,9 @@ Smarter Block-STM conflict partitioning. Runtime metrics with Prometheus export.
 - **Leaner WASM builds**: `grafeo-storage`, `crc32fast`, and `anyhow` are no longer compiled into WASM targets.
 - **Expand locality optimization**: expand operators sort input chunks by source node ID (>1024 rows) before adjacency lookups, improving cache locality on large traversals.
 - **Node.js CI**: test matrix reduced to Node 22/24 (Node 20 still work but are no longer tested).
+- **Release pipeline hardening**: `publish_crate()` now fails explicitly on publish errors instead of silently continuing. Added a pre-publish version consistency gate that compares the tag version against `Cargo.toml`.
+- **CI hardening**: added MSRV verification job (Rust 1.91.1), typos check via `crate-ci/typos`, and made the `supply-chain` audit a required status check (blocks PRs on advisory/license/ban failures).
+- **deny.toml cleanup**: removed stale skips for `windows-sys@0.59` and `windows-targets@0.52` that are no longer in the dependency tree. Updated `rustls-webpki` 0.103.10 to 0.103.12 (RUSTSEC-2026-0098).
 
 ### Fixed
 
@@ -33,6 +36,13 @@ Smarter Block-STM conflict partitioning. Runtime metrics with Prometheus export.
 - **WAL rotation durability**: old log file is now explicitly fsynced before rotation, preventing data loss on crash.
 - **Arena alignment checks**: bounds and alignment validation in `read_at`/`read_at_mut` promoted from debug-only to release builds.
 - **Python `execute_sql` language mismatch**: standardized all bindings to pass `"sql"` to the engine (Python was passing `"sql-pgq"`).
+- **Arena allocator integer overflow**: alignment and offset calculations in `try_alloc_with_offset`, `alloc_slice`, and `alloc_new_chunk` used unchecked arithmetic that could wrap near `usize::MAX`, enabling out-of-bounds writes. Now uses `checked_add`/`checked_mul`, returning allocation errors on overflow.
+- **Buffer manager TOCTOU race**: `try_allocate` checked the hard limit then called `fetch_add` non-atomically, allowing concurrent threads to collectively exceed the memory budget. Replaced with a `compare_exchange` loop.
+- **DPccp join optimizer overflow**: `BitSet::full(n)` computed `1 << n` which overflows for n >= 64. Now saturates to `u64::MAX` and the optimizer falls back to heuristic ordering for queries with more than 64 relations.
+- **Temporal constructor wrapping on negative input**: `date({month: -1})` silently wrapped the `as u32` cast to 4294967295 instead of returning null. All temporal field conversions now use `u32::try_from`/`i32::try_from`, returning null for out-of-range values.
+- **toInteger/CAST float-to-integer garbage**: `toInteger(NaN)`, `toInteger(Infinity)`, and `toInteger(1e20)` produced arbitrary i64 values via unchecked `f as i64`. Now returns null for NaN, infinity, and values outside i64 range.
+- **Block serializer truncation**: `.len() as u32` and `.len() as u16` casts in the block format writer could silently truncate on overflow. Replaced with `try_from` helpers that produce clear panic messages.
+- **RDF dictionary panic on overflow**: `TermDictionary::get_or_insert` panicked via `expect()` when exceeding u32::MAX entries. Now returns `Option<u32>`, propagating gracefully.
 
 ## [0.5.38] - 2026-04-13
 
