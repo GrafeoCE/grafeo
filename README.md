@@ -39,12 +39,13 @@ Grafeo supports both **Labeled Property Graph (LPG)** and **Resource Description
 
 ### Query Languages
 
-- **GQL** (ISO/IEC 39075)
+- **GQL** (ISO/IEC 39075) with Unicode identifiers per spec
 - **Cypher** (openCypher 9.0)
 - **Gremlin** (Apache TinkerPop)
 - **GraphQL**
-- **SPARQL** (W3C 1.1)
+- **SPARQL** (W3C 1.1) with SHACL validation and Ring Index WCOJ planner
 - **SQL/PGQ** (SQL:2023)
+- **EXPLAIN / EXPLAIN ANALYZE** across all six languages
 
 ### Vector Search & AI
 
@@ -63,12 +64,33 @@ Grafeo supports both **Labeled Property Graph (LPG)** and **Resource Description
 
 - **Push-based vectorized execution** with adaptive chunk sizing
 - **Morsel-driven parallelism** with auto-detected thread count
+- **Block-STM conflict partitioning** for parallel transaction re-execution
 - **Columnar storage** with dictionary, delta and RLE compression
 - **Cost-based optimizer** with DPccp join ordering and histograms
 - **Zone maps** for intelligent data skipping (including vector zone maps)
 - **Adaptive query execution** with runtime re-optimization
 - **Transparent spilling** for out-of-core processing
+- **Streaming execution** for large result sets without buffering
 - **Bloom filters** for efficient membership tests
+- **Writable layered compact store**: columnar base with mutable overlay, `recompact()` to merge
+
+### Security
+
+- **Encryption at rest** (`encryption` feature): AES-256-GCM for WAL records and `.grafeo` sections, password-based (Argon2id) or raw-key setup
+- **Role-based access control**: `Admin`, `ReadWrite`, `ReadOnly` roles enforced across all six query languages
+- **Per-graph access grants**: scope an identity's access to specific named graphs
+- **SHACL validation** (`shacl` feature): W3C Shapes Constraint Language with all 28 Core constraint types and SHACL-SPARQL
+- **Resource limits**: query timeouts, property size caps, HNSW `max_elements` bound
+
+### Operations & Observability
+
+- **Incremental backup and point-in-time recovery**: `backup_full`, `backup_incremental`, `restore_to_epoch`
+- **Prometheus metrics** (`metrics` feature): query, transaction, session, cache, and GC counters with text export
+- **Change data capture**: before/after property snapshots with epoch-bounded retention
+- **Async storage** (`async-storage` feature): non-blocking WAL and snapshot I/O via tokio
+- **Tracing** (`tracing` feature): opt-in observability spans and events
+- **Bulk export**: Arrow IPC, Polars, pandas, GEXF (Gephi), GraphML (Cytoscape, yEd, NetworkX)
+- **Bulk import**: CSV, JSONL, TSV, Matrix Market (MMIO), Turtle, N-Triples with streaming loaders
 
 </details>
 
