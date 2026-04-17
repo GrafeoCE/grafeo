@@ -1,6 +1,6 @@
 {
   "name": "@grafeo-db/js-linux-arm64-gnu",
-  "version": "0.5.39",
+  "version": "0.5.40",
   "os": [
     "linux"
   ],

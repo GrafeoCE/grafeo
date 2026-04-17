@@ -1081,6 +1081,8 @@ impl super::GrafeoDB {
                 let pk = grafeo_common::types::PropertyKey::new(property);
                 for &id in &ids {
                     if let Some(node) = self.lpg_store().get_node(id) {
+                        // reason: guard would be side-effecting; keep insert in arm body
+                        #[allow(clippy::collapsible_match)]
                         match node.properties.get(&pk) {
                             Some(Value::Vector(v)) => {
                                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
