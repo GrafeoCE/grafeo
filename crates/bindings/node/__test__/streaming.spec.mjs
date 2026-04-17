@@ -111,7 +111,7 @@ describe('executeStream', () => {
       const stream = await db.executeStream('MATCH (p:Person) RETURN p.name')
       const first = await stream.next()
       expect(first).not.toBe(null)
-      stream.close()
+      await stream.close()
       expect(await stream.next()).toBe(null)
     } finally {
       db.close()

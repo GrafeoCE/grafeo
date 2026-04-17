@@ -9,6 +9,7 @@ Focus:
 - GIL is released during chunk pulls: other Python threads make progress
 """
 
+import sys
 import threading
 import time
 
@@ -117,32 +118,48 @@ def test_gil_is_released_during_iteration(people_db):
     iterates a stream. If execute_lazy held the GIL for the full query, the
     background thread's counter would not advance during iteration.
     """
-    # Seed a larger result set so iteration takes measurable time.
-    for i in range(2000):
+    # Seed enough rows that iteration takes tens of ms even on fast runners.
+    # Fewer rows and the per-row GIL-release window is smaller than Python's
+    # thread-switch interval, so no switch lands inside it (pure scheduling
+    # noise, not a real GIL-held bug).
+    for i in range(10_000):
         people_db.create_node(["Widget"], {"index": i})
 
     progress = {"count": 0, "stop": False}
+    started = threading.Event()
 
     def ticker():
+        started.set()
         while not progress["stop"]:
             progress["count"] += 1
-            time.sleep(0.0001)
+            # Sub-ms sleeps get rounded up by the OS; 1ms is reliable.
+            time.sleep(0.001)
 
+    # Shrink the GIL switch interval so a thread switch is likely to land
+    # during the iteration window even on fast machines.
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(0.001)
     thread = threading.Thread(target=ticker, daemon=True)
     thread.start()
+    try:
+        assert started.wait(timeout=1.0), "ticker thread failed to start"
+        # Give the ticker a moment to actually start incrementing, otherwise
+        # `before` may be captured before its first tick.
+        time.sleep(0.05)
 
-    before = progress["count"]
-    rows = 0
-    for _row in people_db.execute_lazy("MATCH (w:Widget) RETURN w.index"):
-        rows += 1
-    after = progress["count"]
+        before = progress["count"]
+        rows = 0
+        for _row in people_db.execute_lazy("MATCH (w:Widget) RETURN w.index"):
+            rows += 1
+        after = progress["count"]
+    finally:
+        progress["stop"] = True
+        thread.join(timeout=1.0)
+        sys.setswitchinterval(old_interval)
 
-    progress["stop"] = True
-    thread.join(timeout=1.0)
-
-    assert rows == 2000
-    # Very loose assertion: the ticker incremented at least once during iteration.
-    # If the GIL were held the entire time, `after - before` could plausibly be 0.
+    assert rows == 10_000
+    # Loose assertion: the ticker advanced while the Rust side was iterating.
+    # If the GIL stayed held, `after - before` would be 0.
     assert after - before >= 1, (
         f"background thread made no progress during iteration "
         f"(before={before}, after={after}); GIL may not be released"
