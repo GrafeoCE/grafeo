@@ -11,7 +11,6 @@ Focus:
 
 import sys
 import threading
-import time
 
 import pytest
 
@@ -118,34 +117,31 @@ def test_gil_is_released_during_iteration(people_db):
     iterates a stream. If execute_lazy held the GIL for the full query, the
     background thread's counter would not advance during iteration.
     """
-    # Seed enough rows that iteration takes tens of ms even on fast runners.
-    # Fewer rows and the per-row GIL-release window is smaller than Python's
-    # thread-switch interval, so no switch lands inside it (pure scheduling
-    # noise, not a real GIL-held bug).
+    # Seed enough rows that iteration takes a meaningful amount of time.
     for i in range(10_000):
         people_db.create_node(["Widget"], {"index": i})
 
     progress = {"count": 0, "stop": False}
     started = threading.Event()
 
+    # Busy-loop ticker (no time.sleep): every time __next__ releases the GIL
+    # via py.detach, this thread is scheduled, takes the GIL, and increments
+    # the counter a few times before setswitchinterval forces it to yield
+    # back. A sleeping ticker can miss every per-row release window because
+    # sub-ms sleeps are rounded up by the OS to multiples of a tick.
     def ticker():
         started.set()
         while not progress["stop"]:
             progress["count"] += 1
-            # Sub-ms sleeps get rounded up by the OS; 1ms is reliable.
-            time.sleep(0.001)
 
-    # Shrink the GIL switch interval so a thread switch is likely to land
-    # during the iteration window even on fast machines.
+    # Shrink the GIL switch interval so threads trade the GIL aggressively
+    # during the iteration window.
     old_interval = sys.getswitchinterval()
     sys.setswitchinterval(0.001)
     thread = threading.Thread(target=ticker, daemon=True)
     thread.start()
     try:
         assert started.wait(timeout=1.0), "ticker thread failed to start"
-        # Give the ticker a moment to actually start incrementing, otherwise
-        # `before` may be captured before its first tick.
-        time.sleep(0.05)
 
         before = progress["count"]
         rows = 0
@@ -158,8 +154,8 @@ def test_gil_is_released_during_iteration(people_db):
         sys.setswitchinterval(old_interval)
 
     assert rows == 10_000
-    # Loose assertion: the ticker advanced while the Rust side was iterating.
-    # If the GIL stayed held, `after - before` would be 0.
+    # Loose assertion: the busy-looping ticker advanced while Rust was
+    # iterating. If the GIL stayed held, `after - before` would be 0.
     assert after - before >= 1, (
         f"background thread made no progress during iteration "
         f"(before={before}, after={after}); GIL may not be released"
