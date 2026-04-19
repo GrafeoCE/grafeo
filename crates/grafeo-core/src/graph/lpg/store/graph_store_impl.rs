@@ -252,13 +252,7 @@ impl GraphStore for LpgStore {
     }
 
     #[cfg(feature = "text-index")]
-    fn score_text(
-        &self,
-        node_id: NodeId,
-        label: &str,
-        property: &str,
-        query: &str,
-    ) -> Option<f64> {
+    fn score_text(&self, node_id: NodeId, label: &str, property: &str, query: &str) -> Option<f64> {
         let index = self.get_text_index(label, property)?;
         let guard = index.read();
         let score = guard.score_document(node_id, query);
@@ -266,7 +260,13 @@ impl GraphStore for LpgStore {
     }
 
     #[cfg(feature = "text-index")]
-    fn text_search(&self, label: &str, property: &str, query: &str, k: usize) -> Vec<(NodeId, f64)> {
+    fn text_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> Vec<(NodeId, f64)> {
         if let Some(index) = self.get_text_index(label, property) {
             index.read().search(query, k)
         } else {
@@ -275,7 +275,13 @@ impl GraphStore for LpgStore {
     }
 
     #[cfg(feature = "text-index")]
-    fn text_search_with_threshold(&self, label: &str, property: &str, query: &str, threshold: f64) -> Vec<(NodeId, f64)> {
+    fn text_search_with_threshold(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        threshold: f64,
+    ) -> Vec<(NodeId, f64)> {
         if let Some(index) = self.get_text_index(label, property) {
             index.read().search_with_threshold(query, threshold)
         } else {

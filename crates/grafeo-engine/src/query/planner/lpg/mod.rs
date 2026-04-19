@@ -766,7 +766,7 @@ impl Planner {
             _ => {
                 return Err(Error::Internal(
                     "TextScan query must be a string literal or parameter".to_string(),
-                ))
+                ));
             }
         };
 
@@ -844,17 +844,31 @@ impl Planner {
                     .with_metric(metric)
                 } else {
                     VectorScanOperator::brute_force(
-                        Arc::clone(&self.store), &scan.property, query_vec.clone(), k, metric,
-                    ).with_label(label)
+                        Arc::clone(&self.store),
+                        &scan.property,
+                        query_vec.clone(),
+                        k,
+                        metric,
+                    )
+                    .with_label(label)
                 }
             } else {
                 VectorScanOperator::brute_force(
-                    Arc::clone(&self.store), &scan.property, query_vec.clone(), k, metric,
-                ).with_label(label)
+                    Arc::clone(&self.store),
+                    &scan.property,
+                    query_vec.clone(),
+                    k,
+                    metric,
+                )
+                .with_label(label)
             }
         } else {
             VectorScanOperator::brute_force(
-                Arc::clone(&self.store), &scan.property, query_vec, k, metric,
+                Arc::clone(&self.store),
+                &scan.property,
+                query_vec,
+                k,
+                metric,
             )
         };
 
@@ -873,7 +887,10 @@ impl Planner {
             Some(VectorMetric::DotProduct) => "dot",
             Some(VectorMetric::Manhattan) => "man",
         };
-        columns.push(format!("_vscore_{}_{}_{}", metric_tag, scan.property, scan.variable));
+        columns.push(format!(
+            "_vscore_{}_{}_{}",
+            metric_tag, scan.property, scan.variable
+        ));
 
         Ok((Box::new(operator), columns))
     }
@@ -881,6 +898,8 @@ impl Planner {
     /// Resolves a LogicalExpression to a Vec<f32> for vector operations.
     #[cfg(feature = "vector-index")]
     pub(super) fn resolve_vector_literal(&self, expr: &LogicalExpression) -> Result<Vec<f32>> {
+        // f64→f32 precision loss throughout is intentional: vectors are stored and searched as f32.
+        #[allow(clippy::cast_possible_truncation)]
         match expr {
             LogicalExpression::Literal(Value::Vector(v)) => Ok(v.to_vec()),
             LogicalExpression::Literal(Value::List(list)) => {
@@ -892,7 +911,7 @@ impl Planner {
                         _ => {
                             return Err(Error::Internal(
                                 "Vector elements must be numeric".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -909,7 +928,7 @@ impl Planner {
                         _ => {
                             return Err(Error::Internal(
                                 "Vector elements must be numeric literals".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }

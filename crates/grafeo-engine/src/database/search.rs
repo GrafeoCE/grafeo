@@ -41,7 +41,10 @@ impl super::GrafeoDB {
             }
         }
         grafeo_core::index::vector::VectorAccessorKind::Property(
-            grafeo_core::index::vector::PropertyVectorAccessor::new(self.graph_store_ref(), property),
+            grafeo_core::index::vector::PropertyVectorAccessor::new(
+                self.graph_store_ref(),
+                property,
+            ),
         )
     }
 
@@ -54,7 +57,10 @@ impl super::GrafeoDB {
         property: &str,
     ) -> grafeo_core::index::vector::VectorAccessorKind<'a> {
         grafeo_core::index::vector::VectorAccessorKind::Property(
-            grafeo_core::index::vector::PropertyVectorAccessor::new(self.graph_store_ref(), property),
+            grafeo_core::index::vector::PropertyVectorAccessor::new(
+                self.graph_store_ref(),
+                property,
+            ),
         )
     }
 

@@ -232,8 +232,8 @@ impl super::Planner {
                             // scan already projected a score column, reference that column directly
                             // instead of recomputing the distance/score.
                             _ => {
-                                if let Some(score_col) = self
-                                    .find_projected_score(&item.expression, &input_columns)
+                                if let Some(score_col) =
+                                    self.find_projected_score(&item.expression, &input_columns)
                                 {
                                     let col_idx =
                                         *variable_columns.get(&score_col).ok_or_else(|| {
@@ -245,8 +245,7 @@ impl super::Planner {
                                     projections.push(ProjectExpr::Column(col_idx));
                                     output_types.push(LogicalType::Any);
                                 } else {
-                                    let filter_expr =
-                                        self.convert_expression(&item.expression)?;
+                                    let filter_expr = self.convert_expression(&item.expression)?;
                                     projections.push(ProjectExpr::Expression {
                                         expr: filter_expr,
                                         variable_columns: variable_columns.clone(),
@@ -729,10 +728,10 @@ impl super::Planner {
                         self.find_projected_score(&key.expression, &input_columns)
                     {
                         let col_name = format!("__expr_{:?}", key.expression);
-                        if !variable_columns.contains_key(&col_name) {
-                            if let Some(&existing_idx) = variable_columns.get(&score_col) {
-                                variable_columns.insert(col_name, existing_idx);
-                            }
+                        if !variable_columns.contains_key(&col_name)
+                            && let Some(&existing_idx) = variable_columns.get(&score_col)
+                        {
+                            variable_columns.insert(col_name, existing_idx);
                         }
                     } else {
                         let col_name = format!("__expr_{:?}", key.expression);
@@ -898,10 +897,7 @@ impl super::Planner {
 
     /// Attempts to rewrite Sort+Limit on a vector/text function into
     /// a direct index scan that returns results in order.
-    fn try_topk_rewrite(
-        &self,
-        sort: &SortOp,
-    ) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
+    fn try_topk_rewrite(&self, sort: &SortOp) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
         // Must have exactly one sort key
         if sort.keys.len() != 1 {
             return Ok(None);
@@ -919,7 +915,7 @@ impl super::Planner {
         let k = *k;
 
         // Walk through the Limit's input to find a NodeScan
-        let Some((scan_var, scan_label)) = self.find_node_scan(&limit.input) else {
+        let Some((scan_var, scan_label)) = find_node_scan(&limit.input) else {
             return Ok(None);
         };
         let Some(ref label) = scan_label else {
@@ -928,31 +924,17 @@ impl super::Planner {
 
         // Sort key must be a vector or text function call
         match &sort_key.expression {
-            LogicalExpression::FunctionCall { name, args, .. } => {
-                match name.as_str() {
-                    #[cfg(feature = "vector-index")]
-                    "cosine_similarity" | "euclidean_distance" | "dot_product"
-                    | "manhattan_distance" => {
-                        self.try_vector_topk(name, args, k, &scan_var, label, sort_key)
-                    }
-                    #[cfg(feature = "text-index")]
-                    "text_score" => {
-                        self.try_text_topk(args, k, &scan_var, label, sort_key)
-                    }
-                    _ => Ok(None),
+            LogicalExpression::FunctionCall { name, args, .. } => match name.as_str() {
+                #[cfg(feature = "vector-index")]
+                "cosine_similarity" | "euclidean_distance" | "dot_product"
+                | "manhattan_distance" => {
+                    self.try_vector_topk(name, args, k, &scan_var, label, sort_key)
                 }
-            }
+                #[cfg(feature = "text-index")]
+                "text_score" => self.try_text_topk(args, k, &scan_var, label, sort_key),
+                _ => Ok(None),
+            },
             _ => Ok(None),
-        }
-    }
-
-    /// Walks through Return/Project operators to find the underlying NodeScan.
-    fn find_node_scan(&self, op: &LogicalOperator) -> Option<(String, Option<String>)> {
-        match op {
-            LogicalOperator::NodeScan(scan) => Some((scan.variable.clone(), scan.label.clone())),
-            LogicalOperator::Return(ret) => self.find_node_scan(&ret.input),
-            LogicalOperator::Project(proj) => self.find_node_scan(&proj.input),
-            _ => None,
         }
     }
 
@@ -1095,7 +1077,10 @@ impl super::Planner {
             if is_vector_fn || is_text_fn {
                 // The first arg is the property access n.prop; variable is the
                 // node variable whose score column was projected by the scan.
-                if let Some(LogicalExpression::Property { variable, property, .. }) = args.first() {
+                if let Some(LogicalExpression::Property {
+                    variable, property, ..
+                }) = args.first()
+                {
                     let score_col = if is_vector_fn {
                         let metric_tag = match name.as_str() {
                             "cosine_similarity" => "cos",
@@ -1115,5 +1100,14 @@ impl super::Planner {
             }
         }
         None
+    }
+}
+
+fn find_node_scan(op: &LogicalOperator) -> Option<(String, Option<String>)> {
+    match op {
+        LogicalOperator::NodeScan(scan) => Some((scan.variable.clone(), scan.label.clone())),
+        LogicalOperator::Return(ret) => find_node_scan(&ret.input),
+        LogicalOperator::Project(proj) => find_node_scan(&proj.input),
+        _ => None,
     }
 }

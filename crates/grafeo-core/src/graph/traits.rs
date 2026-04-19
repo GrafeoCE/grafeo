@@ -352,7 +352,13 @@ pub trait GraphStore: Send + Sync {
     ///
     /// Results are sorted by BM25 score descending.
     /// Returns empty vec if no text index exists for the (label, property) pair.
-    fn text_search(&self, _label: &str, _property: &str, _query: &str, _k: usize) -> Vec<(NodeId, f64)> {
+    fn text_search(
+        &self,
+        _label: &str,
+        _property: &str,
+        _query: &str,
+        _k: usize,
+    ) -> Vec<(NodeId, f64)> {
         Vec::new()
     }
 
@@ -360,7 +366,13 @@ pub trait GraphStore: Send + Sync {
     ///
     /// Results are sorted by BM25 score descending.
     /// Returns empty vec if no text index exists.
-    fn text_search_with_threshold(&self, _label: &str, _property: &str, _query: &str, _threshold: f64) -> Vec<(NodeId, f64)> {
+    fn text_search_with_threshold(
+        &self,
+        _label: &str,
+        _property: &str,
+        _query: &str,
+        _threshold: f64,
+    ) -> Vec<(NodeId, f64)> {
         Vec::new()
     }
 

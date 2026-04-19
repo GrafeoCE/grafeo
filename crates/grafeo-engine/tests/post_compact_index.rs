@@ -44,8 +44,16 @@ fn setup_compacted_vector_db() -> GrafeoDB {
 fn vector_index_after_compact_returns_results() {
     let db = setup_compacted_vector_db();
 
-    db.create_vector_index("Doc", "embedding", Some(3), Some("cosine"), None, None, None)
-        .expect("create vector index after compact");
+    db.create_vector_index(
+        "Doc",
+        "embedding",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("create vector index after compact");
 
     let results = db
         .vector_search("Doc", "embedding", &[1.0, 0.0, 0.0], 3, None, None)
@@ -59,8 +67,16 @@ fn vector_index_after_compact_returns_results() {
 fn vector_index_after_compact_nearest_neighbor_is_correct() {
     let db = setup_compacted_vector_db();
 
-    db.create_vector_index("Doc", "embedding", Some(3), Some("cosine"), None, None, None)
-        .expect("create vector index");
+    db.create_vector_index(
+        "Doc",
+        "embedding",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("create vector index");
 
     let results = db
         .vector_search("Doc", "embedding", &[1.0, 0.0, 0.0], 1, None, None)
@@ -75,10 +91,9 @@ fn vector_index_after_compact_nearest_neighbor_is_correct() {
     );
 
     // Verify it's the right node by checking its property
-    let title = db.graph_store().get_node_property(
-        nearest_id,
-        &grafeo_common::types::PropertyKey::new("title"),
-    );
+    let title = db
+        .graph_store()
+        .get_node_property(nearest_id, &grafeo_common::types::PropertyKey::new("title"));
     assert_eq!(title, Some(Value::String("alpha".into())));
 }
 
@@ -87,8 +102,16 @@ fn vector_index_after_compact_nearest_neighbor_is_correct() {
 fn rebuild_vector_index_after_compact() {
     let db = setup_compacted_vector_db();
 
-    db.create_vector_index("Doc", "embedding", Some(3), Some("cosine"), None, None, None)
-        .expect("create");
+    db.create_vector_index(
+        "Doc",
+        "embedding",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("create");
 
     db.rebuild_vector_index("Doc", "embedding")
         .expect("rebuild after compact");
@@ -119,14 +142,29 @@ fn vector_search_with_filter_after_compact() {
 
     db.compact().expect("compact");
     db.create_property_index("category");
-    db.create_vector_index("Doc", "embedding", Some(3), Some("cosine"), None, None, None)
-        .expect("create vector index");
+    db.create_vector_index(
+        "Doc",
+        "embedding",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("create vector index");
 
     let mut filters = std::collections::HashMap::new();
     filters.insert("category".to_string(), Value::String("science".into()));
 
     let results = db
-        .vector_search("Doc", "embedding", &[1.0, 0.0, 0.0], 3, None, Some(&filters))
+        .vector_search(
+            "Doc",
+            "embedding",
+            &[1.0, 0.0, 0.0],
+            3,
+            None,
+            Some(&filters),
+        )
         .expect("filtered search");
 
     assert_eq!(results.len(), 2, "should only return science nodes");
@@ -140,20 +178,35 @@ fn text_index_after_compact() {
     let mut db = GrafeoDB::new_in_memory();
 
     let n1 = db.create_node(&["Article"]);
-    db.set_node_property(n1, "body", Value::String("the quick brown fox jumps over the lazy dog".into()));
+    db.set_node_property(
+        n1,
+        "body",
+        Value::String("the quick brown fox jumps over the lazy dog".into()),
+    );
 
     let n2 = db.create_node(&["Article"]);
-    db.set_node_property(n2, "body", Value::String("a fast brown fox leaps over a sleepy hound".into()));
+    db.set_node_property(
+        n2,
+        "body",
+        Value::String("a fast brown fox leaps over a sleepy hound".into()),
+    );
 
     let n3 = db.create_node(&["Article"]);
     db.set_node_property(n3, "body", Value::String("the cat sat on the mat".into()));
 
     db.compact().expect("compact");
 
-    db.create_text_index("Article", "body").expect("create text index after compact");
+    db.create_text_index("Article", "body")
+        .expect("create text index after compact");
 
-    let results = db.text_search("Article", "body", "fox", 10).expect("text search");
-    assert_eq!(results.len(), 2, "should find both fox articles from pre-compact data");
+    let results = db
+        .text_search("Article", "body", "fox", 10)
+        .expect("text search");
+    assert_eq!(
+        results.len(),
+        2,
+        "should find both fox articles from pre-compact data"
+    );
 }
 
 // ── Snapshot round-trip ────────────────────────────────────────────
@@ -177,8 +230,16 @@ fn snapshot_compact_vector_index_round_trip() {
     let mut db = GrafeoDB::import_snapshot(&snapshot_bytes).expect("import");
     db.compact().expect("compact after import");
 
-    db.create_vector_index("Doc", "embedding", Some(3), Some("cosine"), None, None, None)
-        .expect("create vector index after snapshot+compact");
+    db.create_vector_index(
+        "Doc",
+        "embedding",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("create vector index after snapshot+compact");
 
     let results = db
         .vector_search("Doc", "embedding", &[1.0, 0.0, 0.0], 3, None, None)
@@ -192,7 +253,6 @@ fn snapshot_compact_vector_index_round_trip() {
 #[test]
 #[cfg(feature = "vector-index")]
 fn layered_store_has_vector_index_forwards_to_overlay() {
-
     let mut db = GrafeoDB::new_in_memory();
 
     let n = db.create_node(&["Doc"]);
@@ -205,8 +265,16 @@ fn layered_store_has_vector_index_forwards_to_overlay() {
     assert!(!gs.has_vector_index("Doc", "embedding"));
 
     // Create index on the overlay via the imperative API
-    db.create_vector_index("Doc", "embedding", Some(3), Some("cosine"), None, None, None)
-        .expect("create");
+    db.create_vector_index(
+        "Doc",
+        "embedding",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("create");
 
     // Now LayeredStore should forward to overlay and report true
     let gs = db.graph_store();
@@ -217,7 +285,6 @@ fn layered_store_has_vector_index_forwards_to_overlay() {
 #[test]
 #[cfg(feature = "text-index")]
 fn layered_store_has_text_index_forwards_to_overlay() {
-
     let mut db = GrafeoDB::new_in_memory();
 
     let n = db.create_node(&["Article"]);
@@ -232,4 +299,46 @@ fn layered_store_has_text_index_forwards_to_overlay() {
 
     let gs = db.graph_store();
     assert!(gs.has_text_index("Article", "body"));
+}
+
+// ── recompact() ────────────────────────────────────────────────────
+
+#[test]
+#[cfg(feature = "vector-index")]
+fn vector_index_after_recompact() {
+    let mut db = GrafeoDB::new_in_memory();
+
+    let n1 = db.create_node(&["Doc"]);
+    db.set_node_property(n1, "embedding", vec3(1.0, 0.0, 0.0));
+    let n2 = db.create_node(&["Doc"]);
+    db.set_node_property(n2, "embedding", vec3(0.0, 1.0, 0.0));
+
+    db.compact().expect("first compact");
+
+    // Insert a third node after compact, then recompact to merge all three.
+    let n3 = db.create_node(&["Doc"]);
+    db.set_node_property(n3, "embedding", vec3(0.0, 0.0, 1.0));
+
+    db.recompact().expect("recompact");
+
+    db.create_vector_index(
+        "Doc",
+        "embedding",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("create index after recompact");
+
+    let results = db
+        .vector_search("Doc", "embedding", &[1.0, 0.0, 0.0], 3, None, None)
+        .expect("search after recompact");
+
+    assert_eq!(
+        results.len(),
+        3,
+        "should find nodes from both compaction rounds"
+    );
 }

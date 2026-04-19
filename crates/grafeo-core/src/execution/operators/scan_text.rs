@@ -117,8 +117,12 @@ impl TextScanOperator {
             self.store
                 .text_search(&self.label, &self.property, &self.query, k)
         } else if let Some(threshold) = self.threshold {
-            self.store
-                .text_search_with_threshold(&self.label, &self.property, &self.query, threshold)
+            self.store.text_search_with_threshold(
+                &self.label,
+                &self.property,
+                &self.query,
+                threshold,
+            )
         } else {
             Vec::new()
         };
@@ -200,7 +204,11 @@ mod tests {
 
         // Create nodes
         let n1 = store.create_node(&["Doc"]);
-        store.set_node_property(n1, "body", Value::String("rust graph database engine".into()));
+        store.set_node_property(
+            n1,
+            "body",
+            Value::String("rust graph database engine".into()),
+        );
         let n2 = store.create_node(&["Doc"]);
         store.set_node_property(n2, "body", Value::String("python web framework".into()));
         let n3 = store.create_node(&["Doc"]);
@@ -244,7 +252,7 @@ mod tests {
         let store = make_store();
         let all = store.text_search("Doc", "body", "rust database", 10);
         assert_eq!(all.len(), 2);
-        let mid = (all[0].1 + all[1].1) / 2.0;
+        let mid = f64::midpoint(all[0].1, all[1].1);
         let mut scan = TextScanOperator::with_threshold(
             store.clone() as Arc<dyn GraphStore>,
             "Doc",

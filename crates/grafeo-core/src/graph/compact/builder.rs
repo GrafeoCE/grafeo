@@ -811,16 +811,25 @@ pub fn from_graph_store(
                         t.record_len(values.len());
                     }
                     InferredType::Float32Vector { dimensions } => {
-                        let mut flat: Vec<f32> = Vec::with_capacity(values.len() * dimensions as usize);
+                        let mut flat: Vec<f32> =
+                            Vec::with_capacity(values.len() * dimensions as usize);
                         for v in values {
                             match v {
                                 Value::Vector(vec) => flat.extend_from_slice(vec),
-                                _ => flat.extend(std::iter::repeat(0.0f32).take(dimensions as usize)),
+                                _ => {
+                                    flat.extend(std::iter::repeat_n(
+                                        0.0f32,
+                                        usize::from(dimensions),
+                                    ));
+                                }
                             }
                         }
                         t.columns.push((
                             key.clone(),
-                            ColumnCodec::Float32Vector { data: flat, dimensions },
+                            ColumnCodec::Float32Vector {
+                                data: flat,
+                                dimensions,
+                            },
                         ));
                         t.record_len(values.len());
                     }
@@ -957,16 +966,23 @@ pub fn from_graph_store(
                                     .push((key.clone(), ColumnCodec::Float64(f64_values)));
                             }
                             InferredType::Float32Vector { dimensions } => {
-                                let mut flat: Vec<f32> = Vec::with_capacity(values.len() * dimensions as usize);
+                                let mut flat: Vec<f32> =
+                                    Vec::with_capacity(values.len() * dimensions as usize);
                                 for v in values {
                                     match v {
                                         Value::Vector(vec) => flat.extend_from_slice(vec),
-                                        _ => flat.extend(std::iter::repeat(0.0f32).take(dimensions as usize)),
+                                        _ => flat.extend(std::iter::repeat_n(
+                                            0.0f32,
+                                            usize::from(dimensions),
+                                        )),
                                     }
                                 }
                                 r.properties.push((
                                     key.clone(),
-                                    ColumnCodec::Float32Vector { data: flat, dimensions },
+                                    ColumnCodec::Float32Vector {
+                                        data: flat,
+                                        dimensions,
+                                    },
                                 ));
                             }
                             InferredType::Bitmap => {
@@ -1193,10 +1209,14 @@ fn infer_type_from_values(values: &[Value]) -> InferredType {
     }
 
     // Vectors are exclusive — mixed with other types falls back to Dict.
-    if saw_vector && !saw_other && !saw_int && !saw_float && !saw_bool {
-        if let Some(dims) = vector_dims {
-            return InferredType::Float32Vector { dimensions: dims };
-        }
+    if saw_vector
+        && !saw_other
+        && !saw_int
+        && !saw_float
+        && !saw_bool
+        && let Some(dims) = vector_dims
+    {
+        return InferredType::Float32Vector { dimensions: dims };
     }
 
     // Mixed Int64+Float64 coalesces to Float64.

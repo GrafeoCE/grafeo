@@ -1383,10 +1383,10 @@ impl super::Planner {
         match expr {
             LogicalExpression::Binary { left, op, right } => {
                 // Try the left side as a vector function call
-                if let LogicalExpression::FunctionCall { name, args, .. } = left.as_ref() {
-                    if let Some(extracted) = self.try_extract_vector_fn(name, args, op, right) {
-                        return Some(extracted);
-                    }
+                if let LogicalExpression::FunctionCall { name, args, .. } = left.as_ref()
+                    && let Some(extracted) = self.try_extract_vector_fn(name, args, *op, right)
+                {
+                    return Some(extracted);
                 }
                 // AND: recurse into both sides, accumulating remaining predicates
                 if *op == BinaryOp::And {
@@ -1427,7 +1427,7 @@ impl super::Planner {
         &self,
         name: &str,
         args: &[LogicalExpression],
-        op: &BinaryOp,
+        op: BinaryOp,
         threshold: &LogicalExpression,
     ) -> Option<ExtractedVectorPredicate> {
         if args.len() != 2 {
@@ -1462,7 +1462,8 @@ impl super::Planner {
                 return None;
             };
 
-        // Extract threshold value
+        // Extract threshold value; f64→f32 precision loss is intentional (vectors are f32).
+        #[allow(clippy::cast_possible_truncation)]
         let threshold_val = match threshold {
             LogicalExpression::Literal(Value::Float64(v)) => *v as f32,
             LogicalExpression::Literal(Value::Int64(v)) => *v as f32,
@@ -1554,8 +1555,7 @@ impl super::Planner {
         };
 
         // Plan through the TextScan path
-        let (scan_op, scan_columns) =
-            self.plan_operator(&LogicalOperator::TextScan(text_scan))?;
+        let (scan_op, scan_columns) = self.plan_operator(&LogicalOperator::TextScan(text_scan))?;
 
         // If there are remaining predicates (AND with non-text conditions), wrap in filter
         if let Some(remaining) = &extracted.remaining {
@@ -1580,19 +1580,16 @@ impl super::Planner {
     }
 
     /// Recursively extracts a text predicate from a (potentially compound) expression.
-    fn extract_text_predicate(
-        &self,
-        expr: &LogicalExpression,
-    ) -> Option<ExtractedTextPredicate> {
+    fn extract_text_predicate(&self, expr: &LogicalExpression) -> Option<ExtractedTextPredicate> {
         match expr {
             LogicalExpression::Binary { left, op, right } => {
                 // text_score(n.prop, "query") > threshold
-                if let LogicalExpression::FunctionCall { name, args, .. } = left.as_ref() {
-                    if name == "text_score" && matches!(op, BinaryOp::Gt | BinaryOp::Ge) {
-                        if let Some(extracted) = self.try_extract_text_fn(args, right) {
-                            return Some(extracted);
-                        }
-                    }
+                if let LogicalExpression::FunctionCall { name, args, .. } = left.as_ref()
+                    && name == "text_score"
+                    && matches!(op, BinaryOp::Gt | BinaryOp::Ge)
+                    && let Some(extracted) = self.try_extract_text_fn(args, right)
+                {
+                    return Some(extracted);
                 }
                 // AND: recurse into both sides, accumulating remaining predicates
                 if *op == BinaryOp::And {
@@ -1687,35 +1684,34 @@ impl super::Planner {
         };
 
         // Extract vector and text predicates. Strategy depends on AND vs OR.
-        let (vector_pred, text_pred, is_or) =
-            if let LogicalExpression::Binary {
-                left,
-                op: BinaryOp::Or,
-                right,
-            } = &filter.predicate
-            {
-                // OR: extract from each operand independently.
-                // Try vector-left + text-right, then vector-right + text-left.
-                let result = self
-                    .extract_vector_predicate(left)
-                    .and_then(|v| self.extract_text_predicate(right).map(|t| (v, t)))
-                    .or_else(|| {
-                        self.extract_vector_predicate(right)
-                            .and_then(|v| self.extract_text_predicate(left).map(|t| (v, t)))
-                    });
-                let Some((v, t)) = result else {
-                    return Ok(None);
-                };
-                (v, t, true)
-            } else {
-                // AND: extractors recurse into the AND tree (existing behavior).
-                let vector = self.extract_vector_predicate(&filter.predicate);
-                let text = self.extract_text_predicate(&filter.predicate);
-                match (vector, text) {
-                    (Some(v), Some(t)) => (v, t, false),
-                    _ => return Ok(None),
-                }
+        let (vector_pred, text_pred, is_or) = if let LogicalExpression::Binary {
+            left,
+            op: BinaryOp::Or,
+            right,
+        } = &filter.predicate
+        {
+            // OR: extract from each operand independently.
+            // Try vector-left + text-right, then vector-right + text-left.
+            let result = self
+                .extract_vector_predicate(left)
+                .and_then(|v| self.extract_text_predicate(right).map(|t| (v, t)))
+                .or_else(|| {
+                    self.extract_vector_predicate(right)
+                        .and_then(|v| self.extract_text_predicate(left).map(|t| (v, t)))
+                });
+            let Some((v, t)) = result else {
+                return Ok(None);
             };
+            (v, t, true)
+        } else {
+            // AND: extractors recurse into the AND tree (existing behavior).
+            let vector = self.extract_vector_predicate(&filter.predicate);
+            let text = self.extract_text_predicate(&filter.predicate);
+            match (vector, text) {
+                (Some(v), Some(t)) => (v, t, false),
+                _ => return Ok(None),
+            }
+        };
 
         // Validate both reference the scan variable
         if vector_pred.variable != scan.variable || text_pred.variable != scan.variable {
@@ -1860,8 +1856,11 @@ impl super::Planner {
         }
 
         let proj_schema = self.derive_schema_from_columns(&output_cols);
-        let proj_op: Box<dyn Operator> =
-            Box::new(super::ProjectOperator::new(join_op, proj_exprs, proj_schema));
+        let proj_op: Box<dyn Operator> = Box::new(super::ProjectOperator::new(
+            join_op,
+            proj_exprs,
+            proj_schema,
+        ));
 
         // Apply any remaining scalar predicates (parts of the expression that are
         // neither vector nor text, e.g. an extra AND condition)
@@ -1894,10 +1893,7 @@ impl super::Planner {
     /// Recursively walks AND trees. At each leaf (non-AND node), checks whether
     /// it is a vector or text predicate. Keeps only the scalar (non-index) parts.
     /// Used to find conditions that must be applied after the hash join.
-    fn extract_scalar_remaining(
-        &self,
-        expr: &LogicalExpression,
-    ) -> Option<LogicalExpression> {
+    fn extract_scalar_remaining(&self, expr: &LogicalExpression) -> Option<LogicalExpression> {
         match expr {
             LogicalExpression::Binary {
                 left,

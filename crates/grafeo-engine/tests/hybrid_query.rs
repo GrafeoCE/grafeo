@@ -12,8 +12,8 @@
 #![cfg(all(feature = "text-index", feature = "vector-index", feature = "gql"))]
 
 use grafeo_common::types::Value;
-use grafeo_engine::database::QueryResult;
 use grafeo_engine::GrafeoDB;
+use grafeo_engine::database::QueryResult;
 
 // ============================================================================
 // Shared test fixture
@@ -60,9 +60,7 @@ fn setup_article_db() -> GrafeoDB {
     db.set_node_property(
         a3,
         "body",
-        Value::String(
-            "attention mechanisms and transformer models for natural language".into(),
-        ),
+        Value::String("attention mechanisms and transformer models for natural language".into()),
     );
     db.set_node_property(
         a3,
@@ -80,9 +78,18 @@ fn setup_article_db() -> GrafeoDB {
     db.create_edge(friend, a2, "WROTE");
 
     // Create indexes
-    db.create_vector_index("Article", "embedding", Some(3), Some("cosine"), None, None, None)
-        .expect("create vector index");
-    db.create_text_index("Article", "body").expect("create text index");
+    db.create_vector_index(
+        "Article",
+        "embedding",
+        Some(3),
+        Some("cosine"),
+        None,
+        None,
+        None,
+    )
+    .expect("create vector index");
+    db.create_text_index("Article", "body")
+        .expect("create text index");
 
     db
 }
@@ -202,16 +209,11 @@ fn test_text_score_without_index_errors() {
     let db = GrafeoDB::new_in_memory();
     // Create nodes but NO text index
     let n = db.create_node(&["Article"]);
-    db.set_node_property(
-        n,
-        "body",
-        Value::String("some body text about rust".into()),
-    );
+    db.set_node_property(n, "body", Value::String("some body text about rust".into()));
 
     let session = db.session();
-    let result = session.execute(
-        "MATCH (doc:Article) WHERE text_score(doc.body, 'rust') > 0.0 RETURN doc.title",
-    );
+    let result = session
+        .execute("MATCH (doc:Article) WHERE text_score(doc.body, 'rust') > 0.0 RETURN doc.title");
 
     assert!(
         result.is_err(),

@@ -206,10 +206,8 @@ impl super::GrafeoDB {
             match &index {
                 VectorIndexKind::Hnsw(_) => {
                     let graph = self.graph_store();
-                    let accessor = grafeo_core::index::vector::PropertyVectorAccessor::new(
-                        &*graph,
-                        property,
-                    );
+                    let accessor =
+                        grafeo_core::index::vector::PropertyVectorAccessor::new(&*graph, property);
                     for (node_id, vec) in &vectors {
                         index.insert(*node_id, vec, &accessor);
                     }
@@ -386,9 +384,7 @@ impl super::GrafeoDB {
         let graph = self.graph_store();
         let nodes = graph.nodes_by_label(label);
         for node_id in nodes {
-            if let Some(Value::String(text)) =
-                graph.get_node_property(node_id, &prop_key)
-            {
+            if let Some(Value::String(text)) = graph.get_node_property(node_id, &prop_key) {
                 index.insert(node_id, text.as_str());
             }
         }

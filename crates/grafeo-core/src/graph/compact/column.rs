@@ -450,7 +450,9 @@ impl ColumnCodec {
                 // Float32Vector
                 let dimensions = read_u16_le(data, pos)?;
                 let data_len = read_u32_le(data, pos)? as usize;
-                let byte_need = data_len.checked_mul(4).ok_or("Float32Vector length overflow")?;
+                let byte_need = data_len
+                    .checked_mul(4)
+                    .ok_or("Float32Vector length overflow")?;
                 if *pos + byte_need > data.len() {
                     return Err("truncated Float32Vector data");
                 }

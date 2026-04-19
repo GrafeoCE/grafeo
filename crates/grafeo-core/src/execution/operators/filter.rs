@@ -3390,13 +3390,16 @@ impl ExpressionPredicate {
     ///
     /// Handles both `Value::Vector` (native) and `Value::List` (GQL inline literal
     /// form `[0.9, 0.1, 0.0]` which the parser translates to a list of Float64/Int64).
-    fn coerce_to_float_vec(val: &Value) -> Option<std::borrow::Cow<[f32]>> {
+    fn coerce_to_float_vec(val: &Value) -> Option<std::borrow::Cow<'_, [f32]>> {
         match val {
             Value::Vector(v) => Some(std::borrow::Cow::Borrowed(v.as_ref())),
             Value::List(list) => {
                 let mut vec = Vec::with_capacity(list.len());
                 for item in list.iter() {
                     match item {
+                        // GQL numeric literals are Float64; f64→f32 precision loss is intentional
+                        // since all HNSW indexes store f32 components.
+                        #[allow(clippy::cast_possible_truncation)]
                         Value::Float64(f) => vec.push(*f as f32),
                         Value::Int64(i) => vec.push(*i as f32),
                         _ => return None,
@@ -6556,12 +6559,20 @@ mod text_fn_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    fn setup_store_with_text_index() -> (Arc<LpgStore>, grafeo_common::types::NodeId, grafeo_common::types::NodeId) {
+    fn setup_store_with_text_index() -> (
+        Arc<LpgStore>,
+        grafeo_common::types::NodeId,
+        grafeo_common::types::NodeId,
+    ) {
         let store = Arc::new(LpgStore::new().unwrap());
 
         // Create nodes with text properties
         let n1 = store.create_node(&["Article"]);
-        store.set_node_property(n1, "body", Value::String("rust graph database engine".into()));
+        store.set_node_property(
+            n1,
+            "body",
+            Value::String("rust graph database engine".into()),
+        );
         let n2 = store.create_node(&["Article"]);
         store.set_node_property(n2, "body", Value::String("python web framework".into()));
 
@@ -6610,9 +6621,15 @@ mod text_fn_tests {
         );
 
         // n1 matches "rust database" — should pass
-        assert!(predicate.evaluate(&chunk, 0), "n1 should score > 0 for 'rust database'");
+        assert!(
+            predicate.evaluate(&chunk, 0),
+            "n1 should score > 0 for 'rust database'"
+        );
         // n2 does not match — should fail
-        assert!(!predicate.evaluate(&chunk, 1), "n2 should score 0 for 'rust database'");
+        assert!(
+            !predicate.evaluate(&chunk, 1),
+            "n2 should score 0 for 'rust database'"
+        );
     }
 
     #[test]

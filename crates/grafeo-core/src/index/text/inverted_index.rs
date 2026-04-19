@@ -528,7 +528,10 @@ mod tests {
     #[test]
     fn test_score_document_matches_search() {
         let mut index = InvertedIndex::new(BM25Config::default());
-        index.insert(NodeId::new(1), "the quick brown fox jumps over the lazy dog");
+        index.insert(
+            NodeId::new(1),
+            "the quick brown fox jumps over the lazy dog",
+        );
         index.insert(NodeId::new(2), "a fast red car drives on the highway");
         index.insert(NodeId::new(3), "the brown dog sleeps all day");
 
@@ -561,13 +564,19 @@ mod tests {
         index.insert(NodeId::new(2), "python web framework django flask");
         index.insert(NodeId::new(3), "rust systems programming language");
         index.insert(NodeId::new(4), "graph theory algorithms data structures");
-        index.insert(NodeId::new(5), "database indexing storage engine optimization");
+        index.insert(
+            NodeId::new(5),
+            "database indexing storage engine optimization",
+        );
 
         let query = "rust graph database";
 
         // Get search results to calibrate the threshold
         let search_results = index.search(query, 10);
-        assert!(search_results.len() >= 2, "need at least 2 matching docs for this test");
+        assert!(
+            search_results.len() >= 2,
+            "need at least 2 matching docs for this test"
+        );
 
         // Use the score of the second-highest result as our mid threshold
         let mid_threshold = search_results[1].1;
