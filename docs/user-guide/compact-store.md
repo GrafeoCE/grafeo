@@ -10,13 +10,20 @@ tags:
 
 # Compact Store
 
-CompactStore is a read-only columnar graph format that trades mutability for performance.
-After ingesting data (read-write), call `compact()` to switch the database to a columnar
-layout with CSR adjacency. Queries keep working across all supported languages, but writes
-are rejected.
+CompactStore is a columnar graph format that trades some write performance for large
+memory and query wins. After ingesting data, call `compact()` to switch the database
+to a columnar layout with CSR adjacency. From 0.5.39, `compact()` is **non-destructive
+and writable**: it produces a layered store with an immutable columnar base plus a
+mutable overlay. Inserts and property updates after `compact()` land in the overlay;
+`recompact()` merges the overlay back into a fresh base.
 
-**When to use it:** workloads that ingest once, then query many times. Code analysis tools,
-static knowledge graphs, pre-built datasets for WASM or edge deployments.
+Queries keep working across all supported languages, indexes (vector, text, hybrid)
+can be created and searched post-compact, and named graphs are preserved across
+`compact()` / `recompact()`.
+
+**When to use it:** workloads that ingest once and query many times, or read-heavy
+workloads with occasional updates. Code analysis tools, static knowledge graphs,
+pre-built datasets for WASM or edge deployments.
 
 ## Performance
 
@@ -153,19 +160,38 @@ Property values are automatically mapped to the most efficient columnar codec:
 | `Int64` (non-negative) | BitPacked | Auto-determined bit width |
 | `Bool` | Bitmap | 1 bit per value |
 | `String` | Dictionary | Deduplicated string table |
-| `Float64` | Dictionary | Serialized as string |
+| `Float64` | Float64 (native) | 8 bytes per value, since 0.5.40 |
+| `Vector` (f32) | Float32Vector (native) | Contiguous float32 storage, since 0.5.40 |
+| Mixed `Int64 + Float64` | Float64 (native) | Columns coalesce to `Float64` when both types appear |
 | Negative `Int64` | Dictionary | Serialized as string |
 | `List`, `Map`, `Timestamp`, etc. | Dictionary | Serialized as string |
 
 !!! note
-    Dictionary-encoded fallback preserves data but loses typed semantics for comparison
-    and range queries. If your workload depends on numeric range scans over `Float64` or
-    negative integers, keep the standard LpgStore.
+    Before 0.5.40, `Float64` and `Vector` columns fell back to dictionary encoding,
+    which preserved data but lost typed semantics for range scans. Native codecs
+    now retain those semantics without a dictionary round-trip. Dictionary fallback
+    still applies to negative integers and complex values (`List`, `Map`, etc.).
+
+## Writes After `compact()`
+
+Since 0.5.39, `compact()` returns a layered store: an immutable columnar base plus a
+mutable overlay. New inserts and property updates land in the overlay and are visible
+to subsequent queries (`get_node`, property reads, pattern matching, `list_graphs`).
+
+Call `recompact()` to merge the overlay back into a fresh base:
+
+    db.compact()
+    db.execute("INSERT (:Person {name: 'Mia'})")   # lands in overlay
+    db.recompact()                                  # merges overlay into new base
+
+Indexes (`create_vector_index`, `create_text_index`, hybrid search) work on layered
+stores: vector/text scan and search now fall through both layers.
 
 ## Limitations
 
-- **Read-only**: all write queries (`INSERT`, `CREATE`, `SET`, `DELETE`) fail after `compact()`
-- **No undo**: you cannot switch back to read-write mode
+- **Overlay write path**: writes go through the overlay, which is less optimized than
+  `LpgStore`'s full MVCC path. Sustained write-heavy workloads should stay on `LpgStore`
+  or call `recompact()` periodically.
 - **Multi-label nodes**: nodes with multiple labels are stored under a compound key
   (e.g., `"Actor|Person"`, sorted alphabetically). A query like `MATCH (n:Person)` will
   not match nodes stored under `"Actor|Person"`. Workarounds:

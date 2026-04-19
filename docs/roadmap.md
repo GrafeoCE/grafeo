@@ -114,7 +114,7 @@ The beta series focuses on correctness, completeness and real-world durability. 
 - **Edge variable resolution** (#268): multi-hop queries returned edge variables as raw IDs instead of maps
 - **Arrow/DataFrame structural column rename** (#272): underscore-prefixed columns (`_id`, `_type`, `_source`, `_target`) prevent collision with user properties
 
-### Delivered in 0.5.39 (current, unreleased)
+### Delivered in 0.5.39
 
 - **Push-based pipeline execution**: queries with filter, sort, aggregate, limit, or distinct now execute through a push-based pipeline instead of the Volcano pull loop
 - **Encryption at rest** (`encryption` feature): AES-256-GCM for WAL records and `.grafeo` sections with password-based (Argon2id) or raw-key setup
@@ -122,15 +122,26 @@ The beta series focuses on correctness, completeness and real-world durability. 
 - **Runtime metrics**: query, transaction, session, cache, and GC counters with Prometheus text export
 - **WASM binary size**: reduced to 650 KB gzipped (competitive with sql.js)
 - **C# enterprise APIs**: schema management, backup/restore, compact, projections, CDC toggle, `IGrafeoDB`/`ITransaction` interfaces
+- **Layered compact store**: `compact()` now produces a writable two-layer store (columnar base + overlay) instead of a read-only snapshot. `recompact()` merges the overlay back into the base.
+
+### Delivered in 0.5.40
+
+- **Unified hybrid queries**: `text_score()` and `text_match()` are now evaluable as per-row filter expressions. The planner pushes `text_score(n.prop, "query") > threshold` and vector score predicates into dedicated `TextScan` / `VectorScan` operators, supports compound AND/OR hybrid joins, recognizes `ORDER BY ... LIMIT` as top-K, and projects the score column to avoid recompute. See [Filter-expression hybrid search](user-guide/vector-search/filter-expressions.md).
+- **BM25 text scan operator**: `TextScanOperator` supports both top-K and threshold modes. `InvertedIndex` gains `score_document`, `search_with_threshold`, and `bm25_term_score` helpers.
+- **Float64 and Float32Vector column codecs**: `CompactStore` stores `Value::Float64` and `Value::Vector` properties natively instead of falling back to dictionary encoding. Mixed `Int64 + Float64` columns coalesce to `Float64`.
+- **MERGE uses property indexes**: `MERGE (n:Label {prop: value})` now goes through the property index when one exists, matching `MATCH` performance. Previously O(n) on large graphs.
+- **Index and search after `compact()`**: `create_vector_index`, `vector_search`, `create_text_index`, `text_search`, and the other ~26 index/search methods now work correctly on layered stores (previously panicked or silently returned empty).
+- **`LayeredStore` new-node visibility**: `get_node` and `get_node_property` fall back to the overlay for nodes added after `compact()`, fixing `recompact()` dropping those nodes from the merged base.
+- **Named graphs across `compact()` / `recompact()`**: `list_graphs`, `drop_graph`, `create_graph`, and `set_current_graph` now see graphs that existed before compaction.
 
 ### Planned Releases
 
-| Version    | Focus                                                                                |
-|------------|--------------------------------------------------------------------------------------|
-| **0.5.40** | API stability and developer experience: stable/beta/experimental tier annotations, cursor-based streaming results, memory introspection, contributor documentation |
-| **0.5.41** | Improved temporal queries: temporal indexes, GQL temporal syntax extensions, async storage server integration |
-| **0.5.42** | Offline-first sync protocol, cross-language query translation, final 0.6.x blocker audit |
-| **0.5.43** | Flutter/mobile builds (Android NDK, iOS xcframework), final feature profile audit and doc sweep |
+| Version    | Focus                                                                                                                                                               |
+|------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **0.5.41** | API stability and developer experience: stable/beta/experimental tier annotations, cursor-based streaming results, memory introspection, contributor documentation  |
+| **0.5.42** | Improved temporal queries: temporal indexes, GQL temporal syntax extensions, async storage server integration                                                       |
+| **0.5.43** | Offline-first sync protocol, cross-language query translation, final 0.6.x blocker audit                                                                            |
+| **0.5.44** | Flutter/mobile builds (Android NDK, iOS xcframework), final feature profile audit and doc sweep                                                                     |
 
 ---
 
