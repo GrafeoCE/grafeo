@@ -503,7 +503,7 @@ impl PyGrafeoDB {
                 }
             })
             .await
-            .map_err(|e| PyGrafeoError::Database(e.to_string()))?
+            .map_err(|e| PyGrafeoError::database(e.to_string()))?
             .map_err(PyGrafeoError::from)?;
 
             // Extract entities before consuming the result rows.
@@ -726,7 +726,7 @@ impl PyGrafeoDB {
             > = node.properties.into_iter().collect();
             Ok(PyNode::new(id, labels, properties))
         } else {
-            Err(PyGrafeoError::Database("Failed to create node".into()).into())
+            Err(PyGrafeoError::database("Failed to create node").into())
         }
     }
 
@@ -774,7 +774,7 @@ impl PyGrafeoDB {
                 properties,
             ))
         } else {
-            Err(PyGrafeoError::Database("Failed to create edge".into()).into())
+            Err(PyGrafeoError::database("Failed to create edge").into())
         }
     }
 

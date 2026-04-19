@@ -16,6 +16,7 @@ Example:
 from grafeo.grafeo import (
     Edge,
     GrafeoDB,
+    GrafeoError,
     Node,
     QueryResult,
     ResultStream,
@@ -27,6 +28,7 @@ from grafeo.grafeo import (
 
 __all__ = [
     "GrafeoDB",
+    "GrafeoError",
     "Node",
     "Edge",
     "QueryResult",

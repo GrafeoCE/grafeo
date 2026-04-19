@@ -73,6 +73,10 @@ fn simd_support() -> &'static str {
 /// Grafeo Python module.
 #[pymodule]
 fn grafeo(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add(
+        "GrafeoError",
+        m.py().get_type::<crate::error::GrafeoError>(),
+    )?;
     m.add_class::<PyGrafeoDB>()?;
     m.add_class::<PyNode>()?;
     m.add_class::<PyEdge>()?;

@@ -1,29 +1,82 @@
 //! Converts Rust errors to Python exceptions.
 //!
-//! Type errors and invalid arguments become `ValueError`, while database,
-//! query, and transaction errors become `RuntimeError`.
+//! Type errors and invalid arguments become `ValueError`. Database, query,
+//! and transaction errors become `GrafeoError` — a new subclass of
+//! `RuntimeError` that carries the original `ErrorCode` and `is_retryable`
+//! flag as attributes.
+//!
+//! `GrafeoError` inherits from `RuntimeError`, so existing code that catches
+//! `RuntimeError` continues to work. New code can catch `GrafeoError`
+//! specifically and inspect `e.error_code` / `e.is_retryable`.
 
+use grafeo_common::utils::error::ErrorCode;
+use pyo3::create_exception;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use thiserror::Error;
 
+create_exception!(
+    grafeo,
+    GrafeoError,
+    PyRuntimeError,
+    "Grafeo-specific runtime error with machine-readable `error_code` and `is_retryable` attributes."
+);
+
 /// Grafeo errors that translate to Python exceptions.
 #[derive(Error, Debug)]
 pub enum PyGrafeoError {
-    #[error("Database error: {0}")]
-    Database(String),
+    #[error("Database error: {message}")]
+    Database {
+        message: String,
+        code: Option<ErrorCode>,
+    },
 
-    #[error("Query error: {0}")]
-    Query(String),
+    #[error("Query error: {message}")]
+    Query {
+        message: String,
+        code: Option<ErrorCode>,
+    },
 
     #[error("Type error: {0}")]
     Type(String),
 
-    #[error("Transaction error: {0}")]
-    Transaction(String),
+    #[error("Transaction error: {message}")]
+    Transaction {
+        message: String,
+        code: Option<ErrorCode>,
+    },
 
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
+}
+
+impl PyGrafeoError {
+    /// Constructs a plain `Database` variant without a known error code.
+    ///
+    /// Used by call sites that produce strings (binding-internal errors
+    /// with no upstream `Error` to classify).
+    pub fn database<S: Into<String>>(message: S) -> Self {
+        Self::Database {
+            message: message.into(),
+            code: None,
+        }
+    }
+
+    /// Constructs a plain `Query` variant without a known error code.
+    pub fn query<S: Into<String>>(message: S) -> Self {
+        Self::Query {
+            message: message.into(),
+            code: None,
+        }
+    }
+
+    /// Constructs a plain `Transaction` variant without a known error code.
+    pub fn transaction<S: Into<String>>(message: S) -> Self {
+        Self::Transaction {
+            message: message.into(),
+            code: None,
+        }
+    }
 }
 
 impl From<PyGrafeoError> for PyErr {
@@ -32,21 +85,41 @@ impl From<PyGrafeoError> for PyErr {
             PyGrafeoError::InvalidArgument(msg) | PyGrafeoError::Type(msg) => {
                 PyValueError::new_err(msg)
             }
-            PyGrafeoError::Database(msg)
-            | PyGrafeoError::Query(msg)
-            | PyGrafeoError::Transaction(msg) => PyRuntimeError::new_err(msg),
+            PyGrafeoError::Database { message, code }
+            | PyGrafeoError::Query { message, code }
+            | PyGrafeoError::Transaction { message, code } => build_grafeo_error(message, code),
         }
     }
+}
+
+/// Builds a `GrafeoError` with `error_code` and `is_retryable` attributes set
+/// when a code is known. Falls back to a plain `GrafeoError(message)` when
+/// the code cannot be determined.
+fn build_grafeo_error(message: String, code: Option<ErrorCode>) -> PyErr {
+    Python::attach(|py| {
+        let err = GrafeoError::new_err(message);
+        if let Some(code) = code {
+            // Best-effort attribute attachment. If setattr fails (e.g. under
+            // a stripped-down interpreter), the caller still sees a
+            // GrafeoError with the message, just without the structured
+            // attributes.
+            let inst = err.value(py);
+            let _ = inst.setattr("error_code", code.as_str());
+            let _ = inst.setattr("is_retryable", code.is_retryable());
+        }
+        err
+    })
 }
 
 impl From<grafeo_common::utils::error::Error> for PyGrafeoError {
     fn from(err: grafeo_common::utils::error::Error) -> Self {
         use grafeo_bindings_common::error::{ErrorCategory, classify_error};
-        let msg = err.to_string();
+        let code = Some(err.error_code());
+        let message = err.to_string();
         match classify_error(&err) {
-            ErrorCategory::Query => PyGrafeoError::Query(msg),
-            ErrorCategory::Transaction => PyGrafeoError::Transaction(msg),
-            _ => PyGrafeoError::Database(msg),
+            ErrorCategory::Query => PyGrafeoError::Query { message, code },
+            ErrorCategory::Transaction => PyGrafeoError::Transaction { message, code },
+            _ => PyGrafeoError::Database { message, code },
         }
     }
 }
