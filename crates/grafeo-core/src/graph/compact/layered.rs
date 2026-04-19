@@ -2566,39 +2566,56 @@ mod tests {
 
         // Kind 1: dirty node (new overlay node).
         layered.create_node(&["Person"]);
-        assert_eq!(layered.overlay_mutation_count(), 1);
+        assert_eq!(
+            layered.overlay_mutation_count(),
+            1,
+            "kind 1 (dirty node) must increment by exactly 1"
+        );
 
-        // Kind 2: dirty edge (new overlay edge between overlay nodes).
+        // Kind 2: dirty edge (new overlay edge between new overlay nodes).
+        // Two more dirty nodes + one dirty edge = +3. Running total 1 + 3 = 4.
         let a = layered.create_node(&["Person"]);
         let b = layered.create_node(&["Person"]);
         let _ = layered.create_edge(a, b, "KNOWS");
-        // create_edge added 1 edge, but a and b were already counted as dirty.
-        assert!(layered.overlay_mutation_count() >= 4);
+        assert_eq!(
+            layered.overlay_mutation_count(),
+            4,
+            "kind 2 (2 nodes + 1 edge) must add exactly 3, for total 4"
+        );
 
         // Kind 3: deleted base node.
         let persons = layered.nodes_by_label("Person");
         let base_person = *persons
             .iter()
             .find(|id| layered.base.get_node(**id).is_some())
-            .unwrap();
+            .expect("fixture must have at least one base node");
+        let before_delete_node = layered.overlay_mutation_count();
         layered.delete_node(base_person);
+        assert_eq!(
+            layered.overlay_mutation_count(),
+            before_delete_node + 1,
+            "kind 3 (deleted base node) must increment by exactly 1"
+        );
 
-        // Kind 4: deleted base edge.
+        // Kind 4: deleted base edge. The fixture is required to have one so
+        // this branch always executes; a conditional would let the kind-4
+        // tracker silently regress.
         let persons2 = layered.nodes_by_label("Person");
-        if let Some(other_base) = persons2
+        let (other_base, base_eid) = persons2
             .iter()
-            .find(|id| layered.base.get_node(**id).is_some())
-        {
-            let edges = layered.edges_from(*other_base, Direction::Outgoing);
-            if let Some((_, eid)) = edges.first() {
-                layered.delete_edge(*eid);
-            }
-        }
-
-        // All mutations recorded; at least one of each kind.
-        assert!(
-            layered.overlay_mutation_count() > 0,
-            "mutation count should reflect tracked changes"
+            .find_map(|id| {
+                layered.base.get_node(*id)?;
+                let edges = layered.edges_from(*id, Direction::Outgoing);
+                edges.first().map(|(_, eid)| (*id, *eid))
+            })
+            .expect("fixture must have at least one base edge to delete");
+        let _ = other_base;
+        let before_delete_edge = layered.overlay_mutation_count();
+        layered.delete_edge(base_eid);
+        assert_eq!(
+            layered.overlay_mutation_count(),
+            before_delete_edge + 1,
+            "kind 4 (deleted base edge) must increment by exactly 1"
         );
     }
 

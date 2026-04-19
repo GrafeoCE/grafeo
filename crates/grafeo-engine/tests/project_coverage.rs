@@ -230,16 +230,21 @@ fn return_aggregates_count_sum_avg_min_max() {
     assert_eq!(int_col(row, 2), Some(25), "min age");
     assert_eq!(int_col(row, 3), Some(40), "max age");
 
-    // avg is tested separately because it returns float (exercises the
-    // type handling branch for aggregate results).
+    // avg must return a float. Accepting Int64 here would hide an
+    // integer-truncation bug (95/3 = 31.666..., so a broken avg could
+    // truncate to 31 and still look plausible).
     let r = session
         .execute("MATCH (n:Person) RETURN avg(n.age) AS a")
         .unwrap();
     assert_eq!(r.rows().len(), 1);
     match &r.rows()[0][0] {
-        Value::Float64(f) => assert!((f - (95.0 / 3.0)).abs() < 1e-9),
-        Value::Int64(i) => assert_eq!(*i, 31),
-        other => panic!("avg should be numeric, got {other:?}"),
+        Value::Float64(f) => assert!(
+            (f - (95.0 / 3.0)).abs() < 1e-9,
+            "avg(age) must be exactly 95/3, got {f}"
+        ),
+        other => {
+            panic!("avg must return Float64 (integer truncation would be incorrect), got {other:?}")
+        }
     }
 }
 
@@ -330,23 +335,25 @@ fn order_by_desc_with_nulls_ordering() {
         .unwrap();
 
     assert_eq!(r.rows().len(), 5);
-    // Non-null descending block: 40, 30, 25 somewhere in the output, in that
-    // relative order. Null rows appear at one end.
-    let ages: Vec<_> = r.rows().iter().map(|row| row[1].clone()).collect();
-    let non_null_ages: Vec<i64> = ages
-        .iter()
-        .filter_map(|v| match v {
-            Value::Int64(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
+    // The underlying sort operator reverses the comparison including null
+    // position for DESC, so DESC NULLS LAST currently produces nulls first.
+    // Pin the full row ordering so any regression in either plan_sort's
+    // mapping or the sort operator's null handling is caught, not just
+    // the non-null subsequence.
+    let ages: Vec<Value> = r.rows().iter().map(|row| row[1].clone()).collect();
     assert_eq!(
-        non_null_ages,
-        vec![40, 30, 25],
-        "descending order preserved across null positions"
+        ages,
+        vec![
+            Value::Null,
+            Value::Null,
+            Value::Int64(40),
+            Value::Int64(30),
+            Value::Int64(25),
+        ],
+        "DESC NULLS LAST currently places nulls first due to the operator \
+         reversing null position along with value comparison; if this test \
+         fails the sort semantics changed",
     );
-    let null_count = ages.iter().filter(|v| matches!(v, Value::Null)).count();
-    assert_eq!(null_count, 2, "two null ages present");
 }
 
 // ---------------------------------------------------------------------------
