@@ -657,3 +657,109 @@ mod session_isolation {
         assert_eq!(result.row_count(), 1, "Only Alix should survive");
     }
 }
+
+// ============================================================================
+// 6. Multi-schema transaction atomicity (ISO/IEC 39075 catalog hierarchy)
+// ============================================================================
+
+mod multi_schema_atomicity {
+    use super::*;
+
+    #[test]
+    #[ignore = "0.5.40 finding: INSERT followed by SESSION SET SCHEMA inside a \
+                transaction loses the pre-switch graph's writes on COMMIT. \
+                Rollback path unaffected (see rollback_is_atomic_across_schemas). \
+                Tracked for 0.5.41."]
+    fn commit_is_atomic_across_schemas() {
+        let db = db();
+        let session = db.session();
+
+        session.execute("CREATE SCHEMA alpha").unwrap();
+        session.execute("CREATE SCHEMA beta").unwrap();
+
+        session.execute("START TRANSACTION").unwrap();
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        session.execute("INSERT (:Item {owner: 'alpha'})").unwrap();
+        // Visible within the same tx before the schema switch
+        let mid = session.execute("MATCH (n:Item) RETURN n").unwrap();
+        assert_eq!(
+            mid.row_count(),
+            1,
+            "alpha write must be visible within its own tx"
+        );
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        session.execute("INSERT (:Item {owner: 'beta'})").unwrap();
+        session.execute("COMMIT").unwrap();
+
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        let a = session.execute("MATCH (n:Item) RETURN n").unwrap();
+        assert_eq!(a.row_count(), 1, "alpha's commit should be visible");
+
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        let b = session.execute("MATCH (n:Item) RETURN n").unwrap();
+        assert_eq!(b.row_count(), 1, "beta's commit should be visible");
+    }
+
+    #[test]
+    fn rollback_is_atomic_across_schemas() {
+        let db = db();
+        let session = db.session();
+
+        session.execute("CREATE SCHEMA alpha").unwrap();
+        session.execute("CREATE SCHEMA beta").unwrap();
+
+        session.execute("START TRANSACTION").unwrap();
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        session.execute("INSERT (:Item {owner: 'alpha'})").unwrap();
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        session.execute("INSERT (:Item {owner: 'beta'})").unwrap();
+        session.execute("ROLLBACK").unwrap();
+
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        let a = session.execute("MATCH (n:Item) RETURN n").unwrap();
+        assert_eq!(
+            a.row_count(),
+            0,
+            "alpha's write must be undone by cross-schema rollback"
+        );
+
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        let b = session.execute("MATCH (n:Item) RETURN n").unwrap();
+        assert_eq!(
+            b.row_count(),
+            0,
+            "beta's write must be undone by cross-schema rollback"
+        );
+    }
+
+    #[test]
+    fn partial_failure_rolls_back_all_schemas() {
+        let db = db();
+        let session = db.session();
+
+        session.execute("CREATE SCHEMA alpha").unwrap();
+        session.execute("CREATE SCHEMA beta").unwrap();
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        session
+            .execute("CREATE NODE TYPE Strict (name STRING NOT NULL)")
+            .unwrap();
+
+        session.execute("START TRANSACTION").unwrap();
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        session.execute("INSERT (:Item {owner: 'alpha'})").unwrap();
+
+        // Provoke a constraint violation in beta; the earlier alpha write
+        // must unwind on rollback.
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        let _ = session.execute("INSERT (:Strict {})"); // missing required 'name'
+        session.execute("ROLLBACK").unwrap();
+
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        let a = session.execute("MATCH (n:Item) RETURN n").unwrap();
+        assert_eq!(
+            a.row_count(),
+            0,
+            "alpha write must be rolled back after beta's failure"
+        );
+    }
+}
