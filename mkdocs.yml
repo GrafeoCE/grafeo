@@ -290,6 +290,7 @@ nav:
     - Catalog, Schemas & Graphs: user-guide/catalog-hierarchy.md
     - Temporal Properties & Time-Travel: user-guide/temporal.md
     - Observability: user-guide/observability.md
+    - Error Codes: user-guide/error-codes.md
     - Offline Sync: user-guide/offline-sync.md
     - Change Data Capture: user-guide/cdc.md
     - Persistence:
