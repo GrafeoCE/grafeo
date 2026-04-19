@@ -898,43 +898,48 @@ impl super::Planner {
     /// Attempts to rewrite Sort+Limit on a vector/text function into
     /// a direct index scan that returns results in order.
     fn try_topk_rewrite(&self, sort: &SortOp) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
-        // Must have exactly one sort key
         if sort.keys.len() != 1 {
             return Ok(None);
         }
         let sort_key = &sort.keys[0];
-
-        // Input must be Limit (Sort wraps Limit in the AST)
         let LogicalOperator::Limit(limit) = sort.input.as_ref() else {
             return Ok(None);
         };
-        // Parameter-based limits can't be used for top-K rewrite at plan time
-        let crate::query::plan::CountExpr::Literal(k) = &limit.count else {
-            return Ok(None); // Non-constant limit
-        };
-        let k = *k;
 
-        // Walk through the Limit's input to find a NodeScan
-        let Some((scan_var, scan_label)) = find_node_scan(&limit.input) else {
-            return Ok(None);
-        };
-        let Some(ref label) = scan_label else {
-            return Ok(None); // No label → can't look up index
-        };
+        // All remaining work is index-specific; skip when no index feature is compiled in.
+        #[cfg(any(feature = "vector-index", feature = "text-index"))]
+        {
+            let crate::query::plan::CountExpr::Literal(k) = &limit.count else {
+                return Ok(None);
+            };
+            let k = *k;
 
-        // Sort key must be a vector or text function call
-        match &sort_key.expression {
-            LogicalExpression::FunctionCall { name, args, .. } => match name.as_str() {
-                #[cfg(feature = "vector-index")]
-                "cosine_similarity" | "euclidean_distance" | "dot_product"
-                | "manhattan_distance" => {
-                    self.try_vector_topk(name, args, k, &scan_var, label, sort_key)
-                }
-                #[cfg(feature = "text-index")]
-                "text_score" => self.try_text_topk(args, k, &scan_var, label, sort_key),
+            let Some((scan_var, scan_label)) = find_node_scan(&limit.input) else {
+                return Ok(None);
+            };
+            let Some(ref label) = scan_label else {
+                return Ok(None);
+            };
+
+            match &sort_key.expression {
+                LogicalExpression::FunctionCall { name, args, .. } => match name.as_str() {
+                    #[cfg(feature = "vector-index")]
+                    "cosine_similarity" | "euclidean_distance" | "dot_product"
+                    | "manhattan_distance" => {
+                        self.try_vector_topk(name, args, k, &scan_var, label, sort_key)
+                    }
+                    #[cfg(feature = "text-index")]
+                    "text_score" => self.try_text_topk(args, k, &scan_var, label, sort_key),
+                    _ => Ok(None),
+                },
                 _ => Ok(None),
-            },
-            _ => Ok(None),
+            }
+        }
+
+        #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
+        {
+            let _ = (sort_key, limit);
+            Ok(None)
         }
     }
 
@@ -1103,6 +1108,7 @@ impl super::Planner {
     }
 }
 
+#[cfg(any(feature = "vector-index", feature = "text-index"))]
 fn find_node_scan(op: &LogicalOperator) -> Option<(String, Option<String>)> {
     match op {
         LogicalOperator::NodeScan(scan) => Some((scan.variable.clone(), scan.label.clone())),

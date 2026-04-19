@@ -1,6 +1,6 @@
 //! End-to-end integration tests for unified hybrid queries.
 //!
-//! Tests the full pipeline: Cypher parsing → planning → pushdown → execution.
+//! Tests the full pipeline: GQL parsing → planning → pushdown → execution.
 //! Covers text pushdown, vector pushdown, text_match, text_score,
 //! graph+vector per-row eval, error on missing text index,
 //! and brute-force fallback without vector index.
@@ -70,9 +70,9 @@ fn setup_article_db() -> GrafeoDB {
 
     // Create user + friend with relationships
     let user = db.create_node(&["User"]);
-    db.set_node_property(user, "name", Value::String("Alice".into()));
+    db.set_node_property(user, "name", Value::String("Alix".into()));
     let friend = db.create_node(&["User"]);
-    db.set_node_property(friend, "name", Value::String("Bob".into()));
+    db.set_node_property(friend, "name", Value::String("Vincent".into()));
     db.create_edge(user, friend, "FOLLOWS");
     db.create_edge(friend, a1, "WROTE");
     db.create_edge(friend, a2, "WROTE");
@@ -201,11 +201,11 @@ fn test_vector_where_with_pushdown() {
 }
 
 // ============================================================================
-// Test 4: text_score without text index → must error
+// Test 4: text_score without text index → falls through to per-row eval, 0 rows
 // ============================================================================
 
 #[test]
-fn test_text_score_without_index_errors() {
+fn test_text_score_without_index_fallthrough() {
     let db = GrafeoDB::new_in_memory();
     // Create nodes but NO text index
     let n = db.create_node(&["Article"]);
@@ -213,11 +213,14 @@ fn test_text_score_without_index_errors() {
 
     let session = db.session();
     let result = session
-        .execute("MATCH (doc:Article) WHERE text_score(doc.body, 'rust') > 0.0 RETURN doc.title");
+        .execute("MATCH (doc:Article) WHERE text_score(doc.body, 'rust') > 0.0 RETURN doc.title")
+        .expect("text_score without index should fall through to per-row eval, not error");
 
-    assert!(
-        result.is_err(),
-        "Expected error when using text_score without a text index, but got success"
+    // Without an index, score_text returns None → text_score evaluates to 0.0 → predicate false.
+    assert_eq!(
+        result.row_count(),
+        0,
+        "Expected 0 rows when no text index exists (per-row eval returns 0.0 for all nodes)"
     );
 }
 
@@ -274,12 +277,12 @@ fn test_graph_plus_vector_per_row_eval() {
     let db = setup_article_db();
     let session = db.session();
 
-    // Alice follows Bob; Bob wrote articles 1 and 2.
+    // Alix follows Vincent; Vincent wrote articles 1 and 2.
     // Article 1 embedding [0.9, 0.1, 0.0] is close to query [0.85, 0.15, 0.05].
     // Article 2 embedding [0.1, 0.9, 0.0] is far from query.
     let result = session
         .execute(
-            "MATCH (u:User {name: 'Alice'})-[:FOLLOWS]->(friend)-[:WROTE]->(doc:Article) \
+            "MATCH (u:User {name: 'Alix'})-[:FOLLOWS]->(friend)-[:WROTE]->(doc:Article) \
              WHERE cosine_similarity(doc.embedding, [0.85, 0.15, 0.05]) > 0.3 \
              RETURN doc.title",
         )
@@ -291,7 +294,7 @@ fn test_graph_plus_vector_per_row_eval() {
     // (cosine similarity with [0.85, 0.15, 0.05] ≈ 0.998).
     assert!(
         !titles.is_empty(),
-        "Expected at least one article from Alice→Bob→Article traversal with similarity > 0.3"
+        "Expected at least one article from Alix→Vincent→Article traversal with similarity > 0.3"
     );
     assert!(
         titles.contains(&"Graph Neural Networks".to_string()),

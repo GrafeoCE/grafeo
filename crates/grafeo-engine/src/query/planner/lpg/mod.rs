@@ -7,6 +7,7 @@ mod aggregate;
 mod expand;
 mod expression;
 mod filter;
+mod filter_hybrid;
 mod join;
 mod mutation;
 mod project;
@@ -14,6 +15,8 @@ mod scan;
 
 #[cfg(feature = "algos")]
 use crate::query::plan::CallProcedureOp;
+#[cfg(feature = "text-index")]
+use crate::query::plan::TextScanOp;
 use crate::query::plan::{
     AddLabelOp, AggregateFunction as LogicalAggregateFunction, AggregateOp, AntiJoinOp, ApplyOp,
     BinaryOp, CreateEdgeOp, CreateNodeOp, DeleteEdgeOp, DeleteNodeOp, DistinctOp,
@@ -21,7 +24,7 @@ use crate::query::plan::{
     HorizontalAggregateOp, IntersectOp, JoinOp, JoinType, LeftJoinOp, LimitOp, LogicalExpression,
     LogicalOperator, LogicalPlan, MapCollectOp, MergeOp, MergeRelationshipOp, MultiWayJoinOp,
     NodeScanOp, OtherwiseOp, PathMode, RemoveLabelOp, ReturnOp, SetPropertyOp, ShortestPathOp,
-    SkipOp, SortOp, SortOrder, TextScanOp, UnaryOp, UnionOp, UnwindOp,
+    SkipOp, SortOp, SortOrder, UnaryOp, UnionOp, UnwindOp,
 };
 #[cfg(feature = "vector-index")]
 use crate::query::plan::{VectorMetric, VectorScanOp};

@@ -207,7 +207,12 @@ impl GrafeoDB {
     /// Unlike [`graph_store()`](Self::graph_store) (which clones an `Arc`),
     /// this borrows from `self` — suitable for constructing accessors that
     /// need `&'a dyn GraphStore` tied to the database lifetime.
-    #[cfg(feature = "lpg")]
+    #[cfg(any(
+        feature = "vector-index",
+        feature = "text-index",
+        feature = "hybrid-search",
+        feature = "embed",
+    ))]
     fn graph_store_ref(&self) -> &dyn grafeo_core::graph::GraphStore {
         if let Some(ref ext_read) = self.external_read_store {
             ext_read.as_ref()
@@ -1916,11 +1921,12 @@ impl GrafeoDB {
     /// event log according to its retention policy.
     pub fn gc(&self) {
         #[cfg(feature = "lpg")]
-        let current_epoch = {
+        {
             let min_epoch = self.transaction_manager.min_active_epoch();
             self.lpg_store().gc_versions(min_epoch);
-            self.transaction_manager.current_epoch()
-        };
+        }
+        #[cfg(all(feature = "lpg", feature = "cdc"))]
+        let current_epoch = self.transaction_manager.current_epoch();
         self.transaction_manager.gc();
 
         // Prune CDC events based on retention config (epoch + count limits)
@@ -2106,10 +2112,9 @@ impl GrafeoDB {
     /// Each section reports its memory usage to the buffer manager, enabling
     /// accurate pressure tracking. Called once after database construction.
     fn register_section_consumers(&mut self) {
+        // LPG store section
         #[cfg(feature = "lpg")]
         let store_ref = self.store.as_ref();
-        #[cfg(not(feature = "lpg"))]
-        // LPG store section
         #[cfg(feature = "lpg")]
         if let Some(store) = store_ref {
             let lpg = grafeo_core::graph::lpg::LpgStoreSection::new(Arc::clone(store));
