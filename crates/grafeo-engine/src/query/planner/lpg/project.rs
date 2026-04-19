@@ -1101,7 +1101,7 @@ impl super::Planner {
             query: args[1].clone(),
             k: Some(k),
             threshold: None,
-            score_column: Some(text_score_column_name(scan_var, &args[1])),
+            score_column: Some(text_score_column_name(scan_var, property, &args[1])),
         };
 
         self.plan_operator(&LogicalOperator::TextScan(text_scan))
@@ -1121,42 +1121,71 @@ impl super::Planner {
         expr: &LogicalExpression,
         columns: &[String],
     ) -> Option<String> {
-        if let LogicalExpression::FunctionCall { name, args, .. } = expr {
+        #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
+        {
+            let _ = (expr, columns);
+            None
+        }
+
+        #[cfg(any(feature = "vector-index", feature = "text-index"))]
+        {
+            let LogicalExpression::FunctionCall { name, args, .. } = expr else {
+                return None;
+            };
+
+            #[cfg(feature = "vector-index")]
             let is_vector_fn = matches!(
                 name.as_str(),
                 "cosine_similarity" | "euclidean_distance" | "dot_product" | "manhattan_distance"
             );
-            let is_text_fn = name == "text_score";
+            #[cfg(not(feature = "vector-index"))]
+            let is_vector_fn = false;
 
-            if is_vector_fn || is_text_fn {
-                // The first arg is the property access n.prop; variable is the
-                // node variable whose score column was projected by the scan.
-                // args[1] is the query expression, which is part of the column
-                // name so a different query (e.g. $q2 instead of $q1) against
-                // the same property does not reuse the wrong score.
-                let (Some(LogicalExpression::Property { variable, property }), Some(query)) =
-                    (args.first(), args.get(1))
-                else {
-                    return None;
+            #[cfg(feature = "text-index")]
+            let is_text_fn = name == "text_score";
+            #[cfg(not(feature = "text-index"))]
+            let is_text_fn = false;
+
+            if !(is_vector_fn || is_text_fn) {
+                return None;
+            }
+
+            // The first arg is the property access n.prop; variable is the
+            // node variable whose score column was projected by the scan.
+            // args[1] is the query expression, which is part of the column
+            // name so a different query (e.g. $q2 instead of $q1) against
+            // the same property does not reuse the wrong score.
+            let (Some(LogicalExpression::Property { variable, property }), Some(query)) =
+                (args.first(), args.get(1))
+            else {
+                return None;
+            };
+
+            #[cfg(feature = "vector-index")]
+            if is_vector_fn {
+                let metric_tag = match name.as_str() {
+                    "cosine_similarity" => "cos",
+                    "euclidean_distance" => "euc",
+                    "dot_product" => "dot",
+                    "manhattan_distance" => "man",
+                    _ => "cos",
                 };
-                let score_col = if is_vector_fn {
-                    let metric_tag = match name.as_str() {
-                        "cosine_similarity" => "cos",
-                        "euclidean_distance" => "euc",
-                        "dot_product" => "dot",
-                        "manhattan_distance" => "man",
-                        _ => "cos",
-                    };
-                    vector_score_column_name(metric_tag, property, variable, query)
-                } else {
-                    text_score_column_name(variable, query)
-                };
+                let score_col = vector_score_column_name(metric_tag, property, variable, query);
                 if columns.contains(&score_col) {
                     return Some(score_col);
                 }
             }
+
+            #[cfg(feature = "text-index")]
+            if is_text_fn {
+                let score_col = text_score_column_name(variable, property, query);
+                if columns.contains(&score_col) {
+                    return Some(score_col);
+                }
+            }
+
+            None
         }
-        None
     }
 }
 
@@ -1191,6 +1220,15 @@ pub(super) fn vector_score_column_name(
 }
 
 #[cfg(feature = "text-index")]
-pub(super) fn text_score_column_name(variable: &str, query: &LogicalExpression) -> String {
-    format!("_tscore_{}_{:x}", variable, score_query_hash(query))
+pub(super) fn text_score_column_name(
+    variable: &str,
+    property: &str,
+    query: &LogicalExpression,
+) -> String {
+    format!(
+        "_tscore_{}_{}_{:x}",
+        property,
+        variable,
+        score_query_hash(query)
+    )
 }

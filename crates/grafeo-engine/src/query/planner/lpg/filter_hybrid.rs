@@ -79,6 +79,7 @@ impl super::Planner {
             threshold: Some(extracted.threshold),
             score_column: Some(super::project::text_score_column_name(
                 &scan.variable,
+                &extracted.property,
                 &extracted.query_expr,
             )),
         };
@@ -294,6 +295,7 @@ impl super::Planner {
             threshold: Some(text_pred.threshold),
             score_column: Some(super::project::text_score_column_name(
                 &scan.variable,
+                &text_pred.property,
                 &text_pred.query_expr,
             )),
         });

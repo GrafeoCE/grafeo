@@ -1069,3 +1069,73 @@ fn test_compound_pushdown_skips_when_variable_mismatch() {
     // is similar to [0.9, 0.1, 0.0].
     assert!(result.row_count() >= 1);
 }
+
+/// `text_score` on two different properties of the same variable with the
+/// same query string must NOT share a score column. If the score-column name
+/// only keys on (variable, query), pushdown of `text_score(n.body, q)` writes
+/// a column that a later `text_score(n.title, q)` projection incorrectly
+/// reuses, returning body scores where title scores were asked for.
+#[test]
+fn test_text_score_two_properties_same_variable_and_query() {
+    let db = GrafeoDB::new_in_memory();
+
+    // Two docs, both with 'rust' in body so both pass the body-score pushdown.
+    // They differ on title: only a1.title contains 'rust'.
+    //   a1: title "rust guide",   body "rust tutorial"
+    //   a2: title "other stuff",  body "rust tutorial"
+    let a1 = db.create_node(&["Article"]);
+    db.set_node_property(a1, "title", Value::String("rust guide".into()));
+    db.set_node_property(a1, "body", Value::String("rust tutorial".into()));
+
+    let a2 = db.create_node(&["Article"]);
+    db.set_node_property(a2, "title", Value::String("other stuff".into()));
+    db.set_node_property(a2, "body", Value::String("rust tutorial".into()));
+
+    db.create_text_index("Article", "body").unwrap();
+    db.create_text_index("Article", "title").unwrap();
+
+    let session = db.session();
+
+    // Pushdown fires on body, then RETURN asks for the title score with the
+    // same query string 'rust'. If the score column only keys on (variable,
+    // query), the title score projection reuses the body score — a2 would
+    // report a positive title_score despite its title containing no 'rust'.
+    //
+    // With property in the score-column name, title score is recomputed per
+    // row via the per-row text_score path: a1.title matches, a2.title does not.
+    let result = session
+        .execute(
+            "MATCH (doc:Article) \
+             WHERE text_score(doc.body, 'rust') > 0.0 \
+             RETURN doc.title, text_score(doc.title, 'rust') AS title_score \
+             ORDER BY doc.title",
+        )
+        .expect("query with two text_score calls on different properties should execute");
+
+    assert_eq!(
+        result.row_count(),
+        2,
+        "both articles have 'rust' in body, both should pass the body pushdown"
+    );
+
+    // After ORDER BY doc.title: "other stuff" (a2) comes before "rust guide" (a1).
+    let rows = result.rows();
+    let a2_title_score = match &rows[0][1] {
+        Value::Float64(f) => *f,
+        other => panic!("expected Float64 title score for a2, got {other:?}"),
+    };
+    let a1_title_score = match &rows[1][1] {
+        Value::Float64(f) => *f,
+        other => panic!("expected Float64 title score for a1, got {other:?}"),
+    };
+
+    assert!(
+        a1_title_score > 0.0,
+        "a1.title='rust guide' must have positive text_score on title, got {a1_title_score}"
+    );
+    assert_eq!(
+        a2_title_score, 0.0,
+        "a2.title='other stuff' must have zero text_score on title, \
+         got {a2_title_score} (if nonzero, the body score was reused — collision regression)"
+    );
+}
