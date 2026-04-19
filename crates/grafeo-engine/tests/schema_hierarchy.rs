@@ -245,6 +245,32 @@ fn reset_graph_independent_of_schema() {
     assert!(s.current_graph().is_none());
 }
 
+// ── Identifier validation ───────────────────────────────────────
+
+#[test]
+fn create_schema_rejects_slash_in_name() {
+    let db = db();
+    let s = db.session();
+
+    let result = s.execute("CREATE SCHEMA `foo/bar`");
+    assert!(
+        result.is_err(),
+        "CREATE SCHEMA with '/' in name should fail (reserved separator)"
+    );
+}
+
+#[test]
+fn create_graph_rejects_slash_in_name() {
+    let db = db();
+    let s = db.session();
+
+    let result = s.execute("CREATE GRAPH `foo/bar`");
+    assert!(
+        result.is_err(),
+        "CREATE GRAPH with '/' in name should fail (reserved separator)"
+    );
+}
+
 // ── Backward compatibility ──────────────────────────────────────
 
 #[test]

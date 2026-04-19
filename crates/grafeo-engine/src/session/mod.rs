@@ -810,6 +810,12 @@ impl Session {
                 open: _,
             } => {
                 // ISO/IEC 39075 Section 12.4: graphs are created within the current schema
+                if name.contains('/') {
+                    return Err(Error::Query(QueryError::new(
+                        QueryErrorKind::Semantic,
+                        format!("Graph name '{name}' must not contain '/' (reserved as schema/graph separator)"),
+                    )));
+                }
                 let storage_key = self.effective_graph_key(&name);
 
                 // Validate source graph exists for LIKE / AS COPY OF
@@ -1702,7 +1708,14 @@ impl Session {
             SchemaStatement::CreateSchema {
                 name,
                 if_not_exists,
-            } => match self.catalog.register_schema_namespace(name.clone()) {
+            } => {
+                if name.contains('/') {
+                    return Err(Error::Query(QueryError::new(
+                        QueryErrorKind::Semantic,
+                        format!("Schema name '{name}' must not contain '/' (reserved as schema/graph separator)"),
+                    )));
+                }
+                match self.catalog.register_schema_namespace(name.clone()) {
                 Ok(()) => {
                     wal_log!(self, WalRecord::CreateSchema { name: name.clone() });
                     // Auto-create the schema's default graph partition so that
@@ -1721,7 +1734,8 @@ impl Session {
                     QueryErrorKind::Semantic,
                     e.to_string(),
                 ))),
-            },
+                }
+            }
             SchemaStatement::DropSchema { name, if_exists } => {
                 // ISO/IEC 39075 Section 12.3: schema must be empty before dropping.
                 // The auto-created __default__ graph is exempt from the check.
