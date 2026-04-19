@@ -818,8 +818,8 @@ impl Planner {
 
         // Hybrid shape `VectorScan(input=graph_pattern)` is not supported by
         // the physical VectorScanOperator: it has no input slot and would
-        // silently drop upstream bindings. Reject rather than mis-plan;
-        // callers should build a VectorJoin for this case.
+        // silently drop upstream bindings. Reject rather than plan it
+        // incorrectly; callers should build a VectorJoin for this case.
         if scan.input.is_some() {
             return Err(Error::Internal(
                 "VectorScan with an input subtree is not supported, use VectorJoin for hybrid graph+vector queries".to_string(),
