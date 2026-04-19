@@ -109,7 +109,7 @@ RETURN doc.title
 ```
 
 !!! note "Operator direction matters for pushdown"
-    Natural directions push down to an index scan: `cosine_similarity(prop, q) >= t`, `euclidean_distance(prop, q) <= t`, `manhattan_distance(prop, q) <= t`, and `text_score(prop, q) > t` / `text_score(prop, q) >= t`. Vector predicates (cosine / euclidean / manhattan) push down only for inclusive operators (`>=` / `<=`); strict `>` and `<` fall through to per-row evaluation so boundary semantics are exact. Inverted comparisons (e.g. `cosine_similarity < t`), `dot_product` (not currently pushdown-supported), and queries whose vector is not resolvable at plan time (property reference, unresolved parameter) also fall through to brute-force per-row evaluation.
+    Natural directions push down to an index scan: `cosine_similarity(prop, q) > t`, `euclidean_distance(prop, q) < t`, `manhattan_distance(prop, q) < t`, and `text_score(prop, q) > t` / `text_score(prop, q) >= t`. Inverted comparisons (e.g. `cosine_similarity < t`), `dot_product` (not currently pushdown-supported), and queries whose vector is not resolvable at plan time (property reference, unresolved parameter) also fall through to brute-force per-row evaluation.
 
 ## Compound predicates (AND / OR)
 
