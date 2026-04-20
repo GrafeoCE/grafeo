@@ -1,10 +1,10 @@
 //! Projection, RETURN, sort, limit, and skip planning.
 
 use super::{
-    Arc, Error, FilterExpression, GraphStore, HashMap, LimitOp, LogicalExpression, LogicalOperator,
-    LogicalType, NullOrder, Operator, PhysicalSortKey, ProjectExpr, ProjectOperator, Result,
-    ReturnOp, SkipOp, SortDirection, SortOp, SortOperator, SortOrder, common, expression_to_string,
-    value_to_logical_type,
+    Arc, Error, FilterExpression, GraphStoreSearch, HashMap, LimitOp, LogicalExpression,
+    LogicalOperator, LogicalType, NullOrder, Operator, PhysicalSortKey, ProjectExpr,
+    ProjectOperator, Result, ReturnOp, SkipOp, SortDirection, SortOp, SortOperator, SortOrder,
+    common, expression_to_string, value_to_logical_type,
 };
 
 impl super::Planner {
@@ -301,7 +301,7 @@ impl super::Planner {
                     input_op,
                     projections,
                     output_types,
-                    Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                    Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
                 )
                 .with_transaction_context(self.viewing_epoch, self.transaction_id)
                 .with_session_context(self.session_context.clone()),
@@ -361,7 +361,7 @@ impl super::Planner {
                         input_op,
                         projections,
                         output_types,
-                        Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                        Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
                     )
                     .with_transaction_context(self.viewing_epoch, self.transaction_id)
                     .with_session_context(self.session_context.clone()),
@@ -480,7 +480,7 @@ impl super::Planner {
                 input_op,
                 projections,
                 output_types,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone()),
@@ -820,7 +820,7 @@ impl super::Planner {
                     input_op,
                     projections,
                     output_types,
-                    Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                    Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
                 )
                 .with_transaction_context(self.viewing_epoch, self.transaction_id)
                 .with_session_context(self.session_context.clone()),

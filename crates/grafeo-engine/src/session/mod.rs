@@ -28,7 +28,7 @@ use grafeo_core::graph::lpg::LpgStore;
 use grafeo_core::graph::lpg::{Edge, Node};
 #[cfg(feature = "triple-store")]
 use grafeo_core::graph::rdf::RdfStore;
-use grafeo_core::graph::{GraphStore, GraphStoreMut};
+use grafeo_core::graph::{GraphStore, GraphStoreMut, GraphStoreSearch};
 
 use crate::catalog::{Catalog, CatalogConstraintValidator};
 use crate::config::{AdaptiveConfig, GraphModel};
@@ -112,7 +112,7 @@ pub struct Session {
     #[cfg(feature = "lpg")]
     store: Arc<LpgStore>,
     /// Graph store trait object for pluggable storage backends (read path).
-    graph_store: Arc<dyn GraphStore>,
+    graph_store: Arc<dyn GraphStoreSearch>,
     /// Writable graph store (None for read-only databases).
     graph_store_mut: Option<Arc<dyn GraphStoreMut>>,
     /// Schema and metadata catalog shared across sessions.
@@ -241,7 +241,7 @@ impl Session {
     #[cfg(feature = "lpg")]
     #[allow(dead_code)] // Used when lpg enabled without triple-store
     pub(crate) fn with_adaptive(store: Arc<LpgStore>, cfg: SessionConfig) -> Self {
-        let graph_store = Arc::clone(&store) as Arc<dyn GraphStore>;
+        let graph_store = Arc::clone(&store) as Arc<dyn GraphStoreSearch>;
         let graph_store_mut = Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>);
         Self {
             store,
@@ -300,7 +300,7 @@ impl Session {
     #[cfg(all(feature = "compact-store", feature = "lpg"))]
     pub(crate) fn override_stores(
         &mut self,
-        read_store: Arc<dyn GraphStore>,
+        read_store: Arc<dyn GraphStoreSearch>,
         write_store: Option<Arc<dyn GraphStoreMut>>,
     ) {
         self.graph_store = read_store;
@@ -323,7 +323,7 @@ impl Session {
             Arc::clone(&wal),
             Arc::clone(&wal_graph_context),
         ));
-        self.graph_store = Arc::clone(&wal_store) as Arc<dyn GraphStore>;
+        self.graph_store = Arc::clone(&wal_store) as Arc<dyn GraphStoreSearch>;
         self.graph_store_mut = Some(wal_store as Arc<dyn GraphStoreMut>);
         self.wal = Some(wal);
         self.wal_graph_context = Some(wal_graph_context);
@@ -365,7 +365,7 @@ impl Session {
     ///
     /// Returns an error if the internal arena allocation fails (out of memory).
     pub(crate) fn with_external_store(
-        read_store: Arc<dyn GraphStore>,
+        read_store: Arc<dyn GraphStoreSearch>,
         write_store: Option<Arc<dyn GraphStoreMut>>,
         cfg: SessionConfig,
     ) -> Result<Self> {
@@ -510,7 +510,7 @@ impl Session {
     /// Otherwise looks up the named graph in the root store and wraps it
     /// in a [`WalGraphStore`] so mutations are WAL-logged with the correct
     /// graph context.
-    fn active_store(&self) -> Arc<dyn GraphStore> {
+    fn active_store(&self) -> Arc<dyn GraphStoreSearch> {
         let key = self.active_graph_storage_key();
         match key {
             None => Arc::clone(&self.graph_store),
@@ -524,9 +524,9 @@ impl Session {
                             Arc::clone(wal),
                             name.clone(),
                             Arc::clone(ctx),
-                        )) as Arc<dyn GraphStore>;
+                        )) as Arc<dyn GraphStoreSearch>;
                     }
-                    named_store as Arc<dyn GraphStore>
+                    named_store as Arc<dyn GraphStoreSearch>
                 }
                 None => Arc::clone(&self.graph_store),
             },
@@ -4649,7 +4649,7 @@ impl Session {
     /// `self.active_store()` for graph-aware execution).
     fn create_planner_for_store(
         &self,
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         viewing_epoch: EpochId,
         transaction_id: Option<TransactionId>,
     ) -> crate::query::Planner {
@@ -4658,7 +4658,7 @@ impl Session {
 
     fn create_planner_for_store_with_read_only(
         &self,
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         viewing_epoch: EpochId,
         transaction_id: Option<TransactionId>,
         read_only: bool,

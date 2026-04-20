@@ -9,7 +9,7 @@ use std::sync::Arc;
 use grafeo_common::types::{EpochId, TransactionId, Value};
 use grafeo_core::execution::DataChunk;
 use grafeo_core::execution::operators::{Operator, OperatorError, OperatorResult};
-use grafeo_core::graph::{GraphStore, GraphStoreMut};
+use grafeo_core::graph::{GraphStoreMut, GraphStoreSearch};
 
 use crate::catalog::Catalog;
 use crate::database::QueryResult;
@@ -19,7 +19,7 @@ use crate::transaction::TransactionManager;
 /// Execution context shared across sub-query operators.
 pub struct ProcedureContext {
     /// Store for sub-query execution (read path).
-    pub store: Arc<dyn GraphStore>,
+    pub store: Arc<dyn GraphStoreSearch>,
     /// Writable store for sub-query mutations (None for read-only).
     pub store_mut: Option<Arc<dyn GraphStoreMut>>,
     /// Transaction manager for sub-query coordination.
@@ -50,7 +50,7 @@ pub struct UserProcedureOperator {
     /// YIELD column filter (if specified by caller).
     yield_columns: Option<Vec<String>>,
     /// Store for sub-query execution (read path).
-    store: Arc<dyn GraphStore>,
+    store: Arc<dyn GraphStoreSearch>,
     /// Writable store for sub-query mutations (None for read-only).
     store_mut: Option<Arc<dyn GraphStoreMut>>,
     /// Transaction manager for sub-query.

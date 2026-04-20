@@ -19,7 +19,7 @@ use crate::execution::DataChunk;
 use crate::execution::factorized_chunk::FactorizedChunk;
 use crate::execution::vector::ValueVector;
 use crate::graph::Direction;
-use crate::graph::GraphStore;
+use crate::graph::GraphStoreSearch;
 use grafeo_common::types::{EdgeId, EpochId, LogicalType, NodeId, TransactionId};
 
 /// Result type for factorized operations.
@@ -49,7 +49,7 @@ pub type FactorizedResult = Result<Option<FactorizedChunk>, OperatorError>;
 /// - Memory: ~11,100 values (no duplication)
 pub struct FactorizedExpandOperator {
     /// The store to traverse.
-    store: Arc<dyn GraphStore>,
+    store: Arc<dyn GraphStoreSearch>,
     /// Input operator providing source nodes.
     input: Box<dyn Operator>,
     /// Index of the source node column in input.
@@ -73,7 +73,7 @@ pub struct FactorizedExpandOperator {
 impl FactorizedExpandOperator {
     /// Creates a new factorized expand operator.
     pub fn new(
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         input: Box<dyn Operator>,
         source_column: usize,
         direction: Direction,
@@ -278,7 +278,7 @@ impl FactorizedOperator for FactorizedExpandOperator {
 /// factorized across multiple expansion steps.
 pub struct FactorizedExpandChain {
     /// The store to traverse.
-    store: Arc<dyn GraphStore>,
+    store: Arc<dyn GraphStoreSearch>,
     /// The source operator for the first expansion.
     source: Option<Box<dyn Operator>>,
     /// Accumulated factorized result.
@@ -292,7 +292,7 @@ pub struct FactorizedExpandChain {
 
 impl FactorizedExpandChain {
     /// Creates a new chain starting from a source operator.
-    pub fn new(store: Arc<dyn GraphStore>, source: Box<dyn Operator>) -> Self {
+    pub fn new(store: Arc<dyn GraphStoreSearch>, source: Box<dyn Operator>) -> Self {
         Self {
             store,
             source: Some(source),
@@ -604,7 +604,7 @@ pub struct ExpandStep {
 /// aggregation), this avoids flattening and provides massive speedups.
 pub struct LazyFactorizedChainOperator {
     /// The graph store.
-    store: Arc<dyn GraphStore>,
+    store: Arc<dyn GraphStoreSearch>,
     /// The source operator (filter, scan, etc).
     source: Option<Box<dyn Operator>>,
     /// The expand steps to execute.
@@ -626,7 +626,7 @@ pub struct LazyFactorizedChainOperator {
 impl LazyFactorizedChainOperator {
     /// Creates a new lazy factorized chain operator.
     pub fn new(
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         source: Box<dyn Operator>,
         steps: Vec<ExpandStep>,
     ) -> Self {

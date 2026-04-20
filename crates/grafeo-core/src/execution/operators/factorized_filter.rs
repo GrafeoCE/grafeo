@@ -17,7 +17,7 @@ use std::sync::Arc;
 use super::{FactorizedOperator, FactorizedResult, LazyFactorizedChainOperator, Operator};
 use crate::execution::chunk_state::{FactorizedSelection, LevelSelection};
 use crate::execution::factorized_chunk::FactorizedChunk;
-use crate::graph::GraphStore;
+use crate::graph::GraphStoreSearch;
 use grafeo_common::types::{EpochId, PropertyKey, Value};
 
 /// A predicate that can be evaluated on factorized data at a specific level.
@@ -244,7 +244,7 @@ pub struct PropertyPredicate {
     /// The value to compare against.
     value: Value,
     /// The graph store for property lookups.
-    store: Arc<dyn GraphStore>,
+    store: Arc<dyn GraphStoreSearch>,
     /// Optional epoch for time-travel property reads.
     viewing_epoch: Option<EpochId>,
 }
@@ -257,7 +257,7 @@ impl PropertyPredicate {
         property: impl Into<PropertyKey>,
         op: CompareOp,
         value: Value,
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
     ) -> Self {
         Self {
             level,
@@ -276,7 +276,7 @@ impl PropertyPredicate {
         column: usize,
         property: impl Into<PropertyKey>,
         value: Value,
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
     ) -> Self {
         Self::new(level, column, property, CompareOp::Eq, value, store)
     }
@@ -523,10 +523,10 @@ impl FactorizedPredicate for OrPredicate {
 /// #     FactorizedFilterOperator, PropertyPredicate, FactorizedCompareOp,
 /// #     LazyFactorizedChainOperator,
 /// # };
-/// # use grafeo_core::graph::GraphStore;
+/// # use grafeo_core::graph::GraphStoreSearch;
 /// # use grafeo_common::types::Value;
 /// # use std::sync::Arc;
-/// # fn example(expand_chain: LazyFactorizedChainOperator, store: Arc<dyn GraphStore>) {
+/// # fn example(expand_chain: LazyFactorizedChainOperator, store: Arc<dyn GraphStoreSearch>) {
 /// // Query: MATCH (a)->(b)->(c) WHERE c.age > 30
 /// let predicate = PropertyPredicate::new(
 ///     2, 0, "age", FactorizedCompareOp::Gt, Value::Int64(30), store,

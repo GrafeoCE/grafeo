@@ -6,7 +6,7 @@
 use super::{Operator, OperatorResult};
 use crate::execution::chunk::DataChunkBuilder;
 use crate::graph::Direction;
-use crate::graph::GraphStore;
+use crate::graph::GraphStoreSearch;
 use grafeo_common::types::{LogicalType, NodeId, Value};
 use grafeo_common::utils::hash::FxHashMap;
 use std::collections::VecDeque;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 /// computes the shortest path and outputs the path as a value.
 pub struct ShortestPathOperator {
     /// The graph store.
-    store: Arc<dyn GraphStore>,
+    store: Arc<dyn GraphStoreSearch>,
     /// Input operator providing source/target node pairs.
     input: Box<dyn Operator>,
     /// Column index of the source node.
@@ -38,7 +38,7 @@ pub struct ShortestPathOperator {
 impl ShortestPathOperator {
     /// Creates a new shortest path operator.
     pub fn new(
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         input: Box<dyn Operator>,
         source_column: usize,
         target_column: usize,
@@ -483,7 +483,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, b)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0, // source column
             1, // target column
@@ -507,7 +507,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, a)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -537,7 +537,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, c)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -563,7 +563,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, b)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -600,7 +600,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, d)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -628,7 +628,7 @@ mod tests {
         // Path with KNOWS filter should only reach b, not c
         let input = Box::new(MockPairOperator::new(vec![(a, c)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -653,7 +653,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, b)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -683,7 +683,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, d)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -718,7 +718,7 @@ mod tests {
         // Test multiple pairs at once
         let input = Box::new(MockPairOperator::new(vec![(a, b), (c, d), (a, d)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -744,7 +744,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, b)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -769,7 +769,7 @@ mod tests {
         let store = Arc::new(LpgStore::new().unwrap());
         let input = Box::new(MockPairOperator::new(vec![]));
         let op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -785,7 +785,7 @@ mod tests {
         let store = Arc::new(LpgStore::new().unwrap());
         let input = Box::new(MockPairOperator::new(vec![]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -808,7 +808,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, b)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -831,7 +831,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, a)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -861,7 +861,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(nodes[0], nodes[9])]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -891,7 +891,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, d)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -914,7 +914,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, b)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -934,7 +934,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, a)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -965,7 +965,7 @@ mod tests {
 
         let input = Box::new(MockPairOperator::new(vec![(a, d)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -992,7 +992,7 @@ mod tests {
         // Only KNOWS edges: a can reach b but not c
         let input = Box::new(MockPairOperator::new(vec![(a, c)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -1020,7 +1020,7 @@ mod tests {
         // Bidirectional BFS should work and find shortest path
         let input = Box::new(MockPairOperator::new(vec![(a, c)]));
         let mut op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,
@@ -1038,7 +1038,7 @@ mod tests {
         let store = Arc::new(LpgStore::new().unwrap());
         let input = Box::new(MockPairOperator::new(vec![]));
         let op = ShortestPathOperator::new(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             input,
             0,
             1,

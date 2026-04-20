@@ -2,7 +2,7 @@
 
 use super::{
     ApplyOperator, Arc, BinaryOp, DistinctOperator, EmptyOperator, ExpressionPredicate,
-    FilterExpression, FilterOp, FilterOperator, GraphStore, HashAggregateOperator,
+    FilterExpression, FilterOp, FilterOperator, GraphStoreSearch, HashAggregateOperator,
     HashJoinOperator, HashMap, LogicalExpression, LogicalOperator, NodeListOperator, Operator,
     PhysicalAggregateExpr, PhysicalJoinType, RangeBounds, Result, TransactionId, UnaryOp,
     UnionOperator, Value, convert_binary_op, convert_filter_expression,
@@ -109,7 +109,7 @@ impl super::Planner {
         let predicate = ExpressionPredicate::new(
             filter_expr,
             variable_columns,
-            Arc::clone(&self.store) as Arc<dyn GraphStore>,
+            Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
         )
         .with_transaction_context(self.viewing_epoch, self.transaction_id)
         .with_session_context(self.session_context.clone());
@@ -385,7 +385,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -475,7 +475,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -549,7 +549,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -707,7 +707,7 @@ impl super::Planner {
         let predicate = ExpressionPredicate::new(
             count_filter,
             count_var_columns.clone(),
-            Arc::clone(&self.store) as Arc<dyn GraphStore>,
+            Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
         )
         .with_transaction_context(self.viewing_epoch, self.transaction_id)
         .with_session_context(self.session_context.clone());
@@ -720,7 +720,7 @@ impl super::Planner {
             let remaining_predicate = ExpressionPredicate::new(
                 remaining_expr,
                 count_var_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -933,7 +933,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -1431,7 +1431,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());

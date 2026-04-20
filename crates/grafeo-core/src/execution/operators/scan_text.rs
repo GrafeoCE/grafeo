@@ -5,7 +5,7 @@
 
 use super::{Operator, OperatorError, OperatorResult};
 use crate::execution::DataChunk;
-use crate::graph::traits::GraphStore;
+use crate::graph::traits::GraphStoreSearch;
 use grafeo_common::types::{LogicalType, NodeId};
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// 2. `Float64` — The BM25 relevance score
 pub struct TextScanOperator {
     /// The graph store to search.
-    store: Arc<dyn GraphStore>,
+    store: Arc<dyn GraphStoreSearch>,
     /// Label to search within.
     label: String,
     /// Property holding the text to search.
@@ -54,7 +54,7 @@ impl TextScanOperator {
     /// Returns the `k` highest-scoring nodes for the given query.
     #[must_use]
     pub fn top_k(
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         label: impl Into<String>,
         property: impl Into<String>,
         query: impl Into<String>,
@@ -79,7 +79,7 @@ impl TextScanOperator {
     /// Returns all nodes with a BM25 score ≥ `threshold`.
     #[must_use]
     pub fn with_threshold(
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         label: impl Into<String>,
         property: impl Into<String>,
         query: impl Into<String>,
@@ -193,7 +193,7 @@ impl Operator for TextScanOperator {
 mod tests {
     use super::*;
     use crate::graph::lpg::LpgStore;
-    use crate::graph::traits::GraphStore;
+    use crate::graph::traits::GraphStoreSearch;
     use crate::index::text::{BM25Config, InvertedIndex};
     use grafeo_common::types::Value;
     use parking_lot::RwLock;
@@ -232,7 +232,7 @@ mod tests {
     fn test_text_scan_top_k() {
         let store = make_store();
         let mut scan = TextScanOperator::top_k(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             "Doc",
             "body",
             "rust",
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(all.len(), 2);
         let mid = f64::midpoint(all[0].1, all[1].1);
         let mut scan = TextScanOperator::with_threshold(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             "Doc",
             "body",
             "rust database",
@@ -270,7 +270,7 @@ mod tests {
     fn test_text_scan_no_matches() {
         let store = make_store();
         let mut scan = TextScanOperator::top_k(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             "Doc",
             "body",
             "nonexistent",
@@ -283,7 +283,7 @@ mod tests {
     fn test_text_scan_reset() {
         let store = make_store();
         let mut scan = TextScanOperator::top_k(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             "Doc",
             "body",
             "rust",
@@ -301,7 +301,7 @@ mod tests {
     fn test_text_scan_name() {
         let store = make_store();
         let scan = TextScanOperator::top_k(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             "Doc",
             "body",
             "rust",
@@ -314,7 +314,7 @@ mod tests {
     fn test_text_scan_chunk_capacity() {
         let store = make_store();
         let mut scan = TextScanOperator::top_k(
-            store.clone() as Arc<dyn GraphStore>,
+            store.clone() as Arc<dyn GraphStoreSearch>,
             "Doc",
             "body",
             "rust",

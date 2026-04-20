@@ -1,8 +1,9 @@
 //! Node scan planning.
 
 use super::{
-    Arc, ExpressionPredicate, FilterExpression, FilterOperator, GraphStore, HashMap, LogicalType,
-    NestedLoopJoinOperator, NodeScanOp, Operator, PhysicalJoinType, Result, ScanOperator, Value,
+    Arc, ExpressionPredicate, FilterExpression, FilterOperator, GraphStoreSearch, HashMap,
+    LogicalType, NestedLoopJoinOperator, NodeScanOp, Operator, PhysicalJoinType, Result,
+    ScanOperator, Value,
 };
 
 impl super::Planner {
@@ -12,9 +13,9 @@ impl super::Planner {
         scan: &NodeScanOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
         let scan_op = if let Some(label) = &scan.label {
-            ScanOperator::with_label(Arc::clone(&self.store) as Arc<dyn GraphStore>, label)
+            ScanOperator::with_label(Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>, label)
         } else {
-            ScanOperator::new(Arc::clone(&self.store) as Arc<dyn GraphStore>)
+            ScanOperator::new(Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>)
         };
 
         // Apply MVCC context if available
@@ -47,7 +48,7 @@ impl super::Planner {
                     let predicate = ExpressionPredicate::new(
                         filter_expr,
                         variable_columns,
-                        Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                        Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
                     )
                     .with_transaction_context(self.viewing_epoch, self.transaction_id);
                     let filtered = Box::new(FilterOperator::new(input_op, Box::new(predicate)));

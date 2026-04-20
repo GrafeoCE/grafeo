@@ -18,7 +18,7 @@ use grafeo_core::execution::operators::{
     OperatorError, Predicate, ProjectExpr, ProjectOperator, SimpleAggregateOperator,
     SingleRowOperator, SortOperator, UnaryFilterOp,
 };
-use grafeo_core::graph::GraphStore;
+use grafeo_core::graph::GraphStoreSearch;
 use grafeo_core::graph::rdf::{Literal, RdfStore, Term, Triple, TriplePattern};
 
 use crate::query::plan::{
@@ -637,7 +637,7 @@ impl RdfPlanner {
                 input_op,
                 projections,
                 output_types,
-                Arc::new(grafeo_core::graph::NullGraphStore) as Arc<dyn GraphStore>,
+                Arc::new(grafeo_core::graph::NullGraphStore) as Arc<dyn GraphStoreSearch>,
             ));
         }
 
@@ -872,7 +872,7 @@ impl RdfPlanner {
                 input_op,
                 projections,
                 output_types,
-                Arc::new(grafeo_core::graph::NullGraphStore) as Arc<dyn GraphStore>,
+                Arc::new(grafeo_core::graph::NullGraphStore) as Arc<dyn GraphStoreSearch>,
             ));
         }
 

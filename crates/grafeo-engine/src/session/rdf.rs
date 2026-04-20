@@ -16,7 +16,7 @@ use grafeo_core::graph::lpg::LpgStore;
 #[cfg(feature = "lpg")]
 use grafeo_core::graph::rdf::RdfStore;
 #[cfg(feature = "lpg")]
-use grafeo_core::graph::{GraphStore, GraphStoreMut};
+use grafeo_core::graph::{GraphStoreMut, GraphStoreSearch};
 
 use crate::database::QueryResult;
 
@@ -32,7 +32,7 @@ impl Session {
         rdf_store: Arc<RdfStore>,
         cfg: SessionConfig,
     ) -> Self {
-        let graph_store = Arc::clone(&store) as Arc<dyn GraphStore>;
+        let graph_store = Arc::clone(&store) as Arc<dyn GraphStoreSearch>;
         let graph_store_mut = Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>);
         Self {
             store,

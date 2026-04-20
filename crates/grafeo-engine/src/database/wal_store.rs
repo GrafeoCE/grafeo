@@ -10,7 +10,7 @@ use grafeo_common::grafeo_warn;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
 use grafeo_common::utils::hash::FxHashMap;
 use grafeo_core::graph::lpg::{CompareOp, Edge, LpgStore, Node};
-use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut};
+use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut, GraphStoreSearch};
 use grafeo_core::statistics::Statistics;
 use grafeo_storage::wal::{LpgWal, WalRecord};
 
@@ -320,6 +320,8 @@ impl GraphStore for WalGraphStore {
         self.inner.get_edge_history(id)
     }
 }
+
+impl GraphStoreSearch for WalGraphStore {}
 
 // ---------------------------------------------------------------------------
 // GraphStoreMut: delegate + WAL log

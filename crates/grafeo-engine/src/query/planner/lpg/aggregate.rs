@@ -2,10 +2,11 @@
 
 use super::{
     AggregateOp, Arc, Direction, Error, ExpandDirection, ExpandStep, ExpressionPredicate,
-    FactorizedAggregate, FactorizedAggregateOperator, FilterExpression, FilterOperator, GraphStore,
-    HashAggregateOperator, HashMap, LazyFactorizedChainOperator, LogicalAggregateFunction,
-    LogicalExpression, LogicalType, Operator, PhysicalAggregateExpr, ProjectExpr, ProjectOperator,
-    Result, SimpleAggregateOperator, convert_aggregate_function, expression_to_string,
+    FactorizedAggregate, FactorizedAggregateOperator, FilterExpression, FilterOperator,
+    GraphStoreSearch, HashAggregateOperator, HashMap, LazyFactorizedChainOperator,
+    LogicalAggregateFunction, LogicalExpression, LogicalType, Operator, PhysicalAggregateExpr,
+    ProjectExpr, ProjectOperator, Result, SimpleAggregateOperator, convert_aggregate_function,
+    expression_to_string,
 };
 
 impl super::Planner {
@@ -160,7 +161,7 @@ impl super::Planner {
                     input_op,
                     projections,
                     output_types,
-                    Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                    Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
                 )
                 .with_transaction_context(self.viewing_epoch, self.transaction_id)
                 .with_session_context(self.session_context.clone()),
@@ -299,7 +300,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 having_var_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -396,7 +397,7 @@ impl super::Planner {
 
         // Create the lazy factorized chain operator
         let mut lazy_op = LazyFactorizedChainOperator::new(
-            Arc::clone(&self.store) as Arc<dyn GraphStore>,
+            Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             base_op,
             steps,
         );

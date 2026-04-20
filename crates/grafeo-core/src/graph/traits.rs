@@ -22,6 +22,8 @@
 use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
 use crate::graph::lpg::{Edge, Node};
+#[cfg(feature = "vector-index")]
+use crate::index::vector::DistanceMetric;
 use crate::statistics::Statistics;
 use arcstr::ArcStr;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
@@ -36,7 +38,7 @@ use std::sync::Arc;
 ///
 /// # Object safety
 ///
-/// This trait is object-safe: you can use `Arc<dyn GraphStore>` for dynamic
+/// This trait is object-safe: you can use `Arc<dyn GraphStoreSearch>` for dynamic
 /// dispatch. Traversal methods return `Vec` instead of `impl Iterator` to
 /// enable this.
 pub trait GraphStore: Send + Sync {
@@ -330,14 +332,38 @@ pub trait GraphStore: Send + Sync {
     fn get_edge_history(&self, _id: EdgeId) -> Vec<(EpochId, Option<EpochId>, Edge)> {
         Vec::new()
     }
+}
 
-    // --- Text search (for per-row BM25 evaluation) ---
+/// Index-backed search capabilities that an LPG store may optionally provide.
+///
+/// Keeps the base [`GraphStore`] scoped to graph-structure operations. Stores
+/// that back text or vector indexes implement these methods with real search
+/// logic; stores that don't (columnar bases, projections, RDF adapters) accept
+/// the no-op defaults and the executor falls through to per-row evaluation.
+///
+/// # Symmetric text and vector APIs
+///
+/// `text_search` and `vector_search` are peer operations returning owned
+/// `Vec<(NodeId, f64)>`. The planner decides strategy based on `has_*_index`
+/// and `vector_index_metric` introspection; the store executes the chosen
+/// plan, falling back to brute-force internally when the request is valid
+/// but no matching index exists.
+pub trait GraphStoreSearch: GraphStore {
+    // --- Text search (BM25) ---
 
-    /// Scores a document against a text query using the store's text index.
+    /// Returns true if a BM25 text index exists for the given label and property.
+    #[cfg(feature = "text-index")]
+    #[must_use]
+    fn has_text_index(&self, _label: &str, _property: &str) -> bool {
+        false
+    }
+
+    /// Scores a single document against a text query for per-row filter evaluation.
     ///
-    /// Returns `None` if no text index exists for the given (label, property) pair.
-    /// Used by filter evaluation for per-row BM25 scoring when planner pushdown
-    /// doesn't fire.
+    /// Returns `None` when no text index exists for the (label, property) pair.
+    /// The planner calls this when pushdown is unavailable, for example when
+    /// the text predicate follows a traversal instead of a bare label scan.
+    #[cfg(feature = "text-index")]
     fn score_text(
         &self,
         _node_id: NodeId,
@@ -348,10 +374,11 @@ pub trait GraphStore: Send + Sync {
         None
     }
 
-    /// Performs a full-text search using the store's text index, returning top-k results.
+    /// Returns the top-`k` documents by BM25 score for a text query.
     ///
-    /// Results are sorted by BM25 score descending.
-    /// Returns empty vec if no text index exists for the (label, property) pair.
+    /// Results are sorted by score descending. Returns an empty vec when no
+    /// text index exists, so the caller can fall back to a slower path.
+    #[cfg(feature = "text-index")]
     fn text_search(
         &self,
         _label: &str,
@@ -362,10 +389,8 @@ pub trait GraphStore: Send + Sync {
         Vec::new()
     }
 
-    /// Performs a full-text search returning all results above a threshold.
-    ///
-    /// Results are sorted by BM25 score descending.
-    /// Returns empty vec if no text index exists.
+    /// Returns every document whose BM25 score meets or exceeds a threshold.
+    #[cfg(feature = "text-index")]
     fn text_search_with_threshold(
         &self,
         _label: &str,
@@ -376,27 +401,57 @@ pub trait GraphStore: Send + Sync {
         Vec::new()
     }
 
-    /// Returns true if a text index exists for the given (label, property).
-    fn has_text_index(&self, _label: &str, _property: &str) -> bool {
-        false
-    }
+    // --- Vector search (HNSW or brute force) ---
 
-    /// Returns true if a vector index exists for the given (label, property).
+    /// Returns true if a vector index exists for the given label and property.
+    #[cfg(feature = "vector-index")]
+    #[must_use]
     fn has_vector_index(&self, _label: &str, _property: &str) -> bool {
         false
     }
 
-    /// Returns a type-erased handle to the vector index for a (label, property) pair.
+    /// Returns the distance metric of the vector index at (label, property), if any.
     ///
-    /// The returned `Arc<dyn Any>` can be downcast to `Arc<VectorIndexKind>` when
-    /// the `vector-index` feature is enabled. This allows the planner to use
-    /// HNSW-accelerated search without leaking feature-gated types into the trait.
-    fn get_vector_index_handle(
-        &self,
-        _label: &str,
-        _property: &str,
-    ) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+    /// The planner uses this to decide between an HNSW-accelerated plan and a
+    /// brute-force fallback: an index whose metric does not match the query's
+    /// requested metric cannot serve the query directly, so the planner either
+    /// routes to brute force or skips pushdown entirely.
+    #[cfg(feature = "vector-index")]
+    fn vector_index_metric(&self, _label: &str, _property: &str) -> Option<DistanceMetric> {
         None
+    }
+
+    /// Returns the top-`k` nearest neighbors for a vector similarity search.
+    ///
+    /// `label` is optional: `None` searches every node that has the named
+    /// property. The store uses HNSW when an index exists for (label, property)
+    /// whose metric matches `metric`; otherwise it falls back to brute force.
+    ///
+    /// Results are sorted by distance ascending (nearest first). Returns an
+    /// empty vec when neither an index nor any indexable property is found.
+    #[cfg(feature = "vector-index")]
+    fn vector_search(
+        &self,
+        _label: Option<&str>,
+        _property: &str,
+        _query: &[f32],
+        _k: usize,
+        _metric: DistanceMetric,
+    ) -> Vec<(NodeId, f64)> {
+        Vec::new()
+    }
+
+    /// Returns every node whose distance to the query vector is at or below a threshold.
+    #[cfg(feature = "vector-index")]
+    fn vector_search_with_threshold(
+        &self,
+        _label: Option<&str>,
+        _property: &str,
+        _query: &[f32],
+        _threshold: f64,
+        _metric: DistanceMetric,
+    ) -> Vec<(NodeId, f64)> {
+        Vec::new()
     }
 }
 
@@ -405,7 +460,7 @@ pub trait GraphStore: Send + Sync {
 /// Separated from [`GraphStore`] so read-only wrappers (snapshots, read
 /// replicas) can implement only `GraphStore`. Any mutable store is also
 /// readable via the supertrait bound.
-pub trait GraphStoreMut: GraphStore {
+pub trait GraphStoreMut: GraphStoreSearch {
     // --- Node creation ---
 
     /// Creates a new node with the given labels.
@@ -721,6 +776,8 @@ impl GraphStore for NullGraphStore {
         EpochId(0)
     }
 }
+
+impl GraphStoreSearch for NullGraphStore {}
 
 #[cfg(test)]
 mod tests {
@@ -1046,6 +1103,8 @@ mod tests {
         }
     }
 
+    impl GraphStoreSearch for TestMutStore {}
+
     impl GraphStoreMut for TestMutStore {
         fn create_node(&self, labels: &[&str]) -> NodeId {
             let mut inner = self.inner.lock().unwrap();
@@ -1312,7 +1371,7 @@ mod tests {
     #[test]
     fn test_mut_store_object_safe_dyn_dispatch() {
         // Exercise the object-safe contract: GraphStore methods through `dyn`.
-        let store: Arc<dyn GraphStore> = Arc::new(TestMutStore::new());
+        let store: Arc<dyn GraphStoreSearch> = Arc::new(TestMutStore::new());
         assert_eq!(store.node_count(), 0);
         assert_eq!(store.edge_count(), 0);
         assert!(store.node_ids().is_empty());

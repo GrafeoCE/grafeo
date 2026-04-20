@@ -2,7 +2,7 @@
 
 use super::{
     Arc, Direction, Error, ExecutionPathMode, ExpandDirection, ExpandOp, ExpandOperator,
-    ExpandStep, GraphStore, LazyFactorizedChainOperator, LogicalOperator, Operator, PathMode,
+    ExpandStep, GraphStoreSearch, LazyFactorizedChainOperator, LogicalOperator, Operator, PathMode,
     Result, VariableLengthExpandOperator,
 };
 
@@ -61,7 +61,7 @@ impl super::Planner {
             };
 
             let mut expand_op = VariableLengthExpandOperator::new(
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
                 input_op,
                 source_column,
                 direction,
@@ -84,7 +84,7 @@ impl super::Planner {
         } else {
             // Use simple ExpandOperator for single-hop paths without named paths
             let expand_op = ExpandOperator::new(
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
                 input_op,
                 source_column,
                 direction,
@@ -202,7 +202,7 @@ impl super::Planner {
 
         // Create lazy operator that executes at query time, not planning time
         let mut lazy_op = LazyFactorizedChainOperator::new(
-            Arc::clone(&self.store) as Arc<dyn GraphStore>,
+            Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             base_op,
             steps,
         )

@@ -14,7 +14,7 @@ use super::aggregate::AggregateState;
 use super::{Operator, OperatorResult};
 use crate::execution::DataChunk;
 use crate::execution::vector::ValueVector;
-use crate::graph::traits::GraphStore;
+use crate::graph::traits::GraphStoreSearch;
 
 /// Whether the horizontal aggregate operates on edges or nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +45,7 @@ pub struct HorizontalAggregateOperator {
     /// Property name to access on each entity.
     property: String,
     /// Graph store for property lookups.
-    store: Arc<dyn GraphStore>,
+    store: Arc<dyn GraphStoreSearch>,
     /// Number of input columns (to know where to append the result).
     input_column_count: usize,
 }
@@ -58,7 +58,7 @@ impl HorizontalAggregateOperator {
         entity_kind: EntityKind,
         function: AggregateFunction,
         property: String,
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         input_column_count: usize,
     ) -> Self {
         Self {
@@ -206,7 +206,7 @@ mod tests {
 
     // reason: test IDs are small sequential counters
     #[allow(clippy::cast_possible_wrap)]
-    fn setup_store_with_edges() -> (Arc<dyn GraphStore>, Vec<Value>) {
+    fn setup_store_with_edges() -> (Arc<dyn GraphStoreSearch>, Vec<Value>) {
         let store = LpgStore::new().unwrap();
         let n1 = store.create_node(&[]);
         let n2 = store.create_node(&[]);
@@ -229,7 +229,7 @@ mod tests {
 
     // reason: test IDs are small sequential counters
     #[allow(clippy::cast_possible_wrap)]
-    fn setup_store_with_nodes() -> (Arc<dyn GraphStore>, Vec<Value>) {
+    fn setup_store_with_nodes() -> (Arc<dyn GraphStoreSearch>, Vec<Value>) {
         let store = LpgStore::new().unwrap();
         // Use Float64 properties since the result column is Float64-typed
         // (Int64 values from SumInt finalize would be silently dropped by the Float64 column)
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_horizontal_empty_list_returns_null() {
-        let store: Arc<dyn GraphStore> = Arc::new(LpgStore::new().unwrap());
+        let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
 
         let mut builder = DataChunkBuilder::new(&[LogicalType::Any]);
         builder
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_horizontal_non_list_column_returns_null() {
-        let store: Arc<dyn GraphStore> = Arc::new(LpgStore::new().unwrap());
+        let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
 
         // Put a non-list value in the list column
         let mut builder = DataChunkBuilder::new(&[LogicalType::Int64]);
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_horizontal_name() {
-        let store: Arc<dyn GraphStore> = Arc::new(LpgStore::new().unwrap());
+        let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
         let mock = MockOperator::new(vec![]);
         let op = HorizontalAggregateOperator::new(
             Box::new(mock),
@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_horizontal_child_returns_none() {
-        let store: Arc<dyn GraphStore> = Arc::new(LpgStore::new().unwrap());
+        let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
         let mock = MockOperator::new(vec![]); // No chunks
         let mut op = HorizontalAggregateOperator::new(
             Box::new(mock),
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_horizontal_aggregate_into_any() {
-        let store: Arc<dyn GraphStore> = Arc::new(LpgStore::new().unwrap());
+        let store: Arc<dyn GraphStoreSearch> = Arc::new(LpgStore::new().unwrap());
         let mock = MockOperator::new(vec![]);
         let op = HorizontalAggregateOperator::new(
             Box::new(mock),
