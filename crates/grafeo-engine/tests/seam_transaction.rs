@@ -742,16 +742,13 @@ mod multi_schema_atomicity {
     // the session's current schema, so they cover rollback atomicity without
     // depending on that bug.
 
-    #[cfg(feature = "cypher")]
     #[test]
     fn unique_violation_rolls_back_prior_writes_single_schema() {
         let db = db();
         let session = db.session();
 
-        // Cypher parser accepts CREATE CONSTRAINT (GQL parser has a gap for
-        // FOR-as-keyword). Registers the same catalog constraint either way.
         session
-            .execute_cypher("CREATE CONSTRAINT uniq_item FOR (n:Item) REQUIRE n.id IS UNIQUE")
+            .execute("CREATE CONSTRAINT uniq_item FOR (n:Item) ON (n.id) UNIQUE")
             .unwrap();
         session.execute("INSERT (:Item {id: 1})").unwrap();
 
@@ -773,7 +770,6 @@ mod multi_schema_atomicity {
         );
     }
 
-    #[cfg(feature = "cypher")]
     #[test]
     fn cross_schema_rollback_after_unique_violation() {
         let db = db();
@@ -782,7 +778,7 @@ mod multi_schema_atomicity {
         // UNIQUE constraint in the default schema: the violation trigger is
         // schema-independent and fires whatever the current session schema is.
         session
-            .execute_cypher("CREATE CONSTRAINT uniq_marker FOR (n:Marker) REQUIRE n.id IS UNIQUE")
+            .execute("CREATE CONSTRAINT uniq_marker FOR (n:Marker) ON (n.id) UNIQUE")
             .unwrap();
         session.execute("INSERT (:Marker {id: 1})").unwrap();
 

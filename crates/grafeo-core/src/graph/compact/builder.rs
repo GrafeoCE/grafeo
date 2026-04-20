@@ -2452,43 +2452,12 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Builder column methods: Int8Vector, Bitmap, raw codec injection
+    // Builder column methods: unique scenarios not covered by earlier tests.
+    // `column_int8_vector` happy-path and zero-dim cases live at
+    // `test_node_table_builder_int8_vector_multi_row` / `_zero_dimensions`;
+    // `column` pre-built-codec passthrough lives at
+    // `test_node_table_builder_prebuilt_column`. Keep those canonical.
     // -------------------------------------------------------------------
-
-    #[test]
-    fn test_node_table_column_int8_vector() {
-        let store = CompactStoreBuilder::new()
-            .node_table("Embed", |t| {
-                t.column_int8_vector("vec", vec![1, 2, 3, 4, 5, 6], 3)
-            })
-            .build()
-            .unwrap();
-
-        // Two rows of 3 dimensions.
-        let ids = store.nodes_by_label("Embed");
-        assert_eq!(ids.len(), 2);
-
-        // Read back via get_node_property.
-        let v0 = store
-            .get_node_property(ids[0], &PropertyKey::new("vec"))
-            .unwrap();
-        match v0 {
-            Value::List(items) => assert_eq!(items.len(), 3),
-            other => panic!("expected List, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_node_table_column_int8_vector_zero_dims() {
-        // dimensions == 0 short-circuits the row-count calculation to 0.
-        let store = CompactStoreBuilder::new()
-            .node_table("Empty", |t| t.column_int8_vector("vec", Vec::new(), 0))
-            .build()
-            .unwrap();
-
-        let ids = store.nodes_by_label("Empty");
-        assert_eq!(ids.len(), 0);
-    }
 
     #[test]
     #[should_panic(expected = "is not a multiple of dimensions")]
@@ -2517,94 +2486,9 @@ mod tests {
         assert_eq!(v0, Value::Bool(true));
     }
 
-    #[test]
-    fn test_node_table_column_with_prebuilt_codec() {
-        // Use the generic column() method to add a pre-built codec.
-        let bv = BitVector::from_bools(&[true, true, false]);
-        let codec = ColumnCodec::Bitmap(bv);
-
-        let store = CompactStoreBuilder::new()
-            .node_table("Thing", |t| t.column("flag", codec))
-            .build()
-            .unwrap();
-
-        let ids = store.nodes_by_label("Thing");
-        assert_eq!(ids.len(), 3);
-    }
-
-    // -------------------------------------------------------------------
-    // Builder error paths
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn test_builder_column_length_mismatch() {
-        // First column establishes length 3, second column has length 2.
-        let result = CompactStoreBuilder::new()
-            .node_table("Person", |t| {
-                t.column_bitpacked("age", &[25, 30, 35], 6)
-                    .column_dict("name", &["Vincent", "Jules"])
-            })
-            .build();
-
-        match result {
-            Err(CompactStoreError::ColumnLengthMismatch { expected, got }) => {
-                assert_eq!(expected, 3);
-                assert_eq!(got, 2);
-            }
-            other => panic!("expected ColumnLengthMismatch, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_builder_value_overflow() {
-        // A u64 value exceeding i64::MAX must produce ValueOverflow at build.
-        let too_big = (i64::MAX as u64) + 1;
-        let result = CompactStoreBuilder::new()
-            .node_table("Person", |t| t.column_bitpacked("big", &[too_big], 64))
-            .build();
-
-        match result {
-            Err(CompactStoreError::ValueOverflow { column, value, max }) => {
-                assert_eq!(column, "big");
-                assert_eq!(value, too_big);
-                assert_eq!(max, i64::MAX as u64);
-            }
-            other => panic!("expected ValueOverflow, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_builder_duplicate_label() {
-        let result = CompactStoreBuilder::new()
-            .node_table("Person", |t| t.column_bitpacked("a", &[1], 4))
-            .node_table("Person", |t| t.column_bitpacked("a", &[2], 4))
-            .build();
-
-        match result {
-            Err(CompactStoreError::DuplicateLabel(label)) => assert_eq!(label, "Person"),
-            other => panic!("expected DuplicateLabel, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_builder_duplicate_edge_type() {
-        // Same (edge_type, src, dst) triple twice.
-        let result = CompactStoreBuilder::new()
-            .node_table("A", |t| t.column_bitpacked("v", &[1], 4))
-            .node_table("B", |t| t.column_bitpacked("v", &[1], 4))
-            .rel_table("LINKS", "A", "B", |r| r.edges([(0, 0)]))
-            .rel_table("LINKS", "A", "B", |r| r.edges([(0, 0)]))
-            .build();
-
-        match result {
-            Err(CompactStoreError::DuplicateEdgeType(msg)) => {
-                assert!(msg.contains("LINKS"), "expected 'LINKS' in {msg}");
-                assert!(msg.contains('A'), "expected 'A' in {msg}");
-                assert!(msg.contains('B'), "expected 'B' in {msg}");
-            }
-            other => panic!("expected DuplicateEdgeType, got {other:?}"),
-        }
-    }
+    // Error-path tests (`column_length_mismatch`, `value_overflow`,
+    // `duplicate_label`, `duplicate_edge_type`) live at the matching
+    // `*_error` tests above; keep those canonical.
 
     #[test]
     fn test_builder_same_edge_type_different_labels_allowed() {
@@ -2692,49 +2576,11 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // from_graph_store_preserving_ids
+    // from_graph_store_preserving_ids: specialized cases.
+    // The basic happy-path is covered by
+    // `test_from_graph_store_preserving_ids_with_data`; multi-label and
+    // CSR-edge-ordering are unique to this section.
     // -------------------------------------------------------------------
-
-    #[test]
-    fn test_from_graph_store_preserving_ids_basic() {
-        use crate::graph::lpg::LpgStore;
-
-        let store = LpgStore::new().unwrap();
-
-        let vincent = store.create_node(&["Person"]);
-        store.set_node_property(vincent, "name", Value::from("Vincent"));
-        let jules = store.create_node(&["Person"]);
-        store.set_node_property(jules, "name", Value::from("Jules"));
-        let amsterdam = store.create_node(&["City"]);
-        store.set_node_property(amsterdam, "name", Value::from("Amsterdam"));
-
-        let e1 = store.create_edge(vincent, amsterdam, "LIVES_IN");
-        let e2 = store.create_edge(jules, amsterdam, "LIVES_IN");
-
-        let compact = from_graph_store_preserving_ids(&store).unwrap();
-        assert!(compact.preserves_ids());
-
-        // Original IDs still resolve.
-        let vincent_name = compact
-            .get_node_property(vincent, &PropertyKey::new("name"))
-            .and_then(|v| v.as_str().map(str::to_string));
-        assert_eq!(vincent_name.as_deref(), Some("Vincent"));
-
-        let jules_name = compact
-            .get_node_property(jules, &PropertyKey::new("name"))
-            .and_then(|v| v.as_str().map(str::to_string));
-        assert_eq!(jules_name.as_deref(), Some("Jules"));
-
-        // Original edges resolve back to their originals via get_edge.
-        let e1_rec = compact.get_edge(e1).unwrap();
-        assert_eq!(e1_rec.edge_type.as_str(), "LIVES_IN");
-        assert_eq!(e1_rec.src, vincent);
-        assert_eq!(e1_rec.dst, amsterdam);
-
-        let e2_rec = compact.get_edge(e2).unwrap();
-        assert_eq!(e2_rec.src, jules);
-        assert_eq!(e2_rec.dst, amsterdam);
-    }
 
     #[test]
     fn test_from_graph_store_preserving_ids_multi_label() {

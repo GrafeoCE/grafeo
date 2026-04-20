@@ -174,6 +174,41 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Returns `true` if the current token is either the dedicated `kind`
+    /// or an identifier matching `keyword` case-insensitively.
+    ///
+    /// Prefer this over the raw `self.is_identifier() && name == "X"`
+    /// pattern for any keyword that has a dedicated `TokenKind` variant.
+    /// That raw pattern silently fails when the word is tokenised as a
+    /// keyword rather than an identifier (bug-gql-create-constraint-named).
+    fn peek_keyword(&self, kind: TokenKind, keyword: &str) -> bool {
+        self.current.kind == kind
+            || (self.is_identifier() && self.get_identifier_name().eq_ignore_ascii_case(keyword))
+    }
+
+    /// Consumes the current token if it matches [`Self::peek_keyword`].
+    /// Returns `true` on match.
+    fn try_accept_keyword(&mut self, kind: TokenKind, keyword: &str) -> bool {
+        if self.peek_keyword(kind, keyword) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consumes the current token if it is an identifier matching `keyword`
+    /// case-insensitively. Use this for keywords that have no dedicated
+    /// `TokenKind` variant (IF, EXPLAIN, PROFILE, REQUIRE, etc.).
+    fn try_accept_identifier_keyword(&mut self, keyword: &str) -> bool {
+        if self.is_identifier() && self.get_identifier_name().eq_ignore_ascii_case(keyword) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Parses the input into a statement.
     ///
     /// # Errors
@@ -4674,9 +4709,11 @@ impl<'a> Parser<'a> {
                 // Optional IF NOT EXISTS
                 let if_not_exists = self.try_parse_if_not_exists();
 
-                // Optional constraint name
+                // Optional constraint name: consume one identifier only if
+                // the next token is not the FOR keyword (dedicated token or
+                // unreserved identifier).
                 let name = if self.is_identifier()
-                    && !self.get_identifier_name().eq_ignore_ascii_case("FOR")
+                    && !self.peek_keyword(TokenKind::For, "FOR")
                 {
                     let n = self.get_identifier_name();
                     self.advance();
@@ -4788,12 +4825,8 @@ impl<'a> Parser<'a> {
         name: String,
         if_not_exists: bool,
     ) -> Result<SchemaStatement> {
-        // Expect FOR (may be lexed as keyword TokenKind::For or as an identifier)
-        if self.current.kind == TokenKind::For
-            || (self.is_identifier() && self.get_identifier_name().eq_ignore_ascii_case("FOR"))
-        {
-            self.advance();
-        } else {
+        // Expect FOR (may be lexed as keyword TokenKind::For or as an identifier).
+        if !self.try_accept_keyword(TokenKind::For, "FOR") {
             return Err(self.error("Expected FOR after index name"));
         }
 
@@ -4936,11 +4969,10 @@ impl<'a> Parser<'a> {
         name: Option<String>,
         if_not_exists: bool,
     ) -> Result<SchemaStatement> {
-        // Expect FOR
-        if !self.is_identifier() || !self.get_identifier_name().eq_ignore_ascii_case("FOR") {
+        // Expect FOR (keyword or identifier).
+        if !self.try_accept_keyword(TokenKind::For, "FOR") {
             return Err(self.error("Expected FOR after constraint name"));
         }
-        self.advance();
 
         // Parse (n:Label)
         self.expect(TokenKind::LParen)?;
@@ -5060,7 +5092,7 @@ impl<'a> Parser<'a> {
     /// at the current and next token. If current is "OR" and next is "REPLACE",
     /// consumes both and returns true.
     fn try_parse_or_replace(&mut self) -> bool {
-        if self.is_identifier() && self.get_identifier_name().eq_ignore_ascii_case("OR") {
+        if self.peek_keyword(TokenKind::Or, "OR") {
             let pk = self.peek_kind();
             if pk == TokenKind::Identifier {
                 let text = self.peek_text_upper();
@@ -6357,23 +6389,13 @@ impl<'a> Parser<'a> {
         self.advance();
 
         // Optional IF NOT EXISTS
-        let if_not_exists = if self.is_identifier()
-            && self.get_identifier_name().eq_ignore_ascii_case("IF")
-        {
-            self.advance();
-            if !(self.current.kind == TokenKind::Not
-                || (self.is_identifier() && self.get_identifier_name().eq_ignore_ascii_case("NOT")))
-            {
+        let if_not_exists = if self.try_accept_identifier_keyword("IF") {
+            if !self.try_accept_keyword(TokenKind::Not, "NOT") {
                 return Err(self.error("Expected NOT after IF"));
             }
-            self.advance();
-            if self.current.kind != TokenKind::Exists
-                && (!self.is_identifier()
-                    || !self.get_identifier_name().eq_ignore_ascii_case("EXISTS"))
-            {
+            if !self.try_accept_keyword(TokenKind::Exists, "EXISTS") {
                 return Err(self.error("Expected EXISTS after IF NOT"));
             }
-            self.advance();
             true
         } else {
             false
@@ -10572,5 +10594,81 @@ mod tests {
         let mut parser = Parser::new("RETURN '\\u0041'");
         let result = parser.parse();
         assert!(result.is_ok(), "String with \\u escape should parse");
+    }
+
+    // --- Keyword-aware helpers: regression for bug-gql-create-constraint-named ---
+    //
+    // The four parser paths below used to check FOR / OR / NOT as identifiers
+    // only, which silently failed when the lexer promoted those words to
+    // dedicated `TokenKind` variants. Each test parses a statement that goes
+    // through one of the fixed paths and must now succeed.
+
+    #[test]
+    fn test_create_constraint_anonymous_parses() {
+        let mut parser = Parser::new("CREATE CONSTRAINT FOR (n:Item) ON (n.id) UNIQUE");
+        let result = parser.parse();
+        assert!(
+            result.is_ok(),
+            "anonymous CREATE CONSTRAINT must parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_create_constraint_named_parses() {
+        let mut parser = Parser::new("CREATE CONSTRAINT uniq_item FOR (n:Item) ON (n.id) UNIQUE");
+        let result = parser.parse();
+        assert!(
+            result.is_ok(),
+            "named CREATE CONSTRAINT must parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_create_constraint_if_not_exists_parses() {
+        // Parser requires IF NOT EXISTS before the optional name.
+        let mut parser =
+            Parser::new("CREATE CONSTRAINT IF NOT EXISTS uniq_item FOR (n:Item) ON (n.id) UNIQUE");
+        let result = parser.parse();
+        assert!(
+            result.is_ok(),
+            "CREATE CONSTRAINT IF NOT EXISTS must parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_create_index_for_parses() {
+        let mut parser = Parser::new("CREATE INDEX idx FOR (n:Item) ON (n.id)");
+        let result = parser.parse();
+        assert!(
+            result.is_ok(),
+            "CREATE INDEX ... FOR must parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_create_or_replace_node_type_parses() {
+        // Exercises try_parse_or_replace via the NODE TYPE branch.
+        let mut parser = Parser::new("CREATE OR REPLACE NODE TYPE Person (name STRING)");
+        let result = parser.parse();
+        assert!(
+            result.is_ok(),
+            "CREATE OR REPLACE NODE TYPE must parse: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_create_graph_if_not_exists_parses() {
+        let mut parser = Parser::new("CREATE GRAPH IF NOT EXISTS g");
+        let result = parser.parse();
+        assert!(
+            result.is_ok(),
+            "CREATE GRAPH IF NOT EXISTS must parse: {:?}",
+            result.err()
+        );
     }
 }

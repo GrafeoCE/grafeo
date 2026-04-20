@@ -1283,6 +1283,14 @@ impl super::Planner {
 }
 
 /// Extracted vector predicate from a filter expression.
+///
+/// `remaining` carries the residual predicate that must run in a
+/// `FilterOperator` above the `VectorScanOperator`. It is required for
+/// strict operators (`>` / `<`): the scan compares inclusively
+/// (`>=` / `<=`) when applying `min_similarity` / `max_distance`, so without
+/// the residual the boundary row at exactly `threshold` leaks through.
+/// Construct via [`Self::inclusive`] or [`Self::strict`] to make that
+/// invariant explicit at every call site.
 #[cfg(feature = "vector-index")]
 pub(super) struct ExtractedVectorPredicate {
     pub(super) property: String,
@@ -1293,7 +1301,59 @@ pub(super) struct ExtractedVectorPredicate {
     pub(super) metric: super::VectorMetric,
     pub(super) min_similarity: Option<f32>,
     pub(super) max_distance: Option<f32>,
+    /// Residual predicate to apply above the scan. `Some` for strict
+    /// operators; `None` for inclusive operators (the scan's own
+    /// comparison is sufficient).
     pub(super) remaining: Option<LogicalExpression>,
+}
+
+#[cfg(feature = "vector-index")]
+impl ExtractedVectorPredicate {
+    /// Builds a predicate for an inclusive operator (`>=` / `<=`). No
+    /// residual is needed because the scan's internal comparison uses the
+    /// same inclusive bound.
+    fn inclusive(
+        property: String,
+        variable: String,
+        query_vector: LogicalExpression,
+        metric: super::VectorMetric,
+        min_similarity: Option<f32>,
+        max_distance: Option<f32>,
+    ) -> Self {
+        Self {
+            property,
+            variable,
+            query_vector,
+            metric,
+            min_similarity,
+            max_distance,
+            remaining: None,
+        }
+    }
+
+    /// Builds a predicate for a strict operator (`>` / `<`). The caller
+    /// must supply the residual predicate; the planner threads it into a
+    /// `FilterOperator` above the `VectorScanOperator` so rows exactly at
+    /// the threshold are rejected.
+    fn strict(
+        property: String,
+        variable: String,
+        query_vector: LogicalExpression,
+        metric: super::VectorMetric,
+        min_similarity: Option<f32>,
+        max_distance: Option<f32>,
+        residual: LogicalExpression,
+    ) -> Self {
+        Self {
+            property,
+            variable,
+            query_vector,
+            metric,
+            min_similarity,
+            max_distance,
+            remaining: Some(residual),
+        }
+    }
 }
 
 #[cfg(feature = "vector-index")]
@@ -1500,17 +1560,11 @@ impl super::Planner {
         };
 
         // For strict ops, reconstruct the original predicate as the residual
-        // filter. FilterOperator will evaluate it against the narrowed
-        // candidate set from the VectorScan to strip boundary rows.
-        //
-        // TODO(0.5.41): wire `_remaining` into the returned
-        // `ExtractedVectorPredicate { remaining: ... }` so strict `>` / `<`
-        // actually strip boundary rows. Currently `remaining: None` below
-        // means strict operators push down without a residual filter, which
-        // can leak boundary rows. Until that is wired, keep pushdown behind
-        // the existing `is_strict` gate but leave the residual empty.
-        let _remaining = if is_strict {
-            Some(LogicalExpression::Binary {
+        // filter. The planner threads it into a FilterOperator above the
+        // VectorScan (see `plan_filter_with_vector_pushdown`) to strip
+        // boundary rows that the scan's inclusive comparison would let through.
+        if is_strict {
+            let residual = LogicalExpression::Binary {
                 left: Box::new(LogicalExpression::FunctionCall {
                     name: name.to_string(),
                     args: args.to_vec(),
@@ -1518,19 +1572,25 @@ impl super::Planner {
                 }),
                 op,
                 right: Box::new(threshold.clone()),
-            })
+            };
+            Some(ExtractedVectorPredicate::strict(
+                property,
+                variable,
+                query_vector,
+                metric,
+                min_similarity,
+                max_distance,
+                residual,
+            ))
         } else {
-            None
-        };
-
-        Some(ExtractedVectorPredicate {
-            property,
-            variable,
-            query_vector,
-            metric,
-            min_similarity,
-            max_distance,
-            remaining: None,
-        })
+            Some(ExtractedVectorPredicate::inclusive(
+                property,
+                variable,
+                query_vector,
+                metric,
+                min_similarity,
+                max_distance,
+            ))
+        }
     }
 }
