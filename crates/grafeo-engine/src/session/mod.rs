@@ -437,6 +437,7 @@ impl Session {
     /// Sets the current graph for this session (USE GRAPH).
     pub fn use_graph(&self, name: &str) {
         *self.current_graph.lock() = Some(name.to_string());
+        self.track_graph_touch();
     }
 
     /// Returns the current graph name, if any.
@@ -450,6 +451,7 @@ impl Session {
     /// Per ISO/IEC 39075 Section 7.1 GR1, this is independent of the session graph.
     pub fn set_schema(&self, name: &str) {
         *self.current_schema.lock() = Some(name.to_string());
+        self.track_graph_touch();
     }
 
     /// Returns the current schema name, if any.
@@ -610,7 +612,11 @@ impl Session {
     /// Records the current graph as "touched" if a transaction is active.
     ///
     /// Uses the full storage key (schema/graph) so that commit/rollback
-    /// can resolve the correct store via `resolve_store`.
+    /// can resolve the correct store via `resolve_store`. Called from
+    /// every setter that can change the active key (`use_graph`,
+    /// `set_schema`, `reset_*`) so mid-transaction context switches are
+    /// always captured; callers that mutate the active key via those
+    /// setters do not need to invoke this directly.
     fn track_graph_touch(&self) {
         if self.current_transaction.lock().is_some() {
             let key = self.active_graph_storage_key();
@@ -650,16 +656,19 @@ impl Session {
         *self.time_zone.lock() = None;
         self.session_params.lock().clear();
         *self.viewing_epoch_override.lock() = None;
+        self.track_graph_touch();
     }
 
     /// Resets only the session schema (Section 7.2 GR1).
     pub fn reset_schema(&self) {
         *self.current_schema.lock() = None;
+        self.track_graph_touch();
     }
 
     /// Resets only the session graph (Section 7.2 GR2).
     pub fn reset_graph(&self) {
         *self.current_graph.lock() = None;
+        self.track_graph_touch();
     }
 
     /// Resets only the session time zone (Section 7.2 GR3).
@@ -948,8 +957,6 @@ impl Session {
                     )));
                 }
                 self.use_graph(&name);
-                // Track the new graph if in a transaction
-                self.track_graph_touch();
                 Ok(QueryResult::empty())
             }
             #[cfg(feature = "lpg")]
@@ -980,8 +987,6 @@ impl Session {
                     )));
                 }
                 self.use_graph(&name);
-                // Track the new graph if in a transaction
-                self.track_graph_touch();
                 Ok(QueryResult::empty())
             }
             SessionCommand::SessionSetSchema(name) => {
@@ -3893,9 +3898,17 @@ impl Session {
         let _span = grafeo_debug_span!("grafeo::tx::commit");
 
         #[cfg(feature = "testing-statement-injection")]
-        grafeo_common::testing::statement_failure::maybe_fail_commit().map_err(|e| {
-            grafeo_common::utils::error::Error::Internal(format!("injected commit failure: {e}"))
-        })?;
+        if let Err(e) = grafeo_common::testing::statement_failure::maybe_fail_commit() {
+            // Commit fails before any state is finalized. Treat it like any
+            // other pre-prepare commit failure and auto-rollback so the
+            // session returns to a clean, consistent state (matches real
+            // DB semantics: commit failure implies the transaction is
+            // aborted, not left in-flight).
+            let _ = self.rollback_inner();
+            return Err(grafeo_common::utils::error::Error::Internal(format!(
+                "injected commit failure: {e}"
+            )));
+        }
 
         self.check_no_active_streams("commit")?;
         // Nested transaction: release the auto-savepoint (changes are preserved).

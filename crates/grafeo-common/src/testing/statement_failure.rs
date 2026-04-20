@@ -131,13 +131,23 @@ mod inner {
     use super::InjectedFailure;
 
     /// No-op when injection is disabled.
-    #[inline(always)]
+    ///
+    /// # Errors
+    ///
+    /// Always returns `Ok(())` when the `testing-statement-injection` feature
+    /// is off; the result type is kept so call sites compile uniformly.
+    #[inline]
     pub fn maybe_fail_statement() -> Result<(), InjectedFailure> {
         Ok(())
     }
 
     /// No-op when injection is disabled.
-    #[inline(always)]
+    ///
+    /// # Errors
+    ///
+    /// Always returns `Ok(())` when the `testing-statement-injection` feature
+    /// is off; the result type is kept so call sites compile uniformly.
+    #[inline]
     pub fn maybe_fail_commit() -> Result<(), InjectedFailure> {
         Ok(())
     }

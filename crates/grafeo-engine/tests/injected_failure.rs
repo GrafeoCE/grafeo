@@ -99,9 +99,6 @@ fn injected_statement_failure_rolls_back_cross_schema_writes() {
 }
 
 #[test]
-#[ignore = "Exposes the same mid-tx schema-switch commit bug tracked in \
-            bug-multi-schema-commit-atomicity.md: writes survive the injected \
-            commit failure. Un-ignore and expect pass once the bug is fixed."]
 fn injected_commit_failure_rolls_back_prior_writes() {
     let db = db();
     let session = db.session();

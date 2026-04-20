@@ -80,12 +80,6 @@ and `CREATE GRAPH a/b` are rejected at parse time.
 
 ## Transactions across schemas
 
-A single transaction can write to graphs in multiple schemas. On ROLLBACK,
-all writes across all touched schemas are undone atomically.
-
-!!! warning "Known issue in 0.5.40"
-    `SESSION SET SCHEMA` executed between two writes *within the same
-    transaction* can cause the pre-switch writes to be lost on COMMIT.
-    Workaround: commit the first schema's writes before switching, or
-    perform each schema's writes in its own transaction. Rollback is
-    unaffected. Tracked for 0.5.41.
+A single transaction can write to graphs in multiple schemas. Both COMMIT
+and ROLLBACK are atomic across all schemas touched by the transaction,
+including `SESSION SET SCHEMA` switches mid-transaction.

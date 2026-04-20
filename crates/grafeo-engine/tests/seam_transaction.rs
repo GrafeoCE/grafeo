@@ -666,10 +666,6 @@ mod multi_schema_atomicity {
     use super::*;
 
     #[test]
-    #[ignore = "0.5.40 finding: INSERT followed by SESSION SET SCHEMA inside a \
-                transaction loses the pre-switch graph's writes on COMMIT. \
-                Rollback path unaffected (see rollback_is_atomic_across_schemas). \
-                Tracked for 0.5.41."]
     fn commit_is_atomic_across_schemas() {
         let db = db();
         let session = db.session();
@@ -823,5 +819,40 @@ mod multi_schema_atomicity {
             0,
             "beta's Row writes must be undone by cross-schema rollback"
         );
+    }
+
+    /// Companion to `commit_is_atomic_across_schemas`: the same mid-tx schema
+    /// switch must finalize writes into *both* schemas' named stores, not just
+    /// the post-switch one. Uses a third SESSION SET SCHEMA back to the first
+    /// schema to double-check that alpha's writes still route to alpha's store.
+    #[test]
+    fn mid_tx_schema_switch_finalizes_all_touched_stores() {
+        let db = db();
+        let session = db.session();
+
+        session.execute("CREATE SCHEMA alpha").unwrap();
+        session.execute("CREATE SCHEMA beta").unwrap();
+        session.execute("CREATE SCHEMA gamma").unwrap();
+
+        session.execute("START TRANSACTION").unwrap();
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        session.execute("INSERT (:Tag {v: 1})").unwrap();
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        session.execute("INSERT (:Tag {v: 2})").unwrap();
+        session.execute("SESSION SET SCHEMA gamma").unwrap();
+        session.execute("INSERT (:Tag {v: 3})").unwrap();
+        session.execute("COMMIT").unwrap();
+
+        for schema in ["alpha", "beta", "gamma"] {
+            session
+                .execute(&format!("SESSION SET SCHEMA {schema}"))
+                .unwrap();
+            let r = session.execute("MATCH (n:Tag) RETURN n").unwrap();
+            assert_eq!(
+                r.row_count(),
+                1,
+                "schema '{schema}' should have its own Tag after commit"
+            );
+        }
     }
 }
