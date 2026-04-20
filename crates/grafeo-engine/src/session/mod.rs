@@ -28,7 +28,7 @@ use grafeo_core::graph::lpg::LpgStore;
 use grafeo_core::graph::lpg::{Edge, Node};
 #[cfg(feature = "triple-store")]
 use grafeo_core::graph::rdf::RdfStore;
-use grafeo_core::graph::{GraphStore, GraphStoreMut};
+use grafeo_core::graph::{GraphStore, GraphStoreMut, GraphStoreSearch};
 
 use crate::catalog::{Catalog, CatalogConstraintValidator};
 use crate::config::{AdaptiveConfig, GraphModel};
@@ -112,7 +112,7 @@ pub struct Session {
     #[cfg(feature = "lpg")]
     store: Arc<LpgStore>,
     /// Graph store trait object for pluggable storage backends (read path).
-    graph_store: Arc<dyn GraphStore>,
+    graph_store: Arc<dyn GraphStoreSearch>,
     /// Writable graph store (None for read-only databases).
     graph_store_mut: Option<Arc<dyn GraphStoreMut>>,
     /// Schema and metadata catalog shared across sessions.
@@ -241,7 +241,7 @@ impl Session {
     #[cfg(feature = "lpg")]
     #[allow(dead_code)] // Used when lpg enabled without triple-store
     pub(crate) fn with_adaptive(store: Arc<LpgStore>, cfg: SessionConfig) -> Self {
-        let graph_store = Arc::clone(&store) as Arc<dyn GraphStore>;
+        let graph_store = Arc::clone(&store) as Arc<dyn GraphStoreSearch>;
         let graph_store_mut = Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>);
         Self {
             store,
@@ -297,9 +297,10 @@ impl Session {
     /// Used by the layered store integration: the session's `store` field is
     /// the overlay `LpgStore` (for MVCC), but reads and writes should route
     /// through the `LayeredStore` (which merges base + overlay).
+    #[cfg(all(feature = "compact-store", feature = "lpg"))]
     pub(crate) fn override_stores(
         &mut self,
-        read_store: Arc<dyn GraphStore>,
+        read_store: Arc<dyn GraphStoreSearch>,
         write_store: Option<Arc<dyn GraphStoreMut>>,
     ) {
         self.graph_store = read_store;
@@ -322,7 +323,7 @@ impl Session {
             Arc::clone(&wal),
             Arc::clone(&wal_graph_context),
         ));
-        self.graph_store = Arc::clone(&wal_store) as Arc<dyn GraphStore>;
+        self.graph_store = Arc::clone(&wal_store) as Arc<dyn GraphStoreSearch>;
         self.graph_store_mut = Some(wal_store as Arc<dyn GraphStoreMut>);
         self.wal = Some(wal);
         self.wal_graph_context = Some(wal_graph_context);
@@ -364,7 +365,7 @@ impl Session {
     ///
     /// Returns an error if the internal arena allocation fails (out of memory).
     pub(crate) fn with_external_store(
-        read_store: Arc<dyn GraphStore>,
+        read_store: Arc<dyn GraphStoreSearch>,
         write_store: Option<Arc<dyn GraphStoreMut>>,
         cfg: SessionConfig,
     ) -> Result<Self> {
@@ -436,6 +437,7 @@ impl Session {
     /// Sets the current graph for this session (USE GRAPH).
     pub fn use_graph(&self, name: &str) {
         *self.current_graph.lock() = Some(name.to_string());
+        self.track_graph_touch();
     }
 
     /// Returns the current graph name, if any.
@@ -449,6 +451,7 @@ impl Session {
     /// Per ISO/IEC 39075 Section 7.1 GR1, this is independent of the session graph.
     pub fn set_schema(&self, name: &str) {
         *self.current_schema.lock() = Some(name.to_string());
+        self.track_graph_touch();
     }
 
     /// Returns the current schema name, if any.
@@ -507,7 +510,7 @@ impl Session {
     /// Otherwise looks up the named graph in the root store and wraps it
     /// in a [`WalGraphStore`] so mutations are WAL-logged with the correct
     /// graph context.
-    fn active_store(&self) -> Arc<dyn GraphStore> {
+    fn active_store(&self) -> Arc<dyn GraphStoreSearch> {
         let key = self.active_graph_storage_key();
         match key {
             None => Arc::clone(&self.graph_store),
@@ -521,9 +524,9 @@ impl Session {
                             Arc::clone(wal),
                             name.clone(),
                             Arc::clone(ctx),
-                        )) as Arc<dyn GraphStore>;
+                        )) as Arc<dyn GraphStoreSearch>;
                     }
-                    named_store as Arc<dyn GraphStore>
+                    named_store as Arc<dyn GraphStoreSearch>
                 }
                 None => Arc::clone(&self.graph_store),
             },
@@ -609,7 +612,11 @@ impl Session {
     /// Records the current graph as "touched" if a transaction is active.
     ///
     /// Uses the full storage key (schema/graph) so that commit/rollback
-    /// can resolve the correct store via `resolve_store`.
+    /// can resolve the correct store via `resolve_store`. Called from
+    /// every setter that can change the active key (`use_graph`,
+    /// `set_schema`, `reset_*`) so mid-transaction context switches are
+    /// always captured; callers that mutate the active key via those
+    /// setters do not need to invoke this directly.
     fn track_graph_touch(&self) {
         if self.current_transaction.lock().is_some() {
             let key = self.active_graph_storage_key();
@@ -649,16 +656,19 @@ impl Session {
         *self.time_zone.lock() = None;
         self.session_params.lock().clear();
         *self.viewing_epoch_override.lock() = None;
+        self.track_graph_touch();
     }
 
     /// Resets only the session schema (Section 7.2 GR1).
     pub fn reset_schema(&self) {
         *self.current_schema.lock() = None;
+        self.track_graph_touch();
     }
 
     /// Resets only the session graph (Section 7.2 GR2).
     pub fn reset_graph(&self) {
         *self.current_graph.lock() = None;
+        self.track_graph_touch();
     }
 
     /// Resets only the session time zone (Section 7.2 GR3).
@@ -809,6 +819,14 @@ impl Session {
                 open: _,
             } => {
                 // ISO/IEC 39075 Section 12.4: graphs are created within the current schema
+                if name.contains('/') {
+                    return Err(Error::Query(QueryError::new(
+                        QueryErrorKind::Semantic,
+                        format!(
+                            "Graph name '{name}' must not contain '/' (reserved as schema/graph separator)"
+                        ),
+                    )));
+                }
                 let storage_key = self.effective_graph_key(&name);
 
                 // Validate source graph exists for LIKE / AS COPY OF
@@ -939,8 +957,6 @@ impl Session {
                     )));
                 }
                 self.use_graph(&name);
-                // Track the new graph if in a transaction
-                self.track_graph_touch();
                 Ok(QueryResult::empty())
             }
             #[cfg(feature = "lpg")]
@@ -971,8 +987,6 @@ impl Session {
                     )));
                 }
                 self.use_graph(&name);
-                // Track the new graph if in a transaction
-                self.track_graph_touch();
                 Ok(QueryResult::empty())
             }
             SessionCommand::SessionSetSchema(name) => {
@@ -1701,26 +1715,36 @@ impl Session {
             SchemaStatement::CreateSchema {
                 name,
                 if_not_exists,
-            } => match self.catalog.register_schema_namespace(name.clone()) {
-                Ok(()) => {
-                    wal_log!(self, WalRecord::CreateSchema { name: name.clone() });
-                    // Auto-create the schema's default graph partition so that
-                    // SESSION SET SCHEMA + queries work without an explicit graph.
-                    let default_key = format!("{name}/{SCHEMA_DEFAULT_GRAPH}");
-                    if self.store.create_graph(&default_key).unwrap_or(false) {
-                        wal_log!(self, WalRecord::CreateNamedGraph { name: default_key });
+            } => {
+                if name.contains('/') {
+                    return Err(Error::Query(QueryError::new(
+                        QueryErrorKind::Semantic,
+                        format!(
+                            "Schema name '{name}' must not contain '/' (reserved as schema/graph separator)"
+                        ),
+                    )));
+                }
+                match self.catalog.register_schema_namespace(name.clone()) {
+                    Ok(()) => {
+                        wal_log!(self, WalRecord::CreateSchema { name: name.clone() });
+                        // Auto-create the schema's default graph partition so that
+                        // SESSION SET SCHEMA + queries work without an explicit graph.
+                        let default_key = format!("{name}/{SCHEMA_DEFAULT_GRAPH}");
+                        if self.store.create_graph(&default_key).unwrap_or(false) {
+                            wal_log!(self, WalRecord::CreateNamedGraph { name: default_key });
+                        }
+                        Ok(QueryResult::status(format!("Created schema '{name}'")))
                     }
-                    Ok(QueryResult::status(format!("Created schema '{name}'")))
+                    Err(e) if if_not_exists => {
+                        let _ = e;
+                        Ok(QueryResult::status("No change"))
+                    }
+                    Err(e) => Err(Error::Query(QueryError::new(
+                        QueryErrorKind::Semantic,
+                        e.to_string(),
+                    ))),
                 }
-                Err(e) if if_not_exists => {
-                    let _ = e;
-                    Ok(QueryResult::status("No change"))
-                }
-                Err(e) => Err(Error::Query(QueryError::new(
-                    QueryErrorKind::Semantic,
-                    e.to_string(),
-                ))),
-            },
+            }
             SchemaStatement::DropSchema { name, if_exists } => {
                 // ISO/IEC 39075 Section 12.3: schema must be empty before dropping.
                 // The auto-created __default__ graph is exempt from the check.
@@ -2541,6 +2565,11 @@ impl Session {
     #[cfg(feature = "gql")]
     pub fn execute(&self, query: &str) -> Result<QueryResult> {
         self.require_lpg("GQL")?;
+
+        #[cfg(feature = "testing-statement-injection")]
+        grafeo_common::testing::statement_failure::maybe_fail_statement().map_err(|e| {
+            grafeo_common::utils::error::Error::Internal(format!("injected failure: {e}"))
+        })?;
 
         use crate::query::{
             binder::Binder, cache::CacheKey, optimizer::Optimizer, processor::QueryLanguage,
@@ -3867,6 +3896,20 @@ impl Session {
     #[cfg(feature = "lpg")]
     fn commit_inner(&self) -> Result<()> {
         let _span = grafeo_debug_span!("grafeo::tx::commit");
+
+        #[cfg(feature = "testing-statement-injection")]
+        if let Err(e) = grafeo_common::testing::statement_failure::maybe_fail_commit() {
+            // Commit fails before any state is finalized. Treat it like any
+            // other pre-prepare commit failure and auto-rollback so the
+            // session returns to a clean, consistent state (matches real
+            // DB semantics: commit failure implies the transaction is
+            // aborted, not left in-flight).
+            let _ = self.rollback_inner();
+            return Err(grafeo_common::utils::error::Error::Internal(format!(
+                "injected commit failure: {e}"
+            )));
+        }
+
         self.check_no_active_streams("commit")?;
         // Nested transaction: release the auto-savepoint (changes are preserved).
         {
@@ -4606,7 +4649,7 @@ impl Session {
     /// `self.active_store()` for graph-aware execution).
     fn create_planner_for_store(
         &self,
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         viewing_epoch: EpochId,
         transaction_id: Option<TransactionId>,
     ) -> crate::query::Planner {
@@ -4615,7 +4658,7 @@ impl Session {
 
     fn create_planner_for_store_with_read_only(
         &self,
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         viewing_epoch: EpochId,
         transaction_id: Option<TransactionId>,
         read_only: bool,

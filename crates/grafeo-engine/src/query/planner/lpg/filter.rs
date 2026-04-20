@@ -2,7 +2,7 @@
 
 use super::{
     ApplyOperator, Arc, BinaryOp, DistinctOperator, EmptyOperator, ExpressionPredicate,
-    FilterExpression, FilterOp, FilterOperator, GraphStore, HashAggregateOperator,
+    FilterExpression, FilterOp, FilterOperator, GraphStoreSearch, HashAggregateOperator,
     HashJoinOperator, HashMap, LogicalExpression, LogicalOperator, NodeListOperator, Operator,
     PhysicalAggregateExpr, PhysicalJoinType, RangeBounds, Result, TransactionId, UnaryOp,
     UnionOperator, Value, convert_binary_op, convert_filter_expression,
@@ -74,6 +74,24 @@ impl super::Planner {
             return Ok(result);
         }
 
+        // Try compound hybrid first (both vector AND/OR text in same predicate)
+        #[cfg(all(feature = "vector-index", feature = "text-index"))]
+        if let Some(result) = self.try_plan_filter_compound_hybrid(filter)? {
+            return Ok(result);
+        }
+
+        // Try to use vector index for similarity/distance predicates
+        #[cfg(feature = "vector-index")]
+        if let Some(result) = self.try_plan_filter_with_vector_index(filter)? {
+            return Ok(result);
+        }
+
+        // Try to use text index for text_score/text_match predicates
+        #[cfg(feature = "text-index")]
+        if let Some(result) = self.try_plan_filter_with_text_index(filter)? {
+            return Ok(result);
+        }
+
         // Plan the input operator first
         let (input_op, columns) = self.plan_operator(&filter.input)?;
 
@@ -91,7 +109,7 @@ impl super::Planner {
         let predicate = ExpressionPredicate::new(
             filter_expr,
             variable_columns,
-            Arc::clone(&self.store) as Arc<dyn GraphStore>,
+            Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
         )
         .with_transaction_context(self.viewing_epoch, self.transaction_id)
         .with_session_context(self.session_context.clone());
@@ -367,7 +385,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -457,7 +475,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -531,7 +549,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -689,7 +707,7 @@ impl super::Planner {
         let predicate = ExpressionPredicate::new(
             count_filter,
             count_var_columns.clone(),
-            Arc::clone(&self.store) as Arc<dyn GraphStore>,
+            Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
         )
         .with_transaction_context(self.viewing_epoch, self.transaction_id)
         .with_session_context(self.session_context.clone());
@@ -702,7 +720,7 @@ impl super::Planner {
             let remaining_predicate = ExpressionPredicate::new(
                 remaining_expr,
                 count_var_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -915,7 +933,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -1261,5 +1279,318 @@ impl super::Planner {
         };
 
         Some((left_var, left_prop, min_val, max_val, min_inc, max_inc))
+    }
+}
+
+/// Extracted vector predicate from a filter expression.
+///
+/// `remaining` carries the residual predicate that must run in a
+/// `FilterOperator` above the `VectorScanOperator`. It is required for
+/// strict operators (`>` / `<`): the scan compares inclusively
+/// (`>=` / `<=`) when applying `min_similarity` / `max_distance`, so without
+/// the residual the boundary row at exactly `threshold` leaks through.
+/// Construct via [`Self::inclusive`] or [`Self::strict`] to make that
+/// invariant explicit at every call site.
+#[cfg(feature = "vector-index")]
+pub(super) struct ExtractedVectorPredicate {
+    pub(super) property: String,
+    /// Variable bound in the property access (e.g. `n` in `n.embedding`).
+    /// Validated against the enclosing NodeScan variable before pushdown.
+    pub(super) variable: String,
+    pub(super) query_vector: LogicalExpression,
+    pub(super) metric: super::VectorMetric,
+    pub(super) min_similarity: Option<f32>,
+    pub(super) max_distance: Option<f32>,
+    /// Residual predicate to apply above the scan. `Some` for strict
+    /// operators; `None` for inclusive operators (the scan's own
+    /// comparison is sufficient).
+    pub(super) remaining: Option<LogicalExpression>,
+}
+
+#[cfg(feature = "vector-index")]
+impl ExtractedVectorPredicate {
+    /// Builds a predicate for an inclusive operator (`>=` / `<=`). No
+    /// residual is needed because the scan's internal comparison uses the
+    /// same inclusive bound.
+    fn inclusive(
+        property: String,
+        variable: String,
+        query_vector: LogicalExpression,
+        metric: super::VectorMetric,
+        min_similarity: Option<f32>,
+        max_distance: Option<f32>,
+    ) -> Self {
+        Self {
+            property,
+            variable,
+            query_vector,
+            metric,
+            min_similarity,
+            max_distance,
+            remaining: None,
+        }
+    }
+
+    /// Builds a predicate for a strict operator (`>` / `<`). The caller
+    /// must supply the residual predicate; the planner threads it into a
+    /// `FilterOperator` above the `VectorScanOperator` so rows exactly at
+    /// the threshold are rejected.
+    fn strict(
+        property: String,
+        variable: String,
+        query_vector: LogicalExpression,
+        metric: super::VectorMetric,
+        min_similarity: Option<f32>,
+        max_distance: Option<f32>,
+        residual: LogicalExpression,
+    ) -> Self {
+        Self {
+            property,
+            variable,
+            query_vector,
+            metric,
+            min_similarity,
+            max_distance,
+            remaining: Some(residual),
+        }
+    }
+}
+
+#[cfg(feature = "vector-index")]
+impl super::Planner {
+    /// Tries to push a vector similarity/distance predicate down into a VectorScan operator.
+    ///
+    /// Recognizes patterns like:
+    /// - `cosine_similarity(n.embedding, $qv) > 0.8`
+    /// - `euclidean_distance(n.embedding, $qv) < 0.5`
+    ///
+    /// Returns `Ok(Some((operator, columns)))` if rewritten, `Ok(None)` otherwise.
+    pub(super) fn try_plan_filter_with_vector_index(
+        &self,
+        filter: &super::FilterOp,
+    ) -> Result<Option<(Box<dyn Operator>, Vec<String>)>> {
+        // Only push down when input is a full label scan (no nested input)
+        let LogicalOperator::NodeScan(scan) = filter.input.as_ref() else {
+            return Ok(None);
+        };
+        let Some(ref label) = scan.label else {
+            return Ok(None);
+        };
+
+        // Extract a vector predicate from the filter expression
+        let Some(extracted) = self.extract_vector_predicate(&filter.predicate) else {
+            return Ok(None);
+        };
+
+        // Ensure the predicate references the same variable as the scan being planned
+        if extracted.variable != scan.variable {
+            return Ok(None);
+        }
+
+        // Check that a vector index exists (or fall through to brute-force eval)
+        if !self.store.has_vector_index(label, &extracted.property) {
+            return Ok(None);
+        }
+
+        // The pushdown requires a query vector resolvable at plan time. If the
+        // expression is something like a property access or non-literal, fall
+        // through so per-row Filter evaluation handles it.
+        if self
+            .resolve_vector_literal(&extracted.query_vector)
+            .is_err()
+        {
+            return Ok(None);
+        }
+
+        // Build VectorScanOp
+        let vector_scan = super::VectorScanOp {
+            variable: scan.variable.clone(),
+            index_name: Some(format!("{}:{}", label, extracted.property)),
+            property: extracted.property.clone(),
+            label: Some(label.clone()),
+            query_vector: extracted.query_vector.clone(),
+            k: None, // threshold mode — filter by similarity/distance, no top-k limit
+            metric: Some(extracted.metric),
+            min_similarity: extracted.min_similarity,
+            max_distance: extracted.max_distance,
+            input: None,
+        };
+
+        // Plan through the VectorScan path
+        let (scan_op, scan_columns) =
+            self.plan_operator(&LogicalOperator::VectorScan(vector_scan))?;
+
+        // If there are remaining predicates (AND with non-vector conditions), wrap in filter
+        if let Some(remaining) = &extracted.remaining {
+            let variable_columns: HashMap<String, usize> = scan_columns
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.clone(), i))
+                .collect();
+            let filter_expr = self.convert_expression(remaining)?;
+            let predicate = ExpressionPredicate::new(
+                filter_expr,
+                variable_columns,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
+            )
+            .with_transaction_context(self.viewing_epoch, self.transaction_id)
+            .with_session_context(self.session_context.clone());
+            let filter_op = Box::new(FilterOperator::new(scan_op, Box::new(predicate)));
+            Ok(Some((filter_op, scan_columns)))
+        } else {
+            Ok(Some((scan_op, scan_columns)))
+        }
+    }
+
+    /// Recursively extracts a vector predicate from a (potentially compound) expression.
+    pub(super) fn extract_vector_predicate(
+        &self,
+        expr: &LogicalExpression,
+    ) -> Option<ExtractedVectorPredicate> {
+        match expr {
+            LogicalExpression::Binary { left, op, right } => {
+                // Try the left side as a vector function call
+                if let LogicalExpression::FunctionCall { name, args, .. } = left.as_ref()
+                    && let Some(extracted) = self.try_extract_vector_fn(name, args, *op, right)
+                {
+                    return Some(extracted);
+                }
+                // AND: recurse into both sides, accumulating remaining predicates
+                if *op == BinaryOp::And {
+                    if let Some(mut extracted) = self.extract_vector_predicate(left) {
+                        extracted.remaining = Some(match extracted.remaining {
+                            Some(prev) => LogicalExpression::Binary {
+                                left: Box::new(prev),
+                                op: BinaryOp::And,
+                                right: right.clone(),
+                            },
+                            None => *right.clone(),
+                        });
+                        return Some(extracted);
+                    }
+                    if let Some(mut extracted) = self.extract_vector_predicate(right) {
+                        extracted.remaining = Some(match extracted.remaining {
+                            Some(prev) => LogicalExpression::Binary {
+                                left: left.clone(),
+                                op: BinaryOp::And,
+                                right: Box::new(prev),
+                            },
+                            None => *left.clone(),
+                        });
+                        return Some(extracted);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Tries to extract a vector function call predicate.
+    ///
+    /// Recognizes: `cosine_similarity(n.prop, vec) > threshold`
+    /// and the distance variants: `euclidean_distance(n.prop, vec) < threshold`
+    fn try_extract_vector_fn(
+        &self,
+        name: &str,
+        args: &[LogicalExpression],
+        op: BinaryOp,
+        threshold: &LogicalExpression,
+    ) -> Option<ExtractedVectorPredicate> {
+        if args.len() != 2 {
+            return None;
+        }
+
+        let (metric, is_similarity) = match name {
+            "cosine_similarity" => (super::VectorMetric::Cosine, true),
+            "euclidean_distance" => (super::VectorMetric::Euclidean, false),
+            "manhattan_distance" => (super::VectorMetric::Manhattan, false),
+            // dot_product is intentionally not pushed down: the physical
+            // VectorScanOperator's apply_filters only honors min_similarity
+            // when metric == Cosine, so a pushed DotProduct threshold would
+            // be silently dropped, returning unfiltered results. Fall
+            // through to per-row evaluation instead.
+            _ => return None,
+        };
+
+        // Both strict (>, <) and inclusive (>=, <=) operators push down. The
+        // index-level threshold is applied inclusively (apply_filters uses
+        // >= / <=), so for strict operators we attach a residual filter that
+        // re-applies the strict comparison to exclude boundary rows (scores
+        // exactly at the threshold).
+        let (valid_op, is_strict) = if is_similarity {
+            match op {
+                BinaryOp::Gt => (true, true),
+                BinaryOp::Ge => (true, false),
+                _ => (false, false),
+            }
+        } else {
+            match op {
+                BinaryOp::Lt => (true, true),
+                BinaryOp::Le => (true, false),
+                _ => (false, false),
+            }
+        };
+        if !valid_op {
+            return None;
+        }
+
+        // One arg must be a property access, the other a vector literal/parameter
+        let (variable, property, query_vector) =
+            if let LogicalExpression::Property { variable, property } = &args[0] {
+                (variable.clone(), property.clone(), args[1].clone())
+            } else if let LogicalExpression::Property { variable, property } = &args[1] {
+                (variable.clone(), property.clone(), args[0].clone())
+            } else {
+                return None;
+            };
+
+        // Extract threshold value; f64→f32 precision loss is intentional (vectors are f32).
+        #[allow(clippy::cast_possible_truncation)]
+        let threshold_val = match threshold {
+            LogicalExpression::Literal(Value::Float64(v)) => *v as f32,
+            LogicalExpression::Literal(Value::Int64(v)) => *v as f32,
+            _ => return None,
+        };
+
+        let (min_similarity, max_distance) = if is_similarity {
+            (Some(threshold_val), None)
+        } else {
+            (None, Some(threshold_val))
+        };
+
+        // For strict ops, reconstruct the original predicate as the residual
+        // filter. The planner threads it into a FilterOperator above the
+        // VectorScan (see `plan_filter_with_vector_pushdown`) to strip
+        // boundary rows that the scan's inclusive comparison would let through.
+        if is_strict {
+            let residual = LogicalExpression::Binary {
+                left: Box::new(LogicalExpression::FunctionCall {
+                    name: name.to_string(),
+                    args: args.to_vec(),
+                    distinct: false,
+                }),
+                op,
+                right: Box::new(threshold.clone()),
+            };
+            Some(ExtractedVectorPredicate::strict(
+                property,
+                variable,
+                query_vector,
+                metric,
+                min_similarity,
+                max_distance,
+                residual,
+            ))
+        } else {
+            Some(ExtractedVectorPredicate::inclusive(
+                property,
+                variable,
+                query_vector,
+                metric,
+                min_similarity,
+                max_distance,
+            ))
+        }
     }
 }

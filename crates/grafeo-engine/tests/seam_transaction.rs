@@ -657,3 +657,202 @@ mod session_isolation {
         assert_eq!(result.row_count(), 1, "Only Alix should survive");
     }
 }
+
+// ============================================================================
+// 6. Multi-schema transaction atomicity (ISO/IEC 39075 catalog hierarchy)
+// ============================================================================
+
+mod multi_schema_atomicity {
+    use super::*;
+
+    #[test]
+    fn commit_is_atomic_across_schemas() {
+        let db = db();
+        let session = db.session();
+
+        session.execute("CREATE SCHEMA alpha").unwrap();
+        session.execute("CREATE SCHEMA beta").unwrap();
+
+        session.execute("START TRANSACTION").unwrap();
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        session.execute("INSERT (:Item {owner: 'alpha'})").unwrap();
+        // Visible within the same tx before the schema switch
+        let mid = session.execute("MATCH (n:Item) RETURN n").unwrap();
+        assert_eq!(
+            mid.row_count(),
+            1,
+            "alpha write must be visible within its own tx"
+        );
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        session.execute("INSERT (:Item {owner: 'beta'})").unwrap();
+        session.execute("COMMIT").unwrap();
+
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        let a = session.execute("MATCH (n:Item) RETURN n").unwrap();
+        assert_eq!(a.row_count(), 1, "alpha's commit should be visible");
+
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        let b = session.execute("MATCH (n:Item) RETURN n").unwrap();
+        assert_eq!(b.row_count(), 1, "beta's commit should be visible");
+    }
+
+    #[test]
+    fn rollback_is_atomic_across_schemas() {
+        let db = db();
+        let session = db.session();
+
+        session.execute("CREATE SCHEMA alpha").unwrap();
+        session.execute("CREATE SCHEMA beta").unwrap();
+
+        session.execute("START TRANSACTION").unwrap();
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        session.execute("INSERT (:Item {owner: 'alpha'})").unwrap();
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        session.execute("INSERT (:Item {owner: 'beta'})").unwrap();
+        session.execute("ROLLBACK").unwrap();
+
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        let a = session.execute("MATCH (n:Item) RETURN n").unwrap();
+        assert_eq!(
+            a.row_count(),
+            0,
+            "alpha's write must be undone by cross-schema rollback"
+        );
+
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        let b = session.execute("MATCH (n:Item) RETURN n").unwrap();
+        assert_eq!(
+            b.row_count(),
+            0,
+            "beta's write must be undone by cross-schema rollback"
+        );
+    }
+
+    // `partial_failure_rolls_back_all_schemas` was removed in 0.5.40:
+    // forcing a failure mid-tx depended on a NOT NULL constraint firing
+    // in a schema-scoped type after `SESSION SET SCHEMA`, which is
+    // itself a bug (see .claude/todo/5_beta/bug-multi-schema-commit-atomicity.md).
+    // The two tests below use a UNIQUE constraint declared in the default
+    // schema, which fires deterministically at statement execution time
+    // (`check_unique_node_property` in the catalog validator) regardless of
+    // the session's current schema, so they cover rollback atomicity without
+    // depending on that bug.
+
+    #[test]
+    fn unique_violation_rolls_back_prior_writes_single_schema() {
+        let db = db();
+        let session = db.session();
+
+        session
+            .execute("CREATE CONSTRAINT uniq_item FOR (n:Item) ON (n.id) UNIQUE")
+            .unwrap();
+        session.execute("INSERT (:Item {id: 1})").unwrap();
+
+        session.execute("START TRANSACTION").unwrap();
+        session.execute("INSERT (:Item {id: 2})").unwrap();
+        session.execute("INSERT (:Item {id: 3})").unwrap();
+        let violation = session.execute("INSERT (:Item {id: 1})");
+        assert!(
+            violation.is_err(),
+            "INSERT with duplicate UNIQUE value must fail at statement exec"
+        );
+        session.execute("ROLLBACK").unwrap();
+
+        let remaining = session.execute("MATCH (n:Item) RETURN n.id").unwrap();
+        assert_eq!(
+            remaining.row_count(),
+            1,
+            "only the pre-transaction seed row should remain after ROLLBACK"
+        );
+    }
+
+    #[test]
+    fn cross_schema_rollback_after_unique_violation() {
+        let db = db();
+        let session = db.session();
+
+        // UNIQUE constraint in the default schema: the violation trigger is
+        // schema-independent and fires whatever the current session schema is.
+        session
+            .execute("CREATE CONSTRAINT uniq_marker FOR (n:Marker) ON (n.id) UNIQUE")
+            .unwrap();
+        session.execute("INSERT (:Marker {id: 1})").unwrap();
+
+        session.execute("CREATE SCHEMA alpha").unwrap();
+        session.execute("CREATE SCHEMA beta").unwrap();
+
+        session.execute("START TRANSACTION").unwrap();
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        session.execute("INSERT (:Row {owner: 'alpha'})").unwrap();
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        session.execute("INSERT (:Row {owner: 'beta'})").unwrap();
+        session.execute("SESSION RESET SCHEMA").unwrap();
+        let violation = session.execute("INSERT (:Marker {id: 1})");
+        assert!(
+            violation.is_err(),
+            "duplicate UNIQUE in default schema must fail"
+        );
+        session.execute("ROLLBACK").unwrap();
+
+        // Default schema: only the seed remains.
+        let default_markers = session.execute("MATCH (n:Marker) RETURN n.id").unwrap();
+        assert_eq!(
+            default_markers.row_count(),
+            1,
+            "default schema should still have exactly the seed Marker"
+        );
+
+        // Alpha's Row writes are gone.
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        let alpha_rows = session.execute("MATCH (n:Row) RETURN n").unwrap();
+        assert_eq!(
+            alpha_rows.row_count(),
+            0,
+            "alpha's Row writes must be undone by cross-schema rollback"
+        );
+
+        // Beta's Row writes are gone.
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        let beta_rows = session.execute("MATCH (n:Row) RETURN n").unwrap();
+        assert_eq!(
+            beta_rows.row_count(),
+            0,
+            "beta's Row writes must be undone by cross-schema rollback"
+        );
+    }
+
+    /// Companion to `commit_is_atomic_across_schemas`: the same mid-tx schema
+    /// switch must finalize writes into *both* schemas' named stores, not just
+    /// the post-switch one. Uses a third SESSION SET SCHEMA back to the first
+    /// schema to double-check that alpha's writes still route to alpha's store.
+    #[test]
+    fn mid_tx_schema_switch_finalizes_all_touched_stores() {
+        let db = db();
+        let session = db.session();
+
+        session.execute("CREATE SCHEMA alpha").unwrap();
+        session.execute("CREATE SCHEMA beta").unwrap();
+        session.execute("CREATE SCHEMA gamma").unwrap();
+
+        session.execute("START TRANSACTION").unwrap();
+        session.execute("SESSION SET SCHEMA alpha").unwrap();
+        session.execute("INSERT (:Tag {v: 1})").unwrap();
+        session.execute("SESSION SET SCHEMA beta").unwrap();
+        session.execute("INSERT (:Tag {v: 2})").unwrap();
+        session.execute("SESSION SET SCHEMA gamma").unwrap();
+        session.execute("INSERT (:Tag {v: 3})").unwrap();
+        session.execute("COMMIT").unwrap();
+
+        for schema in ["alpha", "beta", "gamma"] {
+            session
+                .execute(&format!("SESSION SET SCHEMA {schema}"))
+                .unwrap();
+            let r = session.execute("MATCH (n:Tag) RETURN n").unwrap();
+            assert_eq!(
+                r.row_count(),
+                1,
+                "schema '{schema}' should have its own Tag after commit"
+            );
+        }
+    }
+}

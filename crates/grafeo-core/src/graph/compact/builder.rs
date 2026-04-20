@@ -578,6 +578,10 @@ fn infer_column_type(codec: &ColumnCodec) -> ColumnType {
         ColumnCodec::Int8Vector { dimensions, .. } => ColumnType::Int8Vector {
             dimensions: *dimensions,
         },
+        ColumnCodec::Float64(_) => ColumnType::Float64,
+        ColumnCodec::Float32Vector { dimensions, .. } => ColumnType::Float32Vector {
+            dimensions: *dimensions,
+        },
     }
 }
 
@@ -649,8 +653,12 @@ fn compute_zone_map_bool(values: &[bool]) -> ZoneMap {
 enum InferredType {
     /// All non-null values are `Value::Int64` with value >= 0.
     BitPacked,
+    /// All non-null values are `Value::Float64`, or mixed `Int64`+`Float64`.
+    Float64,
     /// All non-null values are `Value::Bool`.
     Bitmap,
+    /// All non-null values are `Value::Vector` with consistent dimensions.
+    Float32Vector { dimensions: u16 },
     /// All non-null values are `Value::String`, or mixed/unsupported types.
     Dict,
 }
@@ -789,6 +797,42 @@ pub fn from_graph_store(
                         t.columns.push((key.clone(), ColumnCodec::BitPacked(bp)));
                         t.record_len(u64_values.len());
                     }
+                    InferredType::Float64 => {
+                        let f64_values: Vec<f64> = values
+                            .iter()
+                            .map(|v| match v {
+                                Value::Float64(f) => *f,
+                                Value::Int64(n) => *n as f64,
+                                _ => 0.0,
+                            })
+                            .collect();
+                        t.columns
+                            .push((key.clone(), ColumnCodec::Float64(f64_values)));
+                        t.record_len(values.len());
+                    }
+                    InferredType::Float32Vector { dimensions } => {
+                        let mut flat: Vec<f32> =
+                            Vec::with_capacity(values.len() * dimensions as usize);
+                        for v in values {
+                            match v {
+                                Value::Vector(vec) => flat.extend_from_slice(vec),
+                                _ => {
+                                    flat.extend(std::iter::repeat_n(
+                                        0.0f32,
+                                        usize::from(dimensions),
+                                    ));
+                                }
+                            }
+                        }
+                        t.columns.push((
+                            key.clone(),
+                            ColumnCodec::Float32Vector {
+                                data: flat,
+                                dimensions,
+                            },
+                        ));
+                        t.record_len(values.len());
+                    }
                     InferredType::Bitmap => {
                         let bool_values: Vec<bool> = values
                             .iter()
@@ -908,6 +952,38 @@ pub fn from_graph_store(
                                     .collect();
                                 let bp = BitPackedInts::pack(&u64_values);
                                 r.properties.push((key.clone(), ColumnCodec::BitPacked(bp)));
+                            }
+                            InferredType::Float64 => {
+                                let f64_values: Vec<f64> = values
+                                    .iter()
+                                    .map(|v| match v {
+                                        Value::Float64(f) => *f,
+                                        Value::Int64(n) => *n as f64,
+                                        _ => 0.0,
+                                    })
+                                    .collect();
+                                r.properties
+                                    .push((key.clone(), ColumnCodec::Float64(f64_values)));
+                            }
+                            InferredType::Float32Vector { dimensions } => {
+                                let mut flat: Vec<f32> =
+                                    Vec::with_capacity(values.len() * dimensions as usize);
+                                for v in values {
+                                    match v {
+                                        Value::Vector(vec) => flat.extend_from_slice(vec),
+                                        _ => flat.extend(std::iter::repeat_n(
+                                            0.0f32,
+                                            usize::from(dimensions),
+                                        )),
+                                    }
+                                }
+                                r.properties.push((
+                                    key.clone(),
+                                    ColumnCodec::Float32Vector {
+                                        data: flat,
+                                        dimensions,
+                                    },
+                                ));
                             }
                             InferredType::Bitmap => {
                                 let bool_values: Vec<bool> = values
@@ -1102,20 +1178,57 @@ pub fn from_graph_store_preserving_ids(
 /// - Otherwise returns `Dict` (string fallback).
 fn infer_type_from_values(values: &[Value]) -> InferredType {
     let mut saw_int = false;
+    let mut saw_float = false;
     let mut saw_bool = false;
+    let mut saw_vector = false;
     let mut saw_other = false;
+    let mut vector_dims: Option<u16> = None;
 
     for v in values {
         match v {
             Value::Null => {} // skip nulls
             Value::Int64(n) if *n >= 0 => saw_int = true,
+            Value::Float64(_) => saw_float = true,
             Value::Bool(_) => saw_bool = true,
+            Value::Vector(vec) => {
+                saw_vector = true;
+                let Ok(dims) = u16::try_from(vec.len()) else {
+                    saw_other = true; // too many dimensions for columnar storage
+                    continue;
+                };
+                if let Some(prev) = vector_dims {
+                    if prev != dims {
+                        saw_other = true; // mixed dimensions → fallback
+                    }
+                } else {
+                    vector_dims = Some(dims);
+                }
+            }
             _ => saw_other = true,
         }
     }
 
-    if saw_other || (saw_int && saw_bool) {
+    // Vectors are exclusive; mixed with other types falls back to Dict.
+    // Zero-dimension vectors cannot be round-tripped through the Float32Vector
+    // codec (stride=0 means no row can be decoded), so those fall back to Dict
+    // as well.
+    if saw_vector
+        && !saw_other
+        && !saw_int
+        && !saw_float
+        && !saw_bool
+        && let Some(dims) = vector_dims
+        && dims > 0
+    {
+        return InferredType::Float32Vector { dimensions: dims };
+    }
+
+    // Mixed Int64+Float64 coalesces to Float64.
+    // Vectors mixed with any other type fall back to Dict.
+    if saw_other || saw_vector || ((saw_int || saw_float) && saw_bool) {
         InferredType::Dict
+    } else if saw_float {
+        InferredType::Float64
     } else if saw_int {
         InferredType::BitPacked
     } else if saw_bool {
@@ -1421,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_graph_store_float_falls_back_to_dict() {
+    fn test_from_graph_store_float64_column() {
         use crate::graph::lpg::LpgStore;
 
         let store = LpgStore::new().unwrap();
@@ -1434,14 +1547,11 @@ mod tests {
         let ids = compact.nodes_by_label("Sensor");
         assert_eq!(ids.len(), 1);
 
-        // Float64 falls back to Dict, serialized as string.
+        // Float64 values are stored natively.
         let val = compact
             .get_node_property(ids[0], &PropertyKey::new("reading"))
             .unwrap();
-        match val {
-            Value::String(s) => assert!(s.contains("98.6"), "expected '98.6' in '{s}'"),
-            other => panic!("expected String (Dict fallback), got {other:?}"),
-        }
+        assert_eq!(val, Value::Float64(98.6));
     }
 
     #[test]
@@ -1616,7 +1726,15 @@ mod tests {
     fn test_infer_type_float() {
         assert_eq!(
             infer_type_from_values(&[Value::Float64(1.5)]),
-            InferredType::Dict
+            InferredType::Float64
+        );
+    }
+
+    #[test]
+    fn test_infer_type_mixed_int_float_coalesces_to_float() {
+        assert_eq!(
+            infer_type_from_values(&[Value::Int64(1), Value::Float64(2.5)]),
+            InferredType::Float64
         );
     }
 
@@ -1862,6 +1980,180 @@ mod tests {
         assert_eq!(ids.len(), 2);
     }
 
+    // -------------------------------------------------------------------
+    // from_graph_store: vector-valued properties fall back to Dict
+    // -------------------------------------------------------------------
+
+    /// Nodes with `Value::Vector` properties of different dimensions produce
+    /// a Dict column (vectors are not an inferred type). Covers the Dict
+    /// fallback for "other" values in `infer_type_from_values` and the
+    /// per-row Display serialization inside the Dict build path.
+    #[test]
+    fn test_from_graph_store_mixed_vector_dims() {
+        use crate::graph::lpg::LpgStore;
+        use std::sync::Arc;
+
+        let store = LpgStore::new().unwrap();
+
+        // Two nodes with differently-dimensioned embeddings.
+        let alix = store.create_node(&["Doc"]);
+        let short: Arc<[f32]> = Arc::from([0.1f32, 0.2, 0.3].as_slice());
+        store.set_node_property(alix, "embedding", Value::Vector(short));
+
+        let gus = store.create_node(&["Doc"]);
+        let long: Arc<[f32]> = Arc::from([0.4f32, 0.5, 0.6, 0.7, 0.8].as_slice());
+        store.set_node_property(gus, "embedding", Value::Vector(long));
+
+        let compact = from_graph_store(&store).unwrap();
+        let ids = compact.nodes_by_label("Doc");
+        assert_eq!(ids.len(), 2);
+
+        // Both embeddings should be readable as strings (Dict fallback).
+        let mut seen_vec_strings = 0usize;
+        for &id in &ids {
+            let val = compact
+                .get_node_property(id, &PropertyKey::new("embedding"))
+                .expect("embedding property missing");
+            match val {
+                Value::String(s) => {
+                    // Display format is lowercase "vector([...])"; compare
+                    // case-insensitively to be resilient to formatting tweaks.
+                    let lower = s.to_lowercase();
+                    assert!(
+                        lower.contains("vector"),
+                        "dict-encoded vector should include the vector tag: {s}"
+                    );
+                    seen_vec_strings += 1;
+                }
+                other => panic!("expected Dict fallback (String), got {other:?}"),
+            }
+        }
+        assert_eq!(seen_vec_strings, 2);
+    }
+
+    /// A `Value::Vector` with consistent dimensions across nodes round-trips
+    /// through the Float32Vector column codec and comes back as `Value::Vector`
+    /// with the original dimensions and values.
+    #[test]
+    fn test_from_graph_store_float32_vector() {
+        use crate::graph::lpg::LpgStore;
+        use std::sync::Arc;
+
+        let store = LpgStore::new().unwrap();
+        let expected: [f32; 4] = [0.1, 0.2, 0.3, 0.4];
+        for name in ["Alix", "Gus", "Vincent"] {
+            let id = store.create_node(&["Doc"]);
+            store.set_node_property(id, "name", Value::from(name));
+            let emb: Arc<[f32]> = Arc::from(expected.as_slice());
+            store.set_node_property(id, "embedding", Value::Vector(emb));
+        }
+
+        let compact = from_graph_store(&store).unwrap();
+        let ids = compact.nodes_by_label("Doc");
+        assert_eq!(ids.len(), 3);
+
+        for &id in &ids {
+            let v = compact
+                .get_node_property(id, &PropertyKey::new("embedding"))
+                .expect("embedding missing");
+            match v {
+                Value::Vector(data) => {
+                    assert_eq!(&*data, &expected, "unexpected vector contents");
+                }
+                other => panic!("expected Value::Vector, got {other:?}"),
+            }
+        }
+    }
+
+    /// Nodes where only ~10% of them carry a given property exercise the
+    /// null-padding path in `from_graph_store`. Covers the `push(Value::Null)`
+    /// fill loops that keep column lengths aligned to row count.
+    #[test]
+    fn test_from_graph_store_all_null() {
+        use crate::graph::lpg::LpgStore;
+
+        let store = LpgStore::new().unwrap();
+        let mut ids = Vec::new();
+        for i in 0..20 {
+            let nid = store.create_node(&["Item"]);
+            // Only 2 out of 20 nodes (10%) have "flag" set.
+            if i == 3 || i == 17 {
+                store.set_node_property(nid, "flag", Value::Int64(i64::from(i)));
+            }
+            ids.push(nid);
+        }
+
+        let compact = from_graph_store(&store).unwrap();
+        let rows = compact.nodes_by_label("Item");
+        assert_eq!(rows.len(), 20);
+
+        // Count rows whose "flag" decoded value is nonzero (BitPacked null
+        // padding decodes as 0). We expect exactly 2.
+        let mut nonzero = 0usize;
+        for &id in &rows {
+            if let Some(Value::Int64(v)) = compact.get_node_property(id, &PropertyKey::new("flag"))
+                && v > 0
+            {
+                nonzero += 1;
+            }
+        }
+        assert_eq!(
+            nonzero, 2,
+            "only 2 nodes had a real 'flag' value; the rest should be zero-padded"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Zone map boundary cases
+    // -------------------------------------------------------------------
+
+    /// Zone map for a u64 column whose maximum equals `i64::MAX` exactly
+    /// should keep both bounds (boundary-inclusive), while a max one above
+    /// `i64::MAX` drops them. Guards against off-by-one errors in the
+    /// overflow check.
+    #[test]
+    fn test_compute_zone_map_i64_boundary() {
+        // Exactly at the boundary: keep bounds.
+        let at_boundary = vec![0u64, 100, i64::MAX as u64];
+        let zm = compute_zone_map_u64(&at_boundary);
+        assert_eq!(zm.min, Some(Value::Int64(0)));
+        assert_eq!(zm.max, Some(Value::Int64(i64::MAX)));
+        assert_eq!(zm.row_count, 3);
+
+        // One above the boundary: drop bounds, preserve row_count.
+        let above_boundary = vec![0u64, i64::MAX as u64 + 1];
+        let zm = compute_zone_map_u64(&above_boundary);
+        assert!(zm.min.is_none());
+        assert!(zm.max.is_none());
+        assert_eq!(zm.row_count, 2);
+    }
+
+    /// Zone map for a mixed true/false bool column: min is false, max is
+    /// true. Distinct from the existing `test_zone_map_bool_mixed` in that
+    /// the ratio of true/false is skewed to sanity-check the any()-based
+    /// implementation.
+    #[test]
+    fn test_compute_zone_map_bool() {
+        // Heavily skewed: one true, many false.
+        let mostly_false = vec![false; 9]
+            .into_iter()
+            .chain(std::iter::once(true))
+            .collect::<Vec<_>>();
+        let zm = compute_zone_map_bool(&mostly_false);
+        assert_eq!(zm.min, Some(Value::Bool(false)));
+        assert_eq!(zm.max, Some(Value::Bool(true)));
+        assert_eq!(zm.row_count, 10);
+
+        // Heavily skewed the other way: one false, many true.
+        let mostly_true = std::iter::once(false)
+            .chain(std::iter::repeat_n(true, 9))
+            .collect::<Vec<_>>();
+        let zm = compute_zone_map_bool(&mostly_true);
+        assert_eq!(zm.min, Some(Value::Bool(false)));
+        assert_eq!(zm.max, Some(Value::Bool(true)));
+        assert_eq!(zm.row_count, 10);
+    }
+
     #[test]
     fn test_from_graph_store_multi_label_sorted_key() {
         use crate::graph::lpg::LpgStore;
@@ -1880,5 +2172,456 @@ mod tests {
             .get_node_property(ids[0], &PropertyKey::new("name"))
             .unwrap();
         assert_eq!(val, Value::String(ArcStr::from("Butch")));
+    }
+
+    // -------------------------------------------------------------------
+    // infer_type_from_values: all Value::* fall-through branches
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_infer_type_timestamp_falls_back_to_dict() {
+        use grafeo_common::types::Timestamp;
+        let ts = Value::Timestamp(Timestamp::from_millis(1_700_000_000_000));
+        assert_eq!(infer_type_from_values(&[ts]), InferredType::Dict);
+    }
+
+    #[test]
+    fn test_infer_type_date_falls_back_to_dict() {
+        use grafeo_common::types::Date;
+        let d = Value::Date(Date::from_days(19000));
+        assert_eq!(infer_type_from_values(&[d]), InferredType::Dict);
+    }
+
+    #[test]
+    fn test_infer_type_vector_consistent_dim_picks_float32_vector() {
+        // Consistent-dimension Float32 vectors get a dedicated column type.
+        let v = Value::Vector(std::sync::Arc::from([0.1f32, 0.2, 0.3].as_slice()));
+        assert_eq!(
+            infer_type_from_values(&[v]),
+            InferredType::Float32Vector { dimensions: 3 }
+        );
+    }
+
+    #[test]
+    fn test_infer_type_mixed_dim_vectors_fall_back_to_dict() {
+        // Inconsistent dimensions force the Dict fallback.
+        let v3 = Value::Vector(std::sync::Arc::from([0.1f32, 0.2, 0.3].as_slice()));
+        let v5 = Value::Vector(std::sync::Arc::from(
+            [0.1f32, 0.2, 0.3, 0.4, 0.5].as_slice(),
+        ));
+        assert_eq!(infer_type_from_values(&[v3, v5]), InferredType::Dict);
+    }
+
+    #[test]
+    fn test_infer_type_bytes_falls_back_to_dict() {
+        let b = Value::Bytes(std::sync::Arc::from(b"payload".as_slice()));
+        assert_eq!(infer_type_from_values(&[b]), InferredType::Dict);
+    }
+
+    #[test]
+    fn test_infer_type_null_with_bool_yields_bitmap() {
+        // Nulls skipped; a pure Bool column stays Bitmap.
+        assert_eq!(
+            infer_type_from_values(&[Value::Null, Value::Bool(false), Value::Null]),
+            InferredType::Bitmap
+        );
+    }
+
+    #[test]
+    fn test_infer_type_saw_int_and_other_yields_dict() {
+        // Int + String (saw_other) should force Dict.
+        assert_eq!(
+            infer_type_from_values(&[Value::Int64(1), Value::from("hello")]),
+            InferredType::Dict
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Builder error variants: DuplicateLabel, DuplicateEdgeType
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_builder_duplicate_label_error() {
+        let result = CompactStoreBuilder::new()
+            .node_table("Person", |t| t.column_bitpacked("age", &[30], 6))
+            .node_table("Person", |t| t.column_bitpacked("age", &[40], 6))
+            .build();
+        assert!(matches!(
+            result,
+            Err(CompactStoreError::DuplicateLabel(ref s)) if s == "Person"
+        ));
+    }
+
+    #[test]
+    fn test_builder_duplicate_edge_type_error() {
+        let result = CompactStoreBuilder::new()
+            .node_table("A", |t| t.column_bitpacked("v", &[1], 4))
+            .node_table("B", |t| t.column_bitpacked("v", &[1], 4))
+            .rel_table("LINKS", "A", "B", |r| r.edges([(0, 0)]))
+            .rel_table("LINKS", "A", "B", |r| r.edges([(0, 0)]))
+            .build();
+        assert!(matches!(
+            result,
+            Err(CompactStoreError::DuplicateEdgeType(_))
+        ));
+    }
+
+    #[test]
+    fn test_builder_column_length_mismatch_error() {
+        let result = CompactStoreBuilder::new()
+            .node_table("Person", |t| {
+                t.column_bitpacked("age", &[25, 30, 35], 6)
+                    .column_dict("name", &["Alix", "Gus"]) // length 2, mismatch
+            })
+            .build();
+        assert!(matches!(
+            result,
+            Err(CompactStoreError::ColumnLengthMismatch {
+                expected: 3,
+                got: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn test_builder_value_overflow_error() {
+        // Values exceeding i64::MAX must be flagged.
+        let bad_value = (i64::MAX as u64) + 10;
+        let result = CompactStoreBuilder::new()
+            .node_table("Person", |t| {
+                t.column_bitpacked("x", &[1u64, bad_value], 64)
+            })
+            .build();
+        assert!(matches!(
+            result,
+            Err(CompactStoreError::ValueOverflow { ref column, value, .. })
+                if column == "x" && value == bad_value
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // Pre-built codec passthrough: NodeTableBuilder::column
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_node_table_builder_prebuilt_column() {
+        use crate::codec::BitPackedInts;
+
+        let bp = BitPackedInts::pack(&[100u64, 200, 300]);
+        let codec = ColumnCodec::BitPacked(bp);
+
+        let store = CompactStoreBuilder::new()
+            .node_table("Item", |t| t.column("value", codec))
+            .build()
+            .unwrap();
+
+        let ids = store.nodes_by_label("Item");
+        assert_eq!(ids.len(), 3);
+
+        // Check the pre-built column values are readable.
+        let mut values: Vec<i64> = ids
+            .iter()
+            .filter_map(|&id| {
+                store
+                    .get_node_property(id, &PropertyKey::new("value"))
+                    .and_then(|v| v.as_int64())
+            })
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, vec![100, 200, 300]);
+    }
+
+    // -------------------------------------------------------------------
+    // column_int8_vector: zero dimensions case (row_count=0)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_node_table_builder_int8_vector_zero_dimensions() {
+        // Zero dimensions yields 0 rows, no panic.
+        let store = CompactStoreBuilder::new()
+            .node_table("Item", |t| t.column_int8_vector("embed", Vec::new(), 0))
+            .build()
+            .unwrap();
+
+        let ids = store.nodes_by_label("Item");
+        assert_eq!(ids.len(), 0);
+    }
+
+    #[test]
+    fn test_node_table_builder_int8_vector_multi_row() {
+        // Two 3-dim vectors packed in one flat array.
+        let store = CompactStoreBuilder::new()
+            .node_table("Doc", |t| {
+                t.column_int8_vector("embed", vec![1i8, 2, 3, 4, 5, 6], 3)
+            })
+            .build()
+            .unwrap();
+
+        let ids = store.nodes_by_label("Doc");
+        assert_eq!(ids.len(), 2);
+    }
+
+    // -------------------------------------------------------------------
+    // from_graph_store / from_graph_store_preserving_ids edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_from_graph_store_preserving_ids_empty() {
+        use crate::graph::lpg::LpgStore;
+
+        let store = LpgStore::new().unwrap();
+        // No nodes, no edges.
+        let compact = crate::graph::compact::from_graph_store_preserving_ids(&store).unwrap();
+        assert_eq!(compact.node_count(), 0);
+        assert_eq!(compact.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_from_graph_store_single_node_no_properties() {
+        use crate::graph::lpg::LpgStore;
+
+        let store = LpgStore::new().unwrap();
+        store.create_node(&["Loner"]);
+
+        let compact = from_graph_store(&store).unwrap();
+        let ids = compact.nodes_by_label("Loner");
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn test_from_graph_store_preserving_ids_with_data() {
+        use crate::graph::lpg::LpgStore;
+
+        let store = LpgStore::new().unwrap();
+        let alix = store.create_node(&["Person"]);
+        store.set_node_property(alix, "name", Value::from("Alix"));
+        let gus = store.create_node(&["Person"]);
+        store.set_node_property(gus, "name", Value::from("Gus"));
+        let edge_id = store.create_edge(alix, gus, "KNOWS");
+        store.set_edge_property(edge_id, "since", Value::Int64(2020));
+
+        let compact = crate::graph::compact::from_graph_store_preserving_ids(&store).unwrap();
+
+        // Original IDs should still resolve to nodes.
+        let alix_resolved = compact.get_node(alix);
+        assert!(
+            alix_resolved.is_some(),
+            "original NodeId should remain resolvable after preserve_ids"
+        );
+        assert_eq!(
+            alix_resolved
+                .unwrap()
+                .properties
+                .get(&PropertyKey::new("name")),
+            Some(&Value::String(ArcStr::from("Alix")))
+        );
+
+        let edge_resolved = compact.get_edge(edge_id);
+        assert!(
+            edge_resolved.is_some(),
+            "original EdgeId should remain resolvable after preserve_ids"
+        );
+    }
+
+    #[test]
+    fn test_from_graph_store_skewed_properties() {
+        // One label with 5 nodes, each has only one of three properties.
+        // This stresses null-padding in sparse columns.
+        use crate::graph::lpg::LpgStore;
+
+        let store = LpgStore::new().unwrap();
+        for (i, (name, key)) in [
+            ("Alix", "a"),
+            ("Gus", "b"),
+            ("Vincent", "c"),
+            ("Jules", "a"),
+            ("Mia", "b"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let nid = store.create_node(&["Person"]);
+            store.set_node_property(nid, "name", Value::from(*name));
+            // Property 'a', 'b', or 'c' stored as Int64.
+            let score = i64::try_from(i).unwrap_or(0);
+            store.set_node_property(nid, key, Value::Int64(score));
+        }
+
+        let compact = from_graph_store(&store).unwrap();
+        assert_eq!(compact.nodes_by_label("Person").len(), 5);
+    }
+
+    // -------------------------------------------------------------------
+    // Builder column methods: unique scenarios not covered by earlier tests.
+    // `column_int8_vector` happy-path and zero-dim cases live at
+    // `test_node_table_builder_int8_vector_multi_row` / `_zero_dimensions`;
+    // `column` pre-built-codec passthrough lives at
+    // `test_node_table_builder_prebuilt_column`. Keep those canonical.
+    // -------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "is not a multiple of dimensions")]
+    fn test_node_table_column_int8_vector_not_multiple_panics() {
+        // 5 bytes with 2 dimensions is not a multiple.
+        let _ = CompactStoreBuilder::new().node_table("Bad", |t| {
+            t.column_int8_vector("vec", vec![1, 2, 3, 4, 5], 2)
+        });
+    }
+
+    #[test]
+    fn test_node_table_column_bitmap() {
+        let store = CompactStoreBuilder::new()
+            .node_table("Flag", |t| {
+                t.column_bitmap("active", &[true, false, true, false])
+            })
+            .build()
+            .unwrap();
+
+        let ids = store.nodes_by_label("Flag");
+        assert_eq!(ids.len(), 4);
+
+        let v0 = store
+            .get_node_property(ids[0], &PropertyKey::new("active"))
+            .unwrap();
+        assert_eq!(v0, Value::Bool(true));
+    }
+
+    // Error-path tests (`column_length_mismatch`, `value_overflow`,
+    // `duplicate_label`, `duplicate_edge_type`) live at the matching
+    // `*_error` tests above; keep those canonical.
+
+    #[test]
+    fn test_builder_same_edge_type_different_labels_allowed() {
+        // Same edge type across different label pairs should NOT trigger
+        // DuplicateEdgeType (issue #221 regression coverage).
+        let result = CompactStoreBuilder::new()
+            .node_table("A", |t| t.column_bitpacked("v", &[1], 4))
+            .node_table("B", |t| t.column_bitpacked("v", &[1], 4))
+            .node_table("C", |t| t.column_bitpacked("v", &[1], 4))
+            .rel_table("LINKS", "A", "B", |r| r.edges([(0, 0)]))
+            .rel_table("LINKS", "A", "C", |r| r.edges([(0, 0)]))
+            .build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_builder_error_types_trait_impls() {
+        // Exercise Debug/Display/Clone on CompactStoreError variants.
+        let err = CompactStoreError::LabelNotFound("Paris".to_string());
+        let cloned = err.clone();
+        assert!(format!("{cloned}").contains("Paris"));
+        assert!(format!("{cloned:?}").contains("LabelNotFound"));
+
+        let mismatch = CompactStoreError::ColumnLengthMismatch {
+            expected: 10,
+            got: 5,
+        };
+        assert!(format!("{mismatch}").contains("10"));
+        assert!(format!("{mismatch}").contains('5'));
+
+        let dup_label = CompactStoreError::DuplicateLabel("Berlin".to_string());
+        assert!(format!("{dup_label}").contains("Berlin"));
+
+        let dup_edge = CompactStoreError::DuplicateEdgeType("KNOWS".to_string());
+        assert!(format!("{dup_edge}").contains("KNOWS"));
+
+        let inconsistent = CompactStoreError::InconsistentEdgeData("boom".to_string());
+        assert!(format!("{inconsistent}").contains("boom"));
+
+        let overflow = CompactStoreError::ValueOverflow {
+            column: "age".to_string(),
+            value: u64::MAX,
+            max: i64::MAX as u64,
+        };
+        assert!(format!("{overflow}").contains("age"));
+
+        let table_overflow = CompactStoreError::TableCountOverflow {
+            kind: "node",
+            count: 99_999,
+            max: MAX_TABLE_ID,
+        };
+        assert!(format!("{table_overflow}").contains("node"));
+        assert!(format!("{table_overflow}").contains("99999"));
+    }
+
+    // -------------------------------------------------------------------
+    // RelTableBuilder: bit-packed edge properties
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_rel_table_column_bitpacked() {
+        // Exercise RelTableBuilder::column_bitpacked (pre-built codec injection on edges).
+        let store = CompactStoreBuilder::new()
+            .node_table("A", |t| t.column_bitpacked("v", &[1, 2], 4))
+            .node_table("B", |t| t.column_bitpacked("v", &[3, 4], 4))
+            .rel_table("LINKS", "A", "B", |r| {
+                r.edges([(0, 0), (1, 1)])
+                    .backward(true)
+                    .column_bitpacked("weight", &[100, 200], 8)
+            })
+            .build()
+            .unwrap();
+
+        let a_ids = store.nodes_by_label("A");
+        assert_eq!(a_ids.len(), 2);
+
+        // Verify edges exist.
+        let mut total_edges = 0;
+        for &id in &a_ids {
+            total_edges += store
+                .edges_from(id, crate::graph::Direction::Outgoing)
+                .len();
+        }
+        assert_eq!(total_edges, 2);
+    }
+
+    // -------------------------------------------------------------------
+    // from_graph_store_preserving_ids: specialized cases.
+    // The basic happy-path is covered by
+    // `test_from_graph_store_preserving_ids_with_data`; multi-label and
+    // CSR-edge-ordering are unique to this section.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_from_graph_store_preserving_ids_multi_label() {
+        use crate::graph::lpg::LpgStore;
+
+        let store = LpgStore::new().unwrap();
+        let butch = store.create_node(&["Person", "Boxer"]);
+        store.set_node_property(butch, "name", Value::from("Butch"));
+
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        assert!(compact.preserves_ids());
+
+        // Multi-label key is sorted as "Boxer|Person".
+        let name = compact
+            .get_node_property(butch, &PropertyKey::new("name"))
+            .and_then(|v| v.as_str().map(str::to_string));
+        assert_eq!(name.as_deref(), Some("Butch"));
+    }
+
+    #[test]
+    fn test_from_graph_store_preserving_ids_edges_sorted_by_csr_order() {
+        use crate::graph::lpg::LpgStore;
+
+        let store = LpgStore::new().unwrap();
+
+        // Create nodes with deliberate insertion order to exercise CSR sorting.
+        let a = store.create_node(&["Node"]);
+        let b = store.create_node(&["Node"]);
+        let c = store.create_node(&["Node"]);
+
+        // Insert edges in an order that differs from (src, dst) sort order.
+        let e_c_a = store.create_edge(c, a, "LINK");
+        let e_a_b = store.create_edge(a, b, "LINK");
+        let e_b_c = store.create_edge(b, c, "LINK");
+
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+
+        // All three original edge IDs should resolve and round-trip.
+        for eid in [e_c_a, e_a_b, e_b_c] {
+            let rec = compact.get_edge(eid).unwrap();
+            assert_eq!(rec.edge_type.as_str(), "LINK");
+        }
     }
 }

@@ -2,14 +2,14 @@
 
 use super::{Operator, OperatorResult};
 use crate::execution::DataChunk;
-use crate::graph::GraphStore;
+use crate::graph::GraphStoreSearch;
 use grafeo_common::types::{EpochId, LogicalType, NodeId, TransactionId};
 use std::sync::Arc;
 
 /// A scan operator that reads nodes from storage.
 pub struct ScanOperator {
     /// The store to scan from.
-    store: Arc<dyn GraphStore>,
+    store: Arc<dyn GraphStoreSearch>,
     /// Label filter (None = all nodes).
     label: Option<String>,
     /// Current position in the scan.
@@ -28,7 +28,7 @@ pub struct ScanOperator {
 
 impl ScanOperator {
     /// Creates a new scan operator for all nodes.
-    pub fn new(store: Arc<dyn GraphStore>) -> Self {
+    pub fn new(store: Arc<dyn GraphStoreSearch>) -> Self {
         Self {
             store,
             label: None,
@@ -42,7 +42,7 @@ impl ScanOperator {
     }
 
     /// Creates a new scan operator for nodes with a specific label.
-    pub fn with_label(store: Arc<dyn GraphStore>, label: impl Into<String>) -> Self {
+    pub fn with_label(store: Arc<dyn GraphStoreSearch>, label: impl Into<String>) -> Self {
         Self {
             store,
             label: Some(label.into()),
@@ -169,7 +169,8 @@ mod tests {
         store.create_node(&["Person"]);
         store.create_node(&["Animal"]);
 
-        let mut scan = ScanOperator::with_label(store.clone() as Arc<dyn GraphStore>, "Person");
+        let mut scan =
+            ScanOperator::with_label(store.clone() as Arc<dyn GraphStoreSearch>, "Person");
 
         let chunk = scan.next().unwrap().unwrap();
         assert_eq!(chunk.row_count(), 2);
@@ -184,7 +185,8 @@ mod tests {
         let store: Arc<dyn GraphStoreMut> = Arc::new(LpgStore::new().unwrap());
         store.create_node(&["Person"]);
 
-        let mut scan = ScanOperator::with_label(store.clone() as Arc<dyn GraphStore>, "Person");
+        let mut scan =
+            ScanOperator::with_label(store.clone() as Arc<dyn GraphStoreSearch>, "Person");
 
         // First scan
         let chunk1 = scan.next().unwrap().unwrap();
@@ -209,7 +211,7 @@ mod tests {
         store.create_node(&["Place"]);
 
         // Full scan (no label filter) should return all nodes
-        let mut scan = ScanOperator::new(store.clone() as Arc<dyn GraphStore>);
+        let mut scan = ScanOperator::new(store.clone() as Arc<dyn GraphStoreSearch>);
 
         let chunk = scan.next().unwrap().unwrap();
         assert_eq!(chunk.row_count(), 4, "Full scan should return all 4 nodes");
@@ -234,15 +236,17 @@ mod tests {
         store.create_node_versioned(&["Person"], epoch5, TransactionId::SYSTEM);
 
         // Scan at epoch 3 should see only the first 2 nodes (created at epoch 1)
-        let mut scan = ScanOperator::with_label(store.clone() as Arc<dyn GraphStore>, "Person")
-            .with_transaction_context(EpochId::new(3), None);
+        let mut scan =
+            ScanOperator::with_label(store.clone() as Arc<dyn GraphStoreSearch>, "Person")
+                .with_transaction_context(EpochId::new(3), None);
 
         let chunk = scan.next().unwrap().unwrap();
         assert_eq!(chunk.row_count(), 2, "Should see 2 nodes at epoch 3");
 
         // Scan at epoch 5 should see all 3 nodes
-        let mut scan_all = ScanOperator::with_label(store.clone() as Arc<dyn GraphStore>, "Person")
-            .with_transaction_context(EpochId::new(5), None);
+        let mut scan_all =
+            ScanOperator::with_label(store.clone() as Arc<dyn GraphStoreSearch>, "Person")
+                .with_transaction_context(EpochId::new(5), None);
 
         let chunk_all = scan_all.next().unwrap().unwrap();
         assert_eq!(chunk_all.row_count(), 3, "Should see 3 nodes at epoch 5");
@@ -251,7 +255,7 @@ mod tests {
     #[test]
     fn test_scan_into_any() {
         let store: Arc<dyn GraphStoreMut> = Arc::new(LpgStore::new().unwrap());
-        let op = ScanOperator::with_label(store.clone() as Arc<dyn GraphStore>, "Person");
+        let op = ScanOperator::with_label(store.clone() as Arc<dyn GraphStoreSearch>, "Person");
         let any = Box::new(op).into_any();
         assert!(any.downcast::<ScanOperator>().is_ok());
     }

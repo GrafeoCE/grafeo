@@ -3,7 +3,7 @@
 use super::{Operator, OperatorError, OperatorResult};
 use crate::execution::DataChunk;
 use crate::graph::Direction;
-use crate::graph::GraphStore;
+use crate::graph::GraphStoreSearch;
 use grafeo_common::types::{EdgeId, EpochId, LogicalType, NodeId, TransactionId};
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// output rows for each neighbor connected via matching edges.
 pub struct ExpandOperator {
     /// The store to traverse.
-    store: Arc<dyn GraphStore>,
+    store: Arc<dyn GraphStoreSearch>,
     /// Input operator providing source nodes.
     input: Box<dyn Operator>,
     /// Index of the source node column in input.
@@ -47,7 +47,7 @@ pub struct ExpandOperator {
 impl ExpandOperator {
     /// Creates a new expand operator.
     pub fn new(
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         input: Box<dyn Operator>,
         source_column: usize,
         direction: Direction,
@@ -327,9 +327,9 @@ mod tests {
 
     /// Creates a new `LpgStore` wrapped in an `Arc` and returns both the
     /// concrete handle (for mutation) and a trait-object handle (for operators).
-    fn test_store() -> (Arc<LpgStore>, Arc<dyn GraphStore>) {
+    fn test_store() -> (Arc<LpgStore>, Arc<dyn GraphStoreSearch>) {
         let store = Arc::new(LpgStore::new().unwrap());
-        let dyn_store: Arc<dyn GraphStore> = Arc::clone(&store) as Arc<dyn GraphStore>;
+        let dyn_store: Arc<dyn GraphStoreSearch> = Arc::clone(&store) as Arc<dyn GraphStoreSearch>;
         (store, dyn_store)
     }
 

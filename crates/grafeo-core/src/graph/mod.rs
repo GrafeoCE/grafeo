@@ -22,7 +22,7 @@ pub mod compact;
 pub mod rdf;
 
 pub use projection::{GraphProjection, ProjectionSpec};
-pub use traits::{GraphStore, GraphStoreMut, NullGraphStore};
+pub use traits::{GraphStore, GraphStoreMut, GraphStoreSearch, NullGraphStore};
 
 /// Controls which edges to follow during traversal.
 ///

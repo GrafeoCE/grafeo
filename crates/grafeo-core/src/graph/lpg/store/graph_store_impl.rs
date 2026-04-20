@@ -8,7 +8,11 @@ use super::LpgStore;
 use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
 use crate::graph::lpg::{Edge, Node};
-use crate::graph::traits::{GraphStore, GraphStoreMut};
+use crate::graph::traits::{GraphStore, GraphStoreMut, GraphStoreSearch};
+#[cfg(feature = "vector-index")]
+use crate::index::vector::{
+    DistanceMetric, PropertyVectorAccessor, brute_force_knn, compute_distance,
+};
 use crate::statistics::Statistics;
 use arcstr::ArcStr;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
@@ -249,6 +253,147 @@ impl GraphStore for LpgStore {
 
     fn get_edge_history(&self, id: EdgeId) -> Vec<(EpochId, Option<EpochId>, Edge)> {
         LpgStore::get_edge_history(self, id)
+    }
+}
+
+impl GraphStoreSearch for LpgStore {
+    #[cfg(feature = "text-index")]
+    fn has_text_index(&self, label: &str, property: &str) -> bool {
+        self.get_text_index(label, property).is_some()
+    }
+
+    #[cfg(feature = "text-index")]
+    fn score_text(&self, node_id: NodeId, label: &str, property: &str, query: &str) -> Option<f64> {
+        let index = self.get_text_index(label, property)?;
+        let guard = index.read();
+        let score = guard.score_document(node_id, query);
+        Some(score)
+    }
+
+    #[cfg(feature = "text-index")]
+    fn text_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        k: usize,
+    ) -> Vec<(NodeId, f64)> {
+        if let Some(index) = self.get_text_index(label, property) {
+            index.read().search(query, k)
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[cfg(feature = "text-index")]
+    fn text_search_with_threshold(
+        &self,
+        label: &str,
+        property: &str,
+        query: &str,
+        threshold: f64,
+    ) -> Vec<(NodeId, f64)> {
+        if let Some(index) = self.get_text_index(label, property) {
+            index.read().search_with_threshold(query, threshold)
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[cfg(feature = "vector-index")]
+    fn has_vector_index(&self, label: &str, property: &str) -> bool {
+        self.get_vector_index(label, property).is_some()
+    }
+
+    #[cfg(feature = "vector-index")]
+    fn vector_index_metric(&self, label: &str, property: &str) -> Option<DistanceMetric> {
+        self.get_vector_index(label, property)
+            .map(|idx| idx.config().metric)
+    }
+
+    #[cfg(feature = "vector-index")]
+    fn vector_search(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &[f32],
+        k: usize,
+        metric: DistanceMetric,
+    ) -> Vec<(NodeId, f64)> {
+        // HNSW path: matching index + matching metric.
+        if let Some(label_name) = label
+            && let Some(index) = self.get_vector_index(label_name, property)
+            && index.config().metric == metric
+        {
+            let store_ref: &dyn GraphStore = self;
+            let accessor = PropertyVectorAccessor::new(store_ref, property);
+            return index
+                .search_with_ef(query, k, 64, &accessor)
+                .into_iter()
+                .map(|(id, d)| (id, f64::from(d)))
+                .collect();
+        }
+
+        // Brute-force fallback: scan nodes, compute distance, take top-k.
+        // Keep `Arc<[f32]>` from `Value::Vector` instead of copying each vector
+        // into an owned `Vec<f32>`: `brute_force_knn` only needs `&[f32]` and
+        // the store already owns the embedding data behind an Arc.
+        let node_ids = match label {
+            Some(l) => <Self as GraphStore>::nodes_by_label(self, l),
+            None => <Self as GraphStore>::node_ids(self),
+        };
+        let property_key = PropertyKey::new(property);
+        let vectors: Vec<(NodeId, Arc<[f32]>)> = node_ids
+            .into_iter()
+            .filter_map(|id| {
+                <Self as GraphStore>::get_node_property(self, id, &property_key).and_then(|v| {
+                    if let Value::Vector(arc) = v {
+                        Some((id, arc))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        let iter = vectors.iter().map(|(id, arc)| (*id, arc.as_ref()));
+        brute_force_knn(iter, query, k, metric)
+            .into_iter()
+            .map(|(id, d)| (id, f64::from(d)))
+            .collect()
+    }
+
+    #[cfg(feature = "vector-index")]
+    fn vector_search_with_threshold(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &[f32],
+        threshold: f64,
+        metric: DistanceMetric,
+    ) -> Vec<(NodeId, f64)> {
+        // Threshold mode always scans: HNSW has no threshold API. Iterate all
+        // candidates, compute exact distance, keep those under the threshold,
+        // then sort nearest-first.
+        let node_ids = match label {
+            Some(l) => <Self as GraphStore>::nodes_by_label(self, l),
+            None => <Self as GraphStore>::node_ids(self),
+        };
+        let property_key = PropertyKey::new(property);
+        let mut results: Vec<(NodeId, f64)> = node_ids
+            .into_iter()
+            .filter_map(|id| {
+                <Self as GraphStore>::get_node_property(self, id, &property_key).and_then(|v| {
+                    if let Value::Vector(vec) = v {
+                        let d = f64::from(compute_distance(query, &vec, metric));
+                        (d <= threshold).then_some((id, d))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results
     }
 }
 

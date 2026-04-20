@@ -27,7 +27,7 @@ use grafeo_common::utils::hash::FxHashMap;
 
 use super::Direction;
 use super::lpg::{CompareOp, Edge, Node};
-use super::traits::GraphStore;
+use super::traits::{GraphStore, GraphStoreSearch};
 use crate::statistics::Statistics;
 
 /// Defines which nodes and edges are included in a projection.
@@ -77,13 +77,13 @@ impl ProjectionSpec {
 /// [`ProjectionSpec`]. Nodes without matching labels and edges without
 /// matching types are invisible.
 pub struct GraphProjection {
-    inner: Arc<dyn GraphStore>,
+    inner: Arc<dyn GraphStoreSearch>,
     spec: ProjectionSpec,
 }
 
 impl GraphProjection {
     /// Creates a new projection over the given store.
-    pub fn new(inner: Arc<dyn GraphStore>, spec: ProjectionSpec) -> Self {
+    pub fn new(inner: Arc<dyn GraphStoreSearch>, spec: ProjectionSpec) -> Self {
         Self { inner, spec }
     }
 
@@ -497,6 +497,8 @@ impl GraphStore for GraphProjection {
         self.inner.all_property_keys()
     }
 }
+
+impl GraphStoreSearch for GraphProjection {}
 
 #[cfg(test)]
 #[cfg(feature = "lpg")]

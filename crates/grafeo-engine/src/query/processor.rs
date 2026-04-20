@@ -14,7 +14,7 @@ use grafeo_common::types::{EpochId, TransactionId, Value};
 use grafeo_common::utils::error::{Error, Result};
 #[cfg(feature = "lpg")]
 use grafeo_core::graph::lpg::LpgStore;
-use grafeo_core::graph::{GraphStore, GraphStoreMut};
+use grafeo_core::graph::{GraphStoreMut, GraphStoreSearch};
 
 use crate::catalog::Catalog;
 use crate::database::QueryResult;
@@ -104,7 +104,7 @@ pub struct QueryProcessor {
     #[cfg(feature = "lpg")]
     lpg_store: Arc<LpgStore>,
     /// Graph store trait object for pluggable storage backends (read path).
-    graph_store: Arc<dyn GraphStore>,
+    graph_store: Arc<dyn GraphStoreSearch>,
     /// Writable graph store (None when read-only).
     write_store: Option<Arc<dyn GraphStoreMut>>,
     /// Transaction manager for MVCC operations.
@@ -126,7 +126,7 @@ impl QueryProcessor {
     #[must_use]
     pub fn for_lpg(store: Arc<LpgStore>) -> Self {
         let optimizer = Optimizer::from_store(&store);
-        let graph_store = Arc::clone(&store) as Arc<dyn GraphStore>;
+        let graph_store = Arc::clone(&store) as Arc<dyn GraphStoreSearch>;
         let write_store = Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>);
         Self {
             lpg_store: store,
@@ -149,7 +149,7 @@ impl QueryProcessor {
         transaction_manager: Arc<TransactionManager>,
     ) -> Self {
         let optimizer = Optimizer::from_store(&store);
-        let graph_store = Arc::clone(&store) as Arc<dyn GraphStore>;
+        let graph_store = Arc::clone(&store) as Arc<dyn GraphStoreSearch>;
         let write_store = Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>);
         Self {
             lpg_store: store,
@@ -174,7 +174,7 @@ impl QueryProcessor {
         transaction_manager: Arc<TransactionManager>,
     ) -> Result<Self> {
         let optimizer = Optimizer::from_graph_store(&*store);
-        let read_store = Arc::clone(&store) as Arc<dyn GraphStore>;
+        let read_store = Arc::clone(&store) as Arc<dyn GraphStoreSearch>;
         Ok(Self {
             #[cfg(feature = "lpg")]
             lpg_store: Arc::new(LpgStore::new()?),
@@ -195,7 +195,7 @@ impl QueryProcessor {
     ///
     /// Returns an error if the internal arena allocation fails (out of memory).
     pub fn for_stores_with_transaction(
-        read_store: Arc<dyn GraphStore>,
+        read_store: Arc<dyn GraphStoreSearch>,
         write_store: Option<Arc<dyn GraphStoreMut>>,
         transaction_manager: Arc<TransactionManager>,
     ) -> Result<Self> {
@@ -444,7 +444,7 @@ impl QueryProcessor {
         rdf_store: Arc<grafeo_core::graph::rdf::RdfStore>,
     ) -> Self {
         let optimizer = Optimizer::from_store(&lpg_store);
-        let graph_store = Arc::clone(&lpg_store) as Arc<dyn GraphStore>;
+        let graph_store = Arc::clone(&lpg_store) as Arc<dyn GraphStoreSearch>;
         let write_store = Some(Arc::clone(&lpg_store) as Arc<dyn GraphStoreMut>);
         Self {
             lpg_store,
@@ -709,6 +709,7 @@ pub(crate) fn explain_result(plan: &LogicalPlan) -> QueryResult {
 
 /// Formats a physical EXPLAIN result showing both the logical plan and the
 /// physical operator names mapped to each logical operator.
+#[cfg(feature = "triple-store")]
 pub(crate) fn physical_explain_result(
     plan: &LogicalPlan,
     entries: Vec<crate::query::profile::ProfileEntry>,
@@ -730,6 +731,7 @@ pub(crate) fn physical_explain_result(
 }
 
 /// Recursively formats a physical plan node showing operator name and label.
+#[cfg(feature = "triple-store")]
 fn format_physical_node(out: &mut String, node: &crate::query::profile::ProfileNode, depth: usize) {
     use std::fmt::Write;
     let indent = "  ".repeat(depth);
@@ -944,6 +946,9 @@ fn substitute_in_operator(op: &mut LogicalOperator, params: &QueryParams) -> Res
         LogicalOperator::VectorJoin(join) => {
             substitute_in_expression(&mut join.query_vector, params)?;
             substitute_in_operator(&mut join.input, params)?;
+        }
+        LogicalOperator::TextScan(scan) => {
+            substitute_in_expression(&mut scan.query, params)?;
         }
         LogicalOperator::Except(except) => {
             substitute_in_operator(&mut except.left, params)?;

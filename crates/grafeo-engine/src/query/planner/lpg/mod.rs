@@ -7,6 +7,7 @@ mod aggregate;
 mod expand;
 mod expression;
 mod filter;
+mod filter_hybrid;
 mod join;
 mod mutation;
 mod project;
@@ -14,6 +15,8 @@ mod scan;
 
 #[cfg(feature = "algos")]
 use crate::query::plan::CallProcedureOp;
+#[cfg(feature = "text-index")]
+use crate::query::plan::TextScanOp;
 use crate::query::plan::{
     AddLabelOp, AggregateFunction as LogicalAggregateFunction, AggregateOp, AntiJoinOp, ApplyOp,
     BinaryOp, CreateEdgeOp, CreateNodeOp, DeleteEdgeOp, DeleteNodeOp, DistinctOp,
@@ -23,6 +26,8 @@ use crate::query::plan::{
     NodeScanOp, OtherwiseOp, PathMode, RemoveLabelOp, ReturnOp, SetPropertyOp, ShortestPathOp,
     SkipOp, SortOp, SortOrder, UnaryOp, UnionOp, UnwindOp,
 };
+#[cfg(feature = "vector-index")]
+use crate::query::plan::{VectorMetric, VectorScanOp};
 use grafeo_common::grafeo_debug_span;
 use grafeo_common::types::{EpochId, TransactionId};
 use grafeo_common::types::{LogicalType, Value};
@@ -42,7 +47,7 @@ use grafeo_core::execution::operators::{
     SortDirection, SortKey as PhysicalSortKey, SortOperator, UnionOperator, UnwindOperator,
     VariableLengthExpandOperator,
 };
-use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut};
+use grafeo_core::graph::{Direction, GraphStoreMut, GraphStoreSearch};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -65,7 +70,7 @@ struct RangeBounds<'a> {
 /// Converts a logical plan to a physical operator tree for LPG stores.
 pub struct Planner {
     /// The graph store (read-only operations).
-    pub(super) store: Arc<dyn GraphStore>,
+    pub(super) store: Arc<dyn GraphStoreSearch>,
     /// Writable graph store (None for read-only databases).
     pub(super) write_store: Option<Arc<dyn GraphStoreMut>>,
     /// Transaction manager for MVCC operations.
@@ -116,7 +121,7 @@ impl Planner {
     /// This creates a planner without transaction context, using the current
     /// epoch from the store for visibility.
     #[must_use]
-    pub fn new(store: Arc<dyn GraphStore>) -> Self {
+    pub fn new(store: Arc<dyn GraphStoreSearch>) -> Self {
         let epoch = store.current_epoch();
         Self {
             store,
@@ -143,7 +148,7 @@ impl Planner {
     /// Creates a new planner with transaction context for MVCC-aware planning.
     #[must_use]
     pub fn with_context(
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         write_store: Option<Arc<dyn GraphStoreMut>>,
         transaction_manager: Arc<TransactionManager>,
         transaction_id: Option<TransactionId>,
@@ -656,11 +661,20 @@ impl Planner {
                 Ok((operator, vec![load.variable.clone()]))
             }
             LogicalOperator::Empty => Err(Error::Internal("Empty plan".to_string())),
+            #[cfg(feature = "vector-index")]
+            LogicalOperator::VectorScan(scan) => self.plan_vector_scan(scan),
+            #[cfg(not(feature = "vector-index"))]
             LogicalOperator::VectorScan(_) => Err(Error::Internal(
                 "VectorScan requires vector-index feature".to_string(),
             )),
             LogicalOperator::VectorJoin(_) => Err(Error::Internal(
                 "VectorJoin requires vector-index feature".to_string(),
+            )),
+            #[cfg(feature = "text-index")]
+            LogicalOperator::TextScan(scan) => self.plan_text_scan(scan),
+            #[cfg(not(feature = "text-index"))]
+            LogicalOperator::TextScan(_) => Err(Error::Internal(
+                "TextScan requires text-index feature".to_string(),
             )),
             _ => Err(Error::Internal(format!(
                 "Unsupported operator: {:?}",
@@ -701,7 +715,7 @@ impl Planner {
             entity_kind,
             function,
             ha.property.clone(),
-            Arc::clone(&self.store) as Arc<dyn GraphStore>,
+            Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             input_column_count,
         ));
 
@@ -737,6 +751,187 @@ impl Planner {
         let operator = Box::new(MapCollectOperator::new(child_op, key_idx, value_idx));
         self.scalar_columns.borrow_mut().insert(mc.alias.clone());
         Ok((operator, vec![mc.alias.clone()]))
+    }
+
+    /// Plans a text search scan operator using BM25 inverted index.
+    #[cfg(feature = "text-index")]
+    fn plan_text_scan(&self, scan: &TextScanOp) -> Result<(Box<dyn Operator>, Vec<String>)> {
+        use grafeo_core::execution::operators::TextScanOperator;
+
+        let query_string = match &scan.query {
+            LogicalExpression::Literal(Value::String(s)) => s.to_string(),
+            LogicalExpression::Parameter(name) => {
+                return Err(Error::Internal(format!(
+                    "TextScan query parameter ${} not resolved",
+                    name
+                )));
+            }
+            _ => {
+                return Err(Error::Internal(
+                    "TextScan query must be a string literal or parameter".to_string(),
+                ));
+            }
+        };
+
+        let operator: Box<dyn Operator> = if let Some(k) = scan.k {
+            Box::new(TextScanOperator::top_k(
+                Arc::clone(&self.store),
+                &scan.label,
+                &scan.property,
+                &query_string,
+                k,
+            ))
+        } else if let Some(threshold) = scan.threshold {
+            Box::new(TextScanOperator::with_threshold(
+                Arc::clone(&self.store),
+                &scan.label,
+                &scan.property,
+                &query_string,
+                threshold,
+            ))
+        } else {
+            Box::new(TextScanOperator::top_k(
+                Arc::clone(&self.store),
+                &scan.label,
+                &scan.property,
+                &query_string,
+                100,
+            ))
+        };
+
+        let mut columns = vec![scan.variable.clone()];
+        if let Some(ref score_col) = scan.score_column {
+            columns.push(score_col.clone());
+        }
+
+        Ok((operator, columns))
+    }
+
+    /// Plans a VectorScan logical operator into a physical VectorScanOperator.
+    #[cfg(feature = "vector-index")]
+    pub(super) fn plan_vector_scan(
+        &self,
+        scan: &VectorScanOp,
+    ) -> Result<(Box<dyn Operator>, Vec<String>)> {
+        use grafeo_core::execution::operators::VectorScanOperator;
+        use grafeo_core::index::vector::DistanceMetric;
+
+        // Hybrid shape `VectorScan(input=graph_pattern)` is not supported by
+        // the physical VectorScanOperator: it has no input slot and would
+        // silently drop upstream bindings. Reject rather than plan it
+        // incorrectly; callers should build a VectorJoin for this case.
+        if scan.input.is_some() {
+            return Err(Error::Internal(
+                "VectorScan with an input subtree is not supported, use VectorJoin for hybrid graph+vector queries".to_string(),
+            ));
+        }
+
+        let query_vec = self.resolve_vector_literal(&scan.query_vector)?;
+
+        let requested_metric = scan.metric.map(|m| match m {
+            VectorMetric::Cosine => DistanceMetric::Cosine,
+            VectorMetric::Euclidean => DistanceMetric::Euclidean,
+            VectorMetric::DotProduct => DistanceMetric::DotProduct,
+            VectorMetric::Manhattan => DistanceMetric::Manhattan,
+        });
+
+        let k = scan.k.unwrap_or(usize::MAX);
+
+        // Pick the metric we'll execute under. When the user asked for a
+        // specific one, honor it. Otherwise inherit the index's metric (so a
+        // cosine-built index drives cosine scoring) or default to Cosine for
+        // the unindexed brute-force path.
+        let index_metric = scan
+            .label
+            .as_ref()
+            .and_then(|label| self.store.vector_index_metric(label, &scan.property));
+        let metric = requested_metric
+            .or(index_metric)
+            .unwrap_or(DistanceMetric::Cosine);
+
+        // The store's vector_search routes HNSW when an index exists whose
+        // metric matches `metric`, and brute-force scan otherwise. No handle
+        // downcast; no Arc<dyn Any>.
+        let mut operator = VectorScanOperator::new(
+            Arc::clone(&self.store),
+            scan.label.clone(),
+            scan.property.clone(),
+            query_vec,
+            k,
+            metric,
+        );
+
+        if let Some(sim) = scan.min_similarity {
+            operator = operator.with_min_similarity(sim);
+        }
+        if let Some(dist) = scan.max_distance {
+            operator = operator.with_max_distance(dist);
+        }
+
+        let mut columns = vec![scan.variable.clone()];
+        // VectorScan always projects a score column keyed by the resolved
+        // metric (after index-driven fallback) so downstream score reuse
+        // matches the actual distance values written out.
+        let metric_tag = match metric {
+            DistanceMetric::Cosine => "cos",
+            DistanceMetric::Euclidean => "euc",
+            DistanceMetric::DotProduct => "dot",
+            DistanceMetric::Manhattan => "man",
+            // Future metrics (DistanceMetric is #[non_exhaustive]) fall back
+            // to a generic tag so they still produce a stable column name.
+            _ => "other",
+        };
+        columns.push(project::vector_score_column_name(
+            metric_tag,
+            &scan.property,
+            &scan.variable,
+            &scan.query_vector,
+        ));
+
+        Ok((Box::new(operator), columns))
+    }
+
+    /// Resolves a LogicalExpression to a Vec<f32> for vector operations.
+    #[cfg(feature = "vector-index")]
+    pub(super) fn resolve_vector_literal(&self, expr: &LogicalExpression) -> Result<Vec<f32>> {
+        // f64→f32 precision loss throughout is intentional: vectors are stored and searched as f32.
+        #[allow(clippy::cast_possible_truncation)]
+        match expr {
+            LogicalExpression::Literal(Value::Vector(v)) => Ok(v.to_vec()),
+            LogicalExpression::Literal(Value::List(list)) => {
+                let mut vec = Vec::with_capacity(list.len());
+                for item in list.iter() {
+                    match item {
+                        Value::Float64(f) => vec.push(*f as f32),
+                        Value::Int64(i) => vec.push(*i as f32),
+                        _ => {
+                            return Err(Error::Internal(
+                                "Vector elements must be numeric".to_string(),
+                            ));
+                        }
+                    }
+                }
+                Ok(vec)
+            }
+            // GQL/Cypher parser produces List([Literal(Float64), ...]) for inline vectors like
+            // [0.9, 0.1, 0.0] — handle this form by recursively resolving each element.
+            LogicalExpression::List(items) => {
+                let mut vec = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        LogicalExpression::Literal(Value::Float64(f)) => vec.push(*f as f32),
+                        LogicalExpression::Literal(Value::Int64(i)) => vec.push(*i as f32),
+                        _ => {
+                            return Err(Error::Internal(
+                                "Vector elements must be numeric literals".to_string(),
+                            ));
+                        }
+                    }
+                }
+                Ok(vec)
+            }
+            _ => Err(Error::Internal("Expected vector literal".to_string())),
+        }
     }
 }
 
@@ -1679,7 +1874,7 @@ mod tests {
     // ==================== Mutation Tests ====================
 
     fn create_writable_planner(store: &Arc<LpgStore>) -> Planner {
-        let mut p = Planner::new(Arc::clone(store) as Arc<dyn GraphStore>);
+        let mut p = Planner::new(Arc::clone(store) as Arc<dyn GraphStoreSearch>);
         p.write_store = Some(Arc::clone(store) as Arc<dyn GraphStoreMut>);
         p
     }
@@ -1844,7 +2039,7 @@ mod tests {
     #[test]
     fn test_planner_accessors() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>);
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
 
         assert!(planner.transaction_id().is_none());
         assert!(planner.transaction_manager().is_none());
@@ -1933,7 +2128,7 @@ mod tests {
     #[test]
     fn test_plan_adaptive_with_expand() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>)
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
             .with_factorized_execution(false);
 
         // MATCH (a)-[:KNOWS]->(b) RETURN a, b
@@ -2259,7 +2454,7 @@ mod tests {
     #[test]
     fn test_plan_expand_incoming() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>)
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
             .with_factorized_execution(false);
 
         // MATCH (a)<-[:KNOWS]-(b) RETURN a, b
@@ -2301,7 +2496,7 @@ mod tests {
     #[test]
     fn test_plan_expand_both_directions() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>)
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
             .with_factorized_execution(false);
 
         // MATCH (a)-[:KNOWS]-(b) RETURN a, b
@@ -2352,7 +2547,7 @@ mod tests {
         let epoch = transaction_manager.current_epoch();
 
         let planner = Planner::with_context(
-            Arc::clone(&store) as Arc<dyn GraphStore>,
+            Arc::clone(&store) as Arc<dyn GraphStoreSearch>,
             Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>),
             Arc::clone(&transaction_manager),
             Some(transaction_id),
@@ -2367,7 +2562,7 @@ mod tests {
     #[test]
     fn test_planner_with_factorized_execution_disabled() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>)
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
             .with_factorized_execution(false);
 
         // Two consecutive expands - should NOT use factorized execution
@@ -2487,5 +2682,769 @@ mod tests {
         let physical = planner.plan(&logical).unwrap();
         assert!(physical.columns().contains(&"a".to_string()));
         assert!(physical.columns().contains(&"b".to_string()));
+    }
+
+    // ==================== Additional Coverage Tests ====================
+    //
+    // These tests target branches that were not exercised by the original
+    // planner tests: builder methods, read-only flag, profiled planning,
+    // unsupported operator error paths, and the dispatch branches for every
+    // plan_* function reachable through plan_operator.
+
+    use crate::catalog::Catalog;
+    use crate::query::plan::{
+        AddLabelOp, AntiJoinOp, ApplyOp, BindOp, DeleteEdgeOp, EdgeScanOp, ExceptOp,
+        HorizontalAggregateOp, IntersectOp, LeftJoinOp, LoadDataFormat, LoadDataOp, MapCollectOp,
+        MergeOp, MergeRelationshipOp, MultiWayJoinOp, OtherwiseOp, ParameterScanOp, RemoveLabelOp,
+        SetPropertyOp, ShortestPathOp, TripleComponent, TripleScanOp, UnionOp, UnwindOp,
+    };
+    use grafeo_core::execution::operators::{Operator, SessionContext};
+
+    fn full_store() -> Arc<LpgStore> {
+        // Richer store so expand and shortest path tests have real data.
+        let store = Arc::new(LpgStore::new().unwrap());
+        let vincent = store.create_node(&["Person"]);
+        let jules = store.create_node(&["Person"]);
+        let mia = store.create_node(&["Person"]);
+        let _company = store.create_node(&["Company"]);
+        store.create_edge(vincent, jules, "KNOWS");
+        store.create_edge(jules, mia, "KNOWS");
+        store
+    }
+
+    fn scan_person(var: &str) -> LogicalOperator {
+        LogicalOperator::NodeScan(NodeScanOp {
+            variable: var.to_string(),
+            label: Some("Person".to_string()),
+            input: None,
+        })
+    }
+
+    fn scan_any(var: &str) -> LogicalOperator {
+        LogicalOperator::NodeScan(NodeScanOp {
+            variable: var.to_string(),
+            label: None,
+            input: None,
+        })
+    }
+
+    // ==================== Builder Methods ====================
+
+    #[test]
+    fn test_with_read_only_flag() {
+        let store = create_test_store();
+        let planner =
+            Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>).with_read_only(true);
+        assert!(planner.read_only);
+
+        let planner_off =
+            Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>).with_read_only(false);
+        assert!(!planner_off.read_only);
+    }
+
+    #[test]
+    fn test_with_catalog() {
+        let store = create_test_store();
+        let catalog = Arc::new(Catalog::new());
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
+            .with_catalog(Arc::clone(&catalog));
+        assert!(planner.catalog.is_some());
+    }
+
+    #[test]
+    fn test_with_session_context() {
+        let store = create_test_store();
+        let context = SessionContext {
+            current_schema: Some("public".to_string()),
+            current_graph: Some("main".to_string()),
+            ..SessionContext::default()
+        };
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
+            .with_session_context(context);
+        assert_eq!(
+            planner.session_context.current_schema.as_deref(),
+            Some("public")
+        );
+        assert_eq!(
+            planner.session_context.current_graph.as_deref(),
+            Some("main")
+        );
+    }
+
+    // ==================== register_edge_column ====================
+
+    #[test]
+    fn test_register_edge_column_named() {
+        let store = create_test_store();
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
+        let name = planner.register_edge_column(&Some("r".to_string()));
+        assert_eq!(name, "r");
+        assert!(planner.edge_columns.borrow().contains("r"));
+    }
+
+    #[test]
+    fn test_register_edge_column_anonymous_counter_advances() {
+        let store = create_test_store();
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
+        let a = planner.register_edge_column(&None);
+        let b = planner.register_edge_column(&None);
+        assert_eq!(a, "_anon_edge_0");
+        assert_eq!(b, "_anon_edge_1");
+        assert!(planner.edge_columns.borrow().contains("_anon_edge_0"));
+        assert!(planner.edge_columns.borrow().contains("_anon_edge_1"));
+    }
+
+    // ==================== write_store() error path ====================
+
+    #[test]
+    fn test_create_node_without_write_store_errors() {
+        // Read-only planner: CREATE should fail with ReadOnly transaction error.
+        let store = create_test_store();
+        let planner = Planner::new(store);
+
+        let logical = LogicalPlan::new(LogicalOperator::CreateNode(CreateNodeOp {
+            variable: "n".to_string(),
+            labels: vec!["Person".to_string()],
+            properties: vec![],
+            input: None,
+        }));
+
+        let result = planner.plan(&logical);
+        assert!(result.is_err());
+    }
+
+    // ==================== plan_profiled ====================
+
+    #[test]
+    fn test_plan_profiled_collects_entries() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+
+        let logical = LogicalPlan::new(LogicalOperator::Return(ReturnOp {
+            items: vec![ReturnItem {
+                expression: LogicalExpression::Variable("n".to_string()),
+                alias: None,
+            }],
+            distinct: false,
+            input: Box::new(scan_person("n")),
+        }));
+
+        let (physical, entries) = planner.plan_profiled(&logical).unwrap();
+        assert_eq!(physical.columns(), &["n"]);
+        // Post-order: scan, then return (at least two entries).
+        assert!(
+            entries.len() >= 2,
+            "expected entries, got {}",
+            entries.len()
+        );
+        // After profiling, the internal flag is cleared.
+        assert!(!planner.profiling.get());
+    }
+
+    #[test]
+    fn test_plan_profiled_propagates_plan_errors() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::Empty);
+        let result = planner.plan_profiled(&logical);
+        assert!(result.is_err());
+        // Profiling must still be reset to false even on error.
+        assert!(!planner.profiling.get());
+    }
+
+    // ==================== Unsupported operator error paths ====================
+
+    #[test]
+    fn test_plan_edge_scan_is_unsupported() {
+        // LPG planner does not handle bare EdgeScan; this hits the catch-all branch.
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::EdgeScan(EdgeScanOp {
+            variable: "e".to_string(),
+            edge_types: vec![],
+            input: None,
+        }));
+        let err = planner.plan(&logical).err().expect("plan should fail");
+        assert!(format!("{err}").contains("Unsupported operator"));
+    }
+
+    #[test]
+    fn test_plan_triple_scan_is_unsupported() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::TripleScan(TripleScanOp {
+            subject: TripleComponent::Variable("s".to_string()),
+            predicate: TripleComponent::Variable("p".to_string()),
+            object: TripleComponent::Variable("o".to_string()),
+            graph: None,
+            input: None,
+            dataset: None,
+        }));
+        assert!(planner.plan(&logical).is_err());
+    }
+
+    #[test]
+    fn test_plan_bind_is_unsupported() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::Bind(BindOp {
+            expression: LogicalExpression::Literal(Value::Int64(1)),
+            variable: "x".to_string(),
+            input: Box::new(scan_any("n")),
+        }));
+        assert!(planner.plan(&logical).is_err());
+    }
+
+    #[test]
+    fn test_plan_parameter_scan_without_apply_errors() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::ParameterScan(ParameterScanOp {
+            columns: vec!["n".to_string()],
+        }));
+        let err = planner.plan(&logical).err().expect("plan should fail");
+        assert!(format!("{err}").contains("ParameterScan"));
+    }
+
+    // ==================== plan_operator dispatch branches ====================
+
+    #[test]
+    fn test_plan_union_dispatch() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::Union(UnionOp {
+            inputs: vec![scan_person("n"), scan_person("n")],
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert_eq!(physical.columns(), &["n"]);
+    }
+
+    #[test]
+    fn test_plan_except_dispatch() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::Except(ExceptOp {
+            left: Box::new(scan_person("n")),
+            right: Box::new(scan_person("n")),
+            all: false,
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert_eq!(physical.columns(), &["n"]);
+    }
+
+    #[test]
+    fn test_plan_intersect_dispatch() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::Intersect(IntersectOp {
+            left: Box::new(scan_person("n")),
+            right: Box::new(scan_person("n")),
+            all: false,
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert_eq!(physical.columns(), &["n"]);
+    }
+
+    #[test]
+    fn test_plan_otherwise_dispatch() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::Otherwise(OtherwiseOp {
+            left: Box::new(scan_person("n")),
+            right: Box::new(scan_any("n")),
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert_eq!(physical.columns(), &["n"]);
+    }
+
+    #[test]
+    fn test_plan_left_join_dispatch() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::LeftJoin(LeftJoinOp {
+            left: Box::new(scan_any("a")),
+            right: Box::new(scan_any("b")),
+            condition: None,
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert!(physical.columns().contains(&"a".to_string()));
+        assert!(physical.columns().contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn test_plan_anti_join_dispatch() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::AntiJoin(AntiJoinOp {
+            left: Box::new(scan_any("a")),
+            right: Box::new(scan_any("b")),
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert!(physical.columns().contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn test_plan_apply_uncorrelated_dispatch() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::Apply(ApplyOp {
+            input: Box::new(scan_any("a")),
+            subplan: Box::new(scan_any("b")),
+            shared_variables: vec![],
+            optional: false,
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert!(physical.columns().contains(&"a".to_string()));
+        assert!(physical.columns().contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn test_plan_unwind_literal_list() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+
+        // UNWIND [1,2,3] AS x
+        let logical = LogicalPlan::new(LogicalOperator::Unwind(UnwindOp {
+            expression: LogicalExpression::List(vec![
+                LogicalExpression::Literal(Value::Int64(1)),
+                LogicalExpression::Literal(Value::Int64(2)),
+                LogicalExpression::Literal(Value::Int64(3)),
+            ]),
+            variable: "x".to_string(),
+            ordinality_var: None,
+            offset_var: None,
+            input: Box::new(LogicalOperator::Empty),
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert!(physical.columns().contains(&"x".to_string()));
+    }
+
+    #[test]
+    fn test_plan_merge_dispatch() {
+        let store = create_test_store();
+        let planner = create_writable_planner(&store);
+
+        // MERGE (n:Person)
+        let logical = LogicalPlan::new(LogicalOperator::Merge(MergeOp {
+            variable: "n".to_string(),
+            labels: vec!["Person".to_string()],
+            match_properties: vec![],
+            on_create: vec![],
+            on_match: vec![],
+            input: Box::new(LogicalOperator::Empty),
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert!(physical.columns().contains(&"n".to_string()));
+    }
+
+    #[test]
+    fn test_plan_merge_relationship_dispatch() {
+        let store = full_store();
+        let planner = create_writable_planner(&store);
+
+        // MATCH (a:Person),(b:Person) MERGE (a)-[r:KNOWS]->(b)
+        let logical = LogicalPlan::new(LogicalOperator::MergeRelationship(MergeRelationshipOp {
+            variable: "r".to_string(),
+            source_variable: "a".to_string(),
+            target_variable: "b".to_string(),
+            edge_type: "KNOWS".to_string(),
+            match_properties: vec![],
+            on_create: vec![],
+            on_match: vec![],
+            input: Box::new(LogicalOperator::Join(JoinOp {
+                left: Box::new(scan_person("a")),
+                right: Box::new(scan_person("b")),
+                join_type: JoinType::Cross,
+                conditions: vec![],
+            })),
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert!(physical.columns().contains(&"r".to_string()));
+    }
+
+    #[test]
+    fn test_plan_add_label_dispatch() {
+        let store = full_store();
+        let planner = create_writable_planner(&store);
+        let logical = LogicalPlan::new(LogicalOperator::AddLabel(AddLabelOp {
+            variable: "n".to_string(),
+            labels: vec!["VIP".to_string()],
+            input: Box::new(scan_person("n")),
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert!(physical.columns().contains(&"labels_added".to_string()));
+    }
+
+    #[test]
+    fn test_plan_remove_label_dispatch() {
+        let store = full_store();
+        let planner = create_writable_planner(&store);
+        let logical = LogicalPlan::new(LogicalOperator::RemoveLabel(RemoveLabelOp {
+            variable: "n".to_string(),
+            labels: vec!["Person".to_string()],
+            input: Box::new(scan_person("n")),
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert!(physical.columns().contains(&"labels_removed".to_string()));
+    }
+
+    #[test]
+    fn test_plan_set_property_dispatch() {
+        let store = full_store();
+        let planner = create_writable_planner(&store);
+        let logical = LogicalPlan::new(LogicalOperator::SetProperty(SetPropertyOp {
+            variable: "n".to_string(),
+            properties: vec![(
+                "city".to_string(),
+                LogicalExpression::Literal(Value::String("Amsterdam".into())),
+            )],
+            replace: false,
+            is_edge: false,
+            input: Box::new(scan_person("n")),
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert!(physical.columns().contains(&"n".to_string()));
+    }
+
+    #[test]
+    fn test_plan_delete_edge_dispatch() {
+        let store = full_store();
+        let planner = create_writable_planner(&store);
+
+        // Register the edge column first via an outgoing expand, then DELETE r.
+        let expand_op = LogicalOperator::Expand(ExpandOp {
+            from_variable: "a".to_string(),
+            to_variable: "b".to_string(),
+            edge_variable: Some("r".to_string()),
+            direction: ExpandDirection::Outgoing,
+            edge_types: vec!["KNOWS".to_string()],
+            min_hops: 1,
+            max_hops: Some(1),
+            input: Box::new(scan_person("a")),
+            path_alias: None,
+            path_mode: PathMode::Walk,
+        });
+        let logical = LogicalPlan::new(LogicalOperator::DeleteEdge(DeleteEdgeOp {
+            variable: "r".to_string(),
+            input: Box::new(expand_op),
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert!(physical.columns().contains(&"r".to_string()));
+    }
+
+    #[test]
+    fn test_plan_shortest_path_dispatch() {
+        let store = full_store();
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
+
+        // SHORTEST PATH (a)-(b)
+        let logical = LogicalPlan::new(LogicalOperator::ShortestPath(ShortestPathOp {
+            input: Box::new(LogicalOperator::Join(JoinOp {
+                left: Box::new(scan_person("a")),
+                right: Box::new(scan_person("b")),
+                join_type: JoinType::Cross,
+                conditions: vec![],
+            })),
+            source_var: "a".to_string(),
+            target_var: "b".to_string(),
+            edge_types: vec!["KNOWS".to_string()],
+            direction: ExpandDirection::Outgoing,
+            path_alias: "p".to_string(),
+            all_paths: false,
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert!(
+            physical
+                .columns()
+                .iter()
+                .any(|c| c.contains("_path_length_p"))
+        );
+    }
+
+    #[test]
+    fn test_plan_shortest_path_missing_source_errors() {
+        let store = full_store();
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
+        let logical = LogicalPlan::new(LogicalOperator::ShortestPath(ShortestPathOp {
+            input: Box::new(scan_person("a")),
+            source_var: "missing".to_string(),
+            target_var: "a".to_string(),
+            edge_types: vec![],
+            direction: ExpandDirection::Both,
+            path_alias: "p".to_string(),
+            all_paths: false,
+        }));
+        let err = planner.plan(&logical).err().expect("plan should fail");
+        assert!(format!("{err}").contains("Source variable"));
+    }
+
+    #[test]
+    fn test_plan_map_collect_dispatch() {
+        // Build rows with two columns named 'k' and 'v', then collect k->v into a map.
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let input_with_kv = LogicalOperator::Project(crate::query::plan::ProjectOp {
+            projections: vec![
+                crate::query::plan::Projection {
+                    expression: LogicalExpression::Literal(Value::String("key".into())),
+                    alias: Some("k".to_string()),
+                },
+                crate::query::plan::Projection {
+                    expression: LogicalExpression::Literal(Value::Int64(1)),
+                    alias: Some("v".to_string()),
+                },
+            ],
+            input: Box::new(scan_person("n")),
+            pass_through_input: false,
+        });
+        let logical = LogicalPlan::new(LogicalOperator::MapCollect(MapCollectOp {
+            key_var: "k".to_string(),
+            value_var: "v".to_string(),
+            alias: "m".to_string(),
+            input: Box::new(input_with_kv),
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert_eq!(physical.columns(), &["m"]);
+    }
+
+    #[test]
+    fn test_plan_map_collect_missing_key_errors() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::MapCollect(MapCollectOp {
+            key_var: "not_there".to_string(),
+            value_var: "also_missing".to_string(),
+            alias: "m".to_string(),
+            input: Box::new(scan_any("n")),
+        }));
+        let err = planner.plan(&logical).err().expect("plan should fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("MapCollect key"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_plan_map_collect_missing_value_errors() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        // Input has column "n" so key resolves but value does not.
+        let logical = LogicalPlan::new(LogicalOperator::MapCollect(MapCollectOp {
+            key_var: "n".to_string(),
+            value_var: "missing_value".to_string(),
+            alias: "m".to_string(),
+            input: Box::new(scan_any("n")),
+        }));
+        let err = planner.plan(&logical).err().expect("plan should fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("MapCollect value"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_plan_horizontal_aggregate_missing_column_errors() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::HorizontalAggregate(
+            HorizontalAggregateOp {
+                list_column: "not_a_column".to_string(),
+                entity_kind: crate::query::plan::EntityKind::Edge,
+                function: LogicalAggregateFunction::Count,
+                property: "age".to_string(),
+                alias: "total".to_string(),
+                input: Box::new(scan_any("n")),
+            },
+        ));
+        let err = planner.plan(&logical).err().expect("plan should fail");
+        assert!(format!("{err}").contains("HorizontalAggregate"));
+    }
+
+    #[test]
+    fn test_plan_load_data_dispatch() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        // Path does not need to exist: planning just builds the operator.
+        let logical = LogicalPlan::new(LogicalOperator::LoadData(LoadDataOp {
+            format: LoadDataFormat::Csv,
+            with_headers: true,
+            path: "/nonexistent/data.csv".to_string(),
+            variable: "row".to_string(),
+            field_terminator: Some(','),
+        }));
+        let physical = planner.plan(&logical).unwrap();
+        assert_eq!(physical.columns(), &["row"]);
+    }
+
+    #[test]
+    fn test_plan_multi_way_join_dispatch() {
+        // Three-way join over three expand inputs. Some configurations may
+        // error during planning; we just require no panic.
+        let store = full_store();
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
+        let ab = LogicalOperator::Expand(ExpandOp {
+            from_variable: "a".to_string(),
+            to_variable: "b".to_string(),
+            edge_variable: None,
+            direction: ExpandDirection::Outgoing,
+            edge_types: vec!["KNOWS".to_string()],
+            min_hops: 1,
+            max_hops: Some(1),
+            input: Box::new(scan_person("a")),
+            path_alias: None,
+            path_mode: PathMode::Walk,
+        });
+        let bc = LogicalOperator::Expand(ExpandOp {
+            from_variable: "b".to_string(),
+            to_variable: "c".to_string(),
+            edge_variable: None,
+            direction: ExpandDirection::Outgoing,
+            edge_types: vec!["KNOWS".to_string()],
+            min_hops: 1,
+            max_hops: Some(1),
+            input: Box::new(scan_person("b")),
+            path_alias: None,
+            path_mode: PathMode::Walk,
+        });
+        let ca = LogicalOperator::Expand(ExpandOp {
+            from_variable: "c".to_string(),
+            to_variable: "a".to_string(),
+            edge_variable: None,
+            direction: ExpandDirection::Outgoing,
+            edge_types: vec!["KNOWS".to_string()],
+            min_hops: 1,
+            max_hops: Some(1),
+            input: Box::new(scan_person("c")),
+            path_alias: None,
+            path_mode: PathMode::Walk,
+        });
+        let logical = LogicalPlan::new(LogicalOperator::MultiWayJoin(MultiWayJoinOp {
+            inputs: vec![ab, bc, ca],
+            conditions: vec![],
+            shared_variables: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        }));
+        let _ = planner.plan(&logical);
+    }
+
+    #[test]
+    fn test_plan_horizontal_aggregate_dispatch() {
+        // Variable-length expand produces a list column that the aggregate targets.
+        let store = full_store();
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
+
+        let path = LogicalOperator::Expand(ExpandOp {
+            from_variable: "a".to_string(),
+            to_variable: "b".to_string(),
+            edge_variable: Some("r".to_string()),
+            direction: ExpandDirection::Outgoing,
+            edge_types: vec!["KNOWS".to_string()],
+            min_hops: 1,
+            max_hops: Some(3),
+            input: Box::new(scan_person("a")),
+            path_alias: Some("p".to_string()),
+            path_mode: PathMode::Walk,
+        });
+        // Variable-length expand emits a column named _path_edges_p.
+        let logical = LogicalPlan::new(LogicalOperator::HorizontalAggregate(
+            HorizontalAggregateOp {
+                list_column: "_path_edges_p".to_string(),
+                entity_kind: crate::query::plan::EntityKind::Edge,
+                function: LogicalAggregateFunction::Count,
+                property: "weight".to_string(),
+                alias: "edge_count".to_string(),
+                input: Box::new(path),
+            },
+        ));
+        let physical = planner.plan(&logical).unwrap();
+        assert!(physical.columns().contains(&"edge_count".to_string()));
+    }
+
+    // ==================== Cardinality estimation branches ====================
+
+    #[test]
+    fn test_plan_adaptive_with_except() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::Except(ExceptOp {
+            left: Box::new(scan_person("n")),
+            right: Box::new(scan_person("n")),
+            all: false,
+        }));
+        let physical = planner.plan_adaptive(&logical).unwrap();
+        assert!(physical.adaptive_context.is_some());
+    }
+
+    #[test]
+    fn test_plan_adaptive_with_intersect() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::Intersect(IntersectOp {
+            left: Box::new(scan_person("n")),
+            right: Box::new(scan_any("n")),
+            all: false,
+        }));
+        let physical = planner.plan_adaptive(&logical).unwrap();
+        assert!(physical.adaptive_context.is_some());
+    }
+
+    #[test]
+    fn test_plan_adaptive_with_otherwise() {
+        let store = create_test_store();
+        let planner = Planner::new(store);
+        let logical = LogicalPlan::new(LogicalOperator::Otherwise(OtherwiseOp {
+            left: Box::new(scan_person("n")),
+            right: Box::new(scan_any("n")),
+        }));
+        let physical = planner.plan_adaptive(&logical).unwrap();
+        assert!(physical.adaptive_context.is_some());
+    }
+
+    // ==================== count_expand_chain edge case ====================
+
+    #[test]
+    fn test_count_expand_chain_variable_length_breaks_chain() {
+        // A variable-length expand (not single-hop) should NOT count in the chain.
+        let var_expand = LogicalOperator::Expand(ExpandOp {
+            from_variable: "a".to_string(),
+            to_variable: "b".to_string(),
+            edge_variable: None,
+            direction: ExpandDirection::Outgoing,
+            edge_types: vec!["KNOWS".to_string()],
+            min_hops: 1,
+            max_hops: Some(3),
+            input: Box::new(scan_person("a")),
+            path_alias: None,
+            path_mode: PathMode::Walk,
+        });
+        let (count, _) = Planner::count_expand_chain(&var_expand);
+        assert_eq!(count, 0);
+    }
+
+    // ==================== StaticResultOperator ====================
+
+    #[cfg(feature = "algos")]
+    #[test]
+    fn test_static_result_operator_emits_rows_and_resets() {
+        use grafeo_common::types::Value;
+        let rows = vec![
+            vec![Value::Int64(1), Value::String("Vincent".into())],
+            vec![Value::Int64(2), Value::String("Jules".into())],
+        ];
+        let mut op = StaticResultOperator {
+            rows,
+            column_indices: vec![0, 1],
+            row_index: 0,
+        };
+        assert_eq!(op.name(), "StaticResult");
+        let chunk = op.next().unwrap().expect("first chunk");
+        assert_eq!(chunk.row_count(), 2);
+        // Exhausted.
+        assert!(op.next().unwrap().is_none());
+        // Reset allows re-emitting.
+        op.reset();
+        assert!(op.next().unwrap().is_some());
+        // into_any round trip.
+        let boxed: Box<dyn Operator> = Box::new(StaticResultOperator {
+            rows: vec![vec![Value::Null]],
+            column_indices: vec![0],
+            row_index: 0,
+        });
+        let _any = boxed.into_any();
     }
 }

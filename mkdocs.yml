@@ -262,6 +262,7 @@ nav:
       - HNSW Index: user-guide/vector-search/hnsw-index.md
       - Text Search: user-guide/vector-search/text-search.md
       - Hybrid Search: user-guide/vector-search/hybrid-search.md
+      - Filter Expressions: user-guide/vector-search/filter-expressions.md
       - MMR Search: user-guide/vector-search/mmr-search.md
       - Quantization: user-guide/vector-search/quantization.md
       - Python API: user-guide/vector-search/python-api.md
@@ -286,8 +287,10 @@ nav:
       - Sessions: user-guide/rust/sessions.md
     - Transactions: user-guide/transactions.md
     - Named Graphs: user-guide/named-graphs.md
+    - Catalog, Schemas & Graphs: user-guide/catalog-hierarchy.md
     - Temporal Properties & Time-Travel: user-guide/temporal.md
     - Observability: user-guide/observability.md
+    - Error Codes: user-guide/error-codes.md
     - Offline Sync: user-guide/offline-sync.md
     - Change Data Capture: user-guide/cdc.md
     - Persistence:

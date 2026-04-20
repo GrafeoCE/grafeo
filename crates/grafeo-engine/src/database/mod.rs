@@ -62,7 +62,7 @@ use grafeo_common::utils::error::{Error, QueryError, QueryErrorKind, Result};
 use grafeo_core::graph::lpg::LpgStore;
 #[cfg(feature = "triple-store")]
 use grafeo_core::graph::rdf::RdfStore;
-use grafeo_core::graph::{GraphStore, GraphStoreMut};
+use grafeo_core::graph::{GraphStoreMut, GraphStoreSearch};
 #[cfg(feature = "grafeo-file")]
 use grafeo_storage::file::GrafeoFileManager;
 #[cfg(all(feature = "wal", feature = "lpg"))]
@@ -156,7 +156,7 @@ pub struct GrafeoDB {
     >,
     /// External read-only graph store (when using with_store() or with_read_store()).
     /// When set, sessions route queries through this store instead of the built-in LpgStore.
-    pub(super) external_read_store: Option<Arc<dyn GraphStore>>,
+    pub(super) external_read_store: Option<Arc<dyn GraphStoreSearch>>,
     /// External writable graph store (when using with_store()).
     /// None for read-only databases created via with_read_store().
     pub(super) external_write_store: Option<Arc<dyn GraphStoreMut>>,
@@ -196,6 +196,34 @@ impl GrafeoDB {
             "no built-in LpgStore: this GrafeoDB was created with an external store \
              (with_store / with_read_store). Use session() or graph_store() instead.",
         )
+    }
+
+    /// Returns a borrowed reference to the active graph store.
+    ///
+    /// In layered mode (after [`compact()`](Self::compact)), returns the
+    /// `LayeredStore` which merges the columnar base with the overlay.
+    /// Otherwise, returns the built-in `LpgStore`.
+    ///
+    /// Unlike [`graph_store()`](Self::graph_store) (which clones an `Arc`),
+    /// this borrows from `self` — suitable for constructing accessors that
+    /// need `&'a dyn GraphStore` tied to the database lifetime.
+    #[cfg(any(
+        feature = "vector-index",
+        feature = "text-index",
+        feature = "hybrid-search",
+        feature = "embed",
+    ))]
+    fn graph_store_ref(&self) -> &dyn grafeo_core::graph::GraphStore {
+        if let Some(ref ext_read) = self.external_read_store {
+            ext_read.as_ref()
+        } else {
+            #[cfg(feature = "lpg")]
+            {
+                &**self.lpg_store()
+            }
+            #[cfg(not(feature = "lpg"))]
+            unreachable!("no graph store available: enable the `lpg` feature or use with_store()")
+        }
     }
 
     /// Returns whether CDC is active (runtime check).
@@ -713,7 +741,7 @@ impl GrafeoDB {
             checkpoint_timer: parking_lot::Mutex::new(None),
             #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
             vector_spill_storages: None,
-            external_read_store: Some(Arc::clone(&store) as Arc<dyn GraphStore>),
+            external_read_store: Some(Arc::clone(&store) as Arc<dyn GraphStoreSearch>),
             external_write_store: Some(store),
             #[cfg(feature = "metrics")]
             metrics: Some(Arc::new(crate::metrics::MetricsRegistry::new())),
@@ -736,9 +764,9 @@ impl GrafeoDB {
     /// ```no_run
     /// use std::sync::Arc;
     /// use grafeo_engine::{GrafeoDB, Config};
-    /// use grafeo_core::graph::GraphStore;
+    /// use grafeo_core::graph::GraphStoreSearch;
     ///
-    /// fn example(store: Arc<dyn GraphStore>) -> grafeo_common::utils::error::Result<()> {
+    /// fn example(store: Arc<dyn GraphStoreSearch>) -> grafeo_common::utils::error::Result<()> {
     ///     let db = GrafeoDB::with_read_store(store, Config::in_memory())?;
     ///     let result = db.execute("MATCH (n) RETURN count(n)")?;
     ///     Ok(())
@@ -750,7 +778,7 @@ impl GrafeoDB {
     /// Returns an error if config validation fails.
     ///
     /// [`GraphStore`]: grafeo_core::graph::GraphStore
-    pub fn with_read_store(store: Arc<dyn GraphStore>, config: Config) -> Result<Self> {
+    pub fn with_read_store(store: Arc<dyn GraphStoreSearch>, config: Config) -> Result<Self> {
         config
             .validate()
             .map_err(|e| grafeo_common::utils::error::Error::Internal(e.to_string()))?;
@@ -873,10 +901,19 @@ impl GrafeoDB {
         let current_epoch = self.transaction_manager.current_epoch();
         layered.overlay_store().sync_epoch(current_epoch);
 
-        self.external_read_store = Some(Arc::clone(&layered) as Arc<dyn GraphStore>);
+        // Named graphs are LPG-specific and outside the columnar base; move them
+        // from the pre-compact overlay into the new overlay so they survive
+        // compaction.
+        if let Some(ref old) = self.store {
+            layered
+                .overlay_store()
+                .install_named_graphs(old.take_named_graphs());
+        }
+
+        self.external_read_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreSearch>);
         self.external_write_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreMut>);
+        self.store = Some(Arc::clone(layered.overlay_store()));
         self.layered_store = Some(layered);
-        self.store = None;
         self.read_only = false;
         self.query_cache = Arc::new(QueryCache::default());
         self.projections.write().clear();
@@ -905,7 +942,7 @@ impl GrafeoDB {
             .ok_or_else(|| Error::Internal("recompact() requires a prior compact()".into()))?;
 
         // Read the combined view.
-        let combined: Arc<dyn GraphStore> = Arc::clone(layered) as Arc<dyn GraphStore>;
+        let combined: Arc<dyn GraphStoreSearch> = Arc::clone(layered) as Arc<dyn GraphStoreSearch>;
 
         // Max IDs from the overlay's allocators.
         let max_node_id = layered.overlay_store().next_node_id().saturating_sub(1);
@@ -923,8 +960,14 @@ impl GrafeoDB {
         let current_epoch = self.transaction_manager.current_epoch();
         new_layered.overlay_store().sync_epoch(current_epoch);
 
-        self.external_read_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStore>);
+        // Carry named graphs forward: the old overlay is about to be dropped.
+        new_layered
+            .overlay_store()
+            .install_named_graphs(layered.overlay_store().take_named_graphs());
+
+        self.external_read_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStoreSearch>);
         self.external_write_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStoreMut>);
+        self.store = Some(Arc::clone(new_layered.overlay_store()));
         self.layered_store = Some(new_layered);
         self.query_cache = Arc::new(QueryCache::default());
 
@@ -1529,7 +1572,7 @@ impl GrafeoDB {
             // Override graph_store/graph_store_mut to use the LayeredStore
             // (which merges base + overlay), not just the overlay alone.
             session.override_stores(
-                Arc::clone(&layered_arc) as Arc<dyn GraphStore>,
+                Arc::clone(&layered_arc) as Arc<dyn GraphStoreSearch>,
                 Some(layered_arc as Arc<dyn GraphStoreMut>),
             );
             return session;
@@ -1838,31 +1881,30 @@ impl GrafeoDB {
         self.projections.read().keys().cloned().collect()
     }
 
-    /// Returns a named projection as a [`GraphStore`] trait object.
+    /// Returns a named projection as a [`GraphStoreSearch`] trait object.
     #[must_use]
-    pub fn projection(&self, name: &str) -> Option<Arc<dyn GraphStore>> {
+    pub fn projection(&self, name: &str) -> Option<Arc<dyn GraphStoreSearch>> {
         self.projections
             .read()
             .get(name)
-            .map(|p| Arc::clone(p) as Arc<dyn GraphStore>)
+            .map(|p| Arc::clone(p) as Arc<dyn GraphStoreSearch>)
     }
 
     /// Returns the graph store as a trait object.
     ///
     /// Returns a read-only trait object for the active graph store.
     ///
-    /// This provides the [`GraphStore`] interface for code that only needs
-    /// read operations. For write access, use [`graph_store_mut()`](Self::graph_store_mut).
-    ///
-    /// [`GraphStore`]: grafeo_core::graph::GraphStore
+    /// This provides the [`GraphStoreSearch`] interface (graph-structure reads
+    /// plus text/vector search capabilities) for code that only needs read
+    /// operations. For write access, use [`graph_store_mut()`](Self::graph_store_mut).
     #[must_use]
-    pub fn graph_store(&self) -> Arc<dyn GraphStore> {
+    pub fn graph_store(&self) -> Arc<dyn GraphStoreSearch> {
         if let Some(ref ext_read) = self.external_read_store {
             Arc::clone(ext_read)
         } else {
             #[cfg(feature = "lpg")]
             {
-                Arc::clone(self.lpg_store()) as Arc<dyn GraphStore>
+                Arc::clone(self.lpg_store()) as Arc<dyn GraphStoreSearch>
             }
             #[cfg(not(feature = "lpg"))]
             unreachable!("no graph store available: enable the `lpg` feature or use with_store()")
@@ -1897,11 +1939,12 @@ impl GrafeoDB {
     /// event log according to its retention policy.
     pub fn gc(&self) {
         #[cfg(feature = "lpg")]
-        let current_epoch = {
+        {
             let min_epoch = self.transaction_manager.min_active_epoch();
             self.lpg_store().gc_versions(min_epoch);
-            self.transaction_manager.current_epoch()
-        };
+        }
+        #[cfg(all(feature = "lpg", feature = "cdc"))]
+        let current_epoch = self.transaction_manager.current_epoch();
         self.transaction_manager.gc();
 
         // Prune CDC events based on retention config (epoch + count limits)
@@ -2087,10 +2130,9 @@ impl GrafeoDB {
     /// Each section reports its memory usage to the buffer manager, enabling
     /// accurate pressure tracking. Called once after database construction.
     fn register_section_consumers(&mut self) {
+        // LPG store section
         #[cfg(feature = "lpg")]
         let store_ref = self.store.as_ref();
-        #[cfg(not(feature = "lpg"))]
-        // LPG store section
         #[cfg(feature = "lpg")]
         if let Some(store) = store_ref {
             let lpg = grafeo_core::graph::lpg::LpgStoreSection::new(Arc::clone(store));
@@ -3634,7 +3676,7 @@ mod tests {
         let store = Arc::new(LpgStore::new().unwrap());
         store.create_node(&["Person"]);
 
-        let read_store = Arc::clone(&store) as Arc<dyn GraphStore>;
+        let read_store = Arc::clone(&store) as Arc<dyn GraphStoreSearch>;
         let db = GrafeoDB::with_read_store(read_store, Config::in_memory()).unwrap();
 
         assert!(db.is_read_only());
@@ -3798,7 +3840,7 @@ mod tests {
         use grafeo_core::graph::lpg::LpgStore;
 
         let store = Arc::new(LpgStore::new().unwrap());
-        let read_store = Arc::clone(&store) as Arc<dyn GraphStore>;
+        let read_store = Arc::clone(&store) as Arc<dyn GraphStoreSearch>;
         let db = GrafeoDB::with_read_store(read_store, Config::in_memory()).unwrap();
 
         // drop_graph with external store (no built-in store) returns false
