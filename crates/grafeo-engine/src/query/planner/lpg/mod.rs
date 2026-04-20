@@ -47,7 +47,7 @@ use grafeo_core::execution::operators::{
     SortDirection, SortKey as PhysicalSortKey, SortOperator, UnionOperator, UnwindOperator,
     VariableLengthExpandOperator,
 };
-use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut};
+use grafeo_core::graph::{Direction, GraphStoreMut, GraphStoreSearch};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -70,7 +70,7 @@ struct RangeBounds<'a> {
 /// Converts a logical plan to a physical operator tree for LPG stores.
 pub struct Planner {
     /// The graph store (read-only operations).
-    pub(super) store: Arc<dyn GraphStore>,
+    pub(super) store: Arc<dyn GraphStoreSearch>,
     /// Writable graph store (None for read-only databases).
     pub(super) write_store: Option<Arc<dyn GraphStoreMut>>,
     /// Transaction manager for MVCC operations.
@@ -121,7 +121,7 @@ impl Planner {
     /// This creates a planner without transaction context, using the current
     /// epoch from the store for visibility.
     #[must_use]
-    pub fn new(store: Arc<dyn GraphStore>) -> Self {
+    pub fn new(store: Arc<dyn GraphStoreSearch>) -> Self {
         let epoch = store.current_epoch();
         Self {
             store,
@@ -148,7 +148,7 @@ impl Planner {
     /// Creates a new planner with transaction context for MVCC-aware planning.
     #[must_use]
     pub fn with_context(
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         write_store: Option<Arc<dyn GraphStoreMut>>,
         transaction_manager: Arc<TransactionManager>,
         transaction_id: Option<TransactionId>,
@@ -715,7 +715,7 @@ impl Planner {
             entity_kind,
             function,
             ha.property.clone(),
-            Arc::clone(&self.store) as Arc<dyn GraphStore>,
+            Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             input_column_count,
         ));
 
@@ -814,7 +814,7 @@ impl Planner {
         scan: &VectorScanOp,
     ) -> Result<(Box<dyn Operator>, Vec<String>)> {
         use grafeo_core::execution::operators::VectorScanOperator;
-        use grafeo_core::index::vector::{DistanceMetric, VectorIndexKind};
+        use grafeo_core::index::vector::DistanceMetric;
 
         // Hybrid shape `VectorScan(input=graph_pattern)` is not supported by
         // the physical VectorScanOperator: it has no input slot and would
@@ -826,11 +826,8 @@ impl Planner {
             ));
         }
 
-        // Resolve the query vector expression to Vec<f32>
         let query_vec = self.resolve_vector_literal(&scan.query_vector)?;
 
-        // Map the user-requested metric (if any). `None` means "use whatever
-        // the index uses"; resolved below when we can look at the index.
         let requested_metric = scan.metric.map(|m| match m {
             VectorMetric::Cosine => DistanceMetric::Cosine,
             VectorMetric::Euclidean => DistanceMetric::Euclidean,
@@ -840,58 +837,29 @@ impl Planner {
 
         let k = scan.k.unwrap_or(usize::MAX);
 
-        // Try the HNSW-accelerated path when an index exists AND the requested
-        // metric matches the index's metric. The index ranks by its own
-        // metric, so using it with a different metric would return the wrong
-        // neighbors (with_metric only rescales threshold comparisons).
-        let (mut operator, metric) = if let Some(ref label) = scan.label {
-            let indexed = self
-                .store
-                .get_vector_index_handle(label, &scan.property)
-                .and_then(|handle| handle.downcast::<VectorIndexKind>().ok())
-                .filter(|index| {
-                    requested_metric.is_none() || requested_metric == Some(index.config().metric)
-                });
-            if let Some(index) = indexed {
-                // When the user didn't specify a metric, adopt the index's
-                // metric so apply_filters interprets the returned distances
-                // correctly (e.g. similarity threshold only applies to cosine).
-                let m = requested_metric.unwrap_or(index.config().metric);
-                let op = VectorScanOperator::with_index(
-                    Arc::clone(&self.store),
-                    index,
-                    query_vec.clone(),
-                    k,
-                )
-                .with_property(&scan.property)
-                .with_label(label)
-                .with_metric(m);
-                (op, m)
-            } else {
-                // Brute-force has no index to borrow from; default to Cosine
-                // when the user didn't pick one.
-                let m = requested_metric.unwrap_or(DistanceMetric::Cosine);
-                let op = VectorScanOperator::brute_force(
-                    Arc::clone(&self.store),
-                    &scan.property,
-                    query_vec.clone(),
-                    k,
-                    m,
-                )
-                .with_label(label);
-                (op, m)
-            }
-        } else {
-            let m = requested_metric.unwrap_or(DistanceMetric::Cosine);
-            let op = VectorScanOperator::brute_force(
-                Arc::clone(&self.store),
-                &scan.property,
-                query_vec,
-                k,
-                m,
-            );
-            (op, m)
-        };
+        // Pick the metric we'll execute under. When the user asked for a
+        // specific one, honor it. Otherwise inherit the index's metric (so a
+        // cosine-built index drives cosine scoring) or default to Cosine for
+        // the unindexed brute-force path.
+        let index_metric = scan
+            .label
+            .as_ref()
+            .and_then(|label| self.store.vector_index_metric(label, &scan.property));
+        let metric = requested_metric
+            .or(index_metric)
+            .unwrap_or(DistanceMetric::Cosine);
+
+        // The store's vector_search routes HNSW when an index exists whose
+        // metric matches `metric`, and brute-force scan otherwise. No handle
+        // downcast; no Arc<dyn Any>.
+        let mut operator = VectorScanOperator::new(
+            Arc::clone(&self.store),
+            scan.label.clone(),
+            scan.property.clone(),
+            query_vec,
+            k,
+            metric,
+        );
 
         if let Some(sim) = scan.min_similarity {
             operator = operator.with_min_similarity(sim);
@@ -1906,7 +1874,7 @@ mod tests {
     // ==================== Mutation Tests ====================
 
     fn create_writable_planner(store: &Arc<LpgStore>) -> Planner {
-        let mut p = Planner::new(Arc::clone(store) as Arc<dyn GraphStore>);
+        let mut p = Planner::new(Arc::clone(store) as Arc<dyn GraphStoreSearch>);
         p.write_store = Some(Arc::clone(store) as Arc<dyn GraphStoreMut>);
         p
     }
@@ -2071,7 +2039,7 @@ mod tests {
     #[test]
     fn test_planner_accessors() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>);
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
 
         assert!(planner.transaction_id().is_none());
         assert!(planner.transaction_manager().is_none());
@@ -2160,7 +2128,7 @@ mod tests {
     #[test]
     fn test_plan_adaptive_with_expand() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>)
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
             .with_factorized_execution(false);
 
         // MATCH (a)-[:KNOWS]->(b) RETURN a, b
@@ -2486,7 +2454,7 @@ mod tests {
     #[test]
     fn test_plan_expand_incoming() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>)
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
             .with_factorized_execution(false);
 
         // MATCH (a)<-[:KNOWS]-(b) RETURN a, b
@@ -2528,7 +2496,7 @@ mod tests {
     #[test]
     fn test_plan_expand_both_directions() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>)
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
             .with_factorized_execution(false);
 
         // MATCH (a)-[:KNOWS]-(b) RETURN a, b
@@ -2579,7 +2547,7 @@ mod tests {
         let epoch = transaction_manager.current_epoch();
 
         let planner = Planner::with_context(
-            Arc::clone(&store) as Arc<dyn GraphStore>,
+            Arc::clone(&store) as Arc<dyn GraphStoreSearch>,
             Some(Arc::clone(&store) as Arc<dyn GraphStoreMut>),
             Arc::clone(&transaction_manager),
             Some(transaction_id),
@@ -2594,7 +2562,7 @@ mod tests {
     #[test]
     fn test_planner_with_factorized_execution_disabled() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>)
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
             .with_factorized_execution(false);
 
         // Two consecutive expands - should NOT use factorized execution
@@ -2765,11 +2733,12 @@ mod tests {
     #[test]
     fn test_with_read_only_flag() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>).with_read_only(true);
+        let planner =
+            Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>).with_read_only(true);
         assert!(planner.read_only);
 
         let planner_off =
-            Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>).with_read_only(false);
+            Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>).with_read_only(false);
         assert!(!planner_off.read_only);
     }
 
@@ -2777,7 +2746,7 @@ mod tests {
     fn test_with_catalog() {
         let store = create_test_store();
         let catalog = Arc::new(Catalog::new());
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>)
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
             .with_catalog(Arc::clone(&catalog));
         assert!(planner.catalog.is_some());
     }
@@ -2790,8 +2759,8 @@ mod tests {
             current_graph: Some("main".to_string()),
             ..SessionContext::default()
         };
-        let planner =
-            Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>).with_session_context(context);
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>)
+            .with_session_context(context);
         assert_eq!(
             planner.session_context.current_schema.as_deref(),
             Some("public")
@@ -2807,7 +2776,7 @@ mod tests {
     #[test]
     fn test_register_edge_column_named() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>);
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
         let name = planner.register_edge_column(&Some("r".to_string()));
         assert_eq!(name, "r");
         assert!(planner.edge_columns.borrow().contains("r"));
@@ -2816,7 +2785,7 @@ mod tests {
     #[test]
     fn test_register_edge_column_anonymous_counter_advances() {
         let store = create_test_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>);
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
         let a = planner.register_edge_column(&None);
         let b = planner.register_edge_column(&None);
         assert_eq!(a, "_anon_edge_0");
@@ -3166,7 +3135,7 @@ mod tests {
     #[test]
     fn test_plan_shortest_path_dispatch() {
         let store = full_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>);
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
 
         // SHORTEST PATH (a)-(b)
         let logical = LogicalPlan::new(LogicalOperator::ShortestPath(ShortestPathOp {
@@ -3195,7 +3164,7 @@ mod tests {
     #[test]
     fn test_plan_shortest_path_missing_source_errors() {
         let store = full_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>);
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
         let logical = LogicalPlan::new(LogicalOperator::ShortestPath(ShortestPathOp {
             input: Box::new(scan_person("a")),
             source_var: "missing".to_string(),
@@ -3308,7 +3277,7 @@ mod tests {
         // Three-way join over three expand inputs. Some configurations may
         // error during planning; we just require no panic.
         let store = full_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>);
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
         let ab = LogicalOperator::Expand(ExpandOp {
             from_variable: "a".to_string(),
             to_variable: "b".to_string(),
@@ -3357,7 +3326,7 @@ mod tests {
     fn test_plan_horizontal_aggregate_dispatch() {
         // Variable-length expand produces a list column that the aggregate targets.
         let store = full_store();
-        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStore>);
+        let planner = Planner::new(Arc::clone(&store) as Arc<dyn GraphStoreSearch>);
 
         let path = LogicalOperator::Expand(ExpandOp {
             from_variable: "a".to_string(),

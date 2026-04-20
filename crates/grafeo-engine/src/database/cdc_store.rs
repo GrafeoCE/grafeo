@@ -17,7 +17,7 @@ use grafeo_common::types::{
 };
 use grafeo_common::utils::hash::FxHashMap;
 use grafeo_core::graph::lpg::{CompareOp, Edge, Node};
-use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut};
+use grafeo_core::graph::{Direction, GraphStore, GraphStoreMut, GraphStoreSearch};
 use grafeo_core::statistics::Statistics;
 use parking_lot::Mutex;
 
@@ -380,6 +380,8 @@ impl GraphStore for CdcGraphStore {
         self.inner.get_edge_history(id)
     }
 }
+
+impl GraphStoreSearch for CdcGraphStore {}
 
 // ---------------------------------------------------------------------------
 // GraphStoreMut: delegate + CDC buffer/record

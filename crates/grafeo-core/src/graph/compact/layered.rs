@@ -17,7 +17,9 @@ use parking_lot::RwLock;
 use super::CompactStore;
 use crate::graph::Direction;
 use crate::graph::lpg::{CompareOp, Edge, LpgStore, Node};
-use crate::graph::traits::{GraphStore, GraphStoreMut};
+use crate::graph::traits::{GraphStore, GraphStoreMut, GraphStoreSearch};
+#[cfg(feature = "vector-index")]
+use crate::index::vector::DistanceMetric;
 use crate::statistics::Statistics;
 
 /// A two-layer graph store with a columnar base and mutable overlay.
@@ -677,6 +679,13 @@ impl GraphStore for LayeredStore {
         }
         Vec::new()
     }
+}
+
+impl GraphStoreSearch for LayeredStore {
+    #[cfg(feature = "text-index")]
+    fn has_text_index(&self, label: &str, property: &str) -> bool {
+        self.overlay.has_text_index(label, property)
+    }
 
     #[cfg(feature = "text-index")]
     fn score_text(&self, node_id: NodeId, label: &str, property: &str, query: &str) -> Option<f64> {
@@ -719,23 +728,51 @@ impl GraphStore for LayeredStore {
         results
     }
 
-    #[cfg(feature = "text-index")]
-    fn has_text_index(&self, label: &str, property: &str) -> bool {
-        self.overlay.has_text_index(label, property)
-    }
-
     #[cfg(feature = "vector-index")]
     fn has_vector_index(&self, label: &str, property: &str) -> bool {
         self.overlay.has_vector_index(label, property)
     }
 
     #[cfg(feature = "vector-index")]
-    fn get_vector_index_handle(
+    fn vector_index_metric(&self, label: &str, property: &str) -> Option<DistanceMetric> {
+        self.overlay.vector_index_metric(label, property)
+    }
+
+    #[cfg(feature = "vector-index")]
+    fn vector_search(
         &self,
-        label: &str,
+        label: Option<&str>,
         property: &str,
-    ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
-        self.overlay.get_vector_index_handle(label, property)
+        query: &[f32],
+        k: usize,
+        metric: DistanceMetric,
+    ) -> Vec<(NodeId, f64)> {
+        // Forward to overlay, then filter nodes deleted from base so stale hits
+        // from the underlying index do not leak through the layered view.
+        let deleted = self.deleted_from_base_nodes.read();
+        let mut results =
+            self.overlay
+                .vector_search(label, property, query, k + deleted.len(), metric);
+        results.retain(|(id, _)| !deleted.contains(id));
+        results.truncate(k);
+        results
+    }
+
+    #[cfg(feature = "vector-index")]
+    fn vector_search_with_threshold(
+        &self,
+        label: Option<&str>,
+        property: &str,
+        query: &[f32],
+        threshold: f64,
+        metric: DistanceMetric,
+    ) -> Vec<(NodeId, f64)> {
+        let deleted = self.deleted_from_base_nodes.read();
+        let mut results = self
+            .overlay
+            .vector_search_with_threshold(label, property, query, threshold, metric);
+        results.retain(|(id, _)| !deleted.contains(id));
+        results
     }
 }
 

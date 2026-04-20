@@ -6,7 +6,7 @@
 
 #[cfg(feature = "text-index")]
 use super::{
-    Arc, BinaryOp, ExpressionPredicate, FilterOp, FilterOperator, GraphStore, HashMap,
+    Arc, BinaryOp, ExpressionPredicate, FilterOp, FilterOperator, GraphStoreSearch, HashMap,
     LogicalExpression, LogicalOperator, Operator, Result, Value,
 };
 
@@ -98,7 +98,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -317,7 +317,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -336,7 +336,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -419,7 +419,7 @@ impl super::Planner {
             let predicate = ExpressionPredicate::new(
                 filter_expr,
                 variable_columns,
-                Arc::clone(&self.store) as Arc<dyn GraphStore>,
+                Arc::clone(&self.store) as Arc<dyn GraphStoreSearch>,
             )
             .with_transaction_context(self.viewing_epoch, self.transaction_id)
             .with_session_context(self.session_context.clone());
@@ -503,7 +503,7 @@ impl super::Planner {
 #[cfg(all(test, feature = "text-index"))]
 mod text_extract_tests {
     use super::super::{
-        Arc, BinaryOp, FilterOp, GraphStore, LogicalExpression, LogicalOperator, NodeScanOp,
+        Arc, BinaryOp, FilterOp, GraphStoreSearch, LogicalExpression, LogicalOperator, NodeScanOp,
         Planner, Value,
     };
     use grafeo_core::graph::lpg::LpgStore;
@@ -512,7 +512,7 @@ mod text_extract_tests {
         let store = Arc::new(LpgStore::new().unwrap());
         let article = store.create_node(&["Article"]);
         store.set_node_property(article, "body", Value::String("rust database".into()));
-        Planner::new(store as Arc<dyn GraphStore>)
+        Planner::new(store as Arc<dyn GraphStoreSearch>)
     }
 
     fn property(var: &str, name: &str) -> LogicalExpression {
@@ -882,7 +882,7 @@ mod text_extract_tests {
 #[cfg(all(test, feature = "vector-index", feature = "text-index"))]
 mod compound_hybrid_tests {
     use super::super::{
-        Arc, BinaryOp, FilterOp, GraphStore, LogicalExpression, LogicalOperator, NodeScanOp,
+        Arc, BinaryOp, FilterOp, GraphStoreSearch, LogicalExpression, LogicalOperator, NodeScanOp,
         Planner, Value,
     };
     use grafeo_core::graph::lpg::LpgStore;
@@ -892,7 +892,7 @@ mod compound_hybrid_tests {
         let a = store.create_node(&["Article"]);
         store.set_node_property(a, "body", Value::String("vincent and jules".into()));
         store.set_node_property(a, "embedding", Value::Vector(vec![0.1f32, 0.9, 0.0].into()));
-        Planner::new(store as Arc<dyn GraphStore>)
+        Planner::new(store as Arc<dyn GraphStoreSearch>)
     }
 
     fn property(var: &str, name: &str) -> LogicalExpression {

@@ -3,7 +3,7 @@
 use super::filter::{ExpressionPredicate, FilterExpression, SessionContext};
 use super::{Operator, OperatorError, OperatorResult};
 use crate::execution::DataChunk;
-use crate::graph::GraphStore;
+use crate::graph::GraphStoreSearch;
 use crate::graph::lpg::{Edge, Node};
 use grafeo_common::types::{EpochId, LogicalType, PropertyKey, TransactionId, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -63,7 +63,7 @@ pub struct ProjectOperator {
     /// Output column types.
     output_types: Vec<LogicalType>,
     /// Optional store for property access.
-    store: Option<Arc<dyn GraphStore>>,
+    store: Option<Arc<dyn GraphStoreSearch>>,
     /// Transaction ID for MVCC-aware property lookups.
     transaction_id: Option<TransactionId>,
     /// Viewing epoch for MVCC-aware property lookups.
@@ -104,7 +104,7 @@ impl ProjectOperator {
         child: Box<dyn Operator>,
         projections: Vec<ProjectExpr>,
         output_types: Vec<LogicalType>,
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
     ) -> Self {
         assert_eq!(projections.len(), output_types.len());
         Self {

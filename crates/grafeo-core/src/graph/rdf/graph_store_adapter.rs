@@ -42,7 +42,7 @@ use super::triple::Triple;
 use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
 use crate::graph::lpg::{Edge, Node};
-use crate::graph::traits::GraphStore;
+use crate::graph::traits::{GraphStore, GraphStoreSearch};
 use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
 use arcstr::ArcStr;
 use grafeo_common::types::{EdgeId, EpochId, NodeId, PropertyKey, TransactionId, Value};
@@ -594,6 +594,8 @@ impl GraphStore for RdfGraphStoreAdapter {
         keys.into_iter().collect()
     }
 }
+
+impl GraphStoreSearch for RdfGraphStoreAdapter {}
 
 /// Converts an RDF literal to a Grafeo [`Value`].
 fn literal_to_value(lit: &Literal) -> Value {

@@ -15,7 +15,7 @@ use super::id::encode_node_id;
 use crate::graph::Direction;
 use crate::graph::lpg::CompareOp;
 use crate::graph::lpg::{Edge, Node};
-use crate::graph::traits::GraphStore;
+use crate::graph::traits::{GraphStore, GraphStoreSearch};
 use crate::statistics::Statistics;
 
 impl GraphStore for CompactStore {
@@ -470,3 +470,5 @@ impl GraphStore for CompactStore {
         Vec::new()
     }
 }
+
+impl GraphStoreSearch for CompactStore {}

@@ -10,7 +10,7 @@ use grafeo_adapters::plugins::{AlgorithmResult, Parameters};
 use grafeo_common::types::{LogicalType, Value};
 use grafeo_core::execution::DataChunk;
 use grafeo_core::execution::operators::{Operator, OperatorError, OperatorResult};
-use grafeo_core::graph::GraphStore;
+use grafeo_core::graph::GraphStoreSearch;
 
 /// Physical operator that executes a graph algorithm and yields its results.
 ///
@@ -18,7 +18,7 @@ use grafeo_core::graph::GraphStore;
 /// the full result is cached. Subsequent calls yield rows in chunks of
 /// `CHUNK_SIZE` until exhausted.
 pub struct ProcedureCallOperator {
-    store: Arc<dyn GraphStore>,
+    store: Arc<dyn GraphStoreSearch>,
     algorithm: Arc<dyn GraphAlgorithm>,
     params: Parameters,
     /// YIELD items: (original_column, alias). `None` means yield all columns.
@@ -43,7 +43,7 @@ const CHUNK_SIZE: usize = 1024;
 impl ProcedureCallOperator {
     /// Creates a new procedure call operator.
     pub fn new(
-        store: Arc<dyn GraphStore>,
+        store: Arc<dyn GraphStoreSearch>,
         algorithm: Arc<dyn GraphAlgorithm>,
         params: Parameters,
         yield_columns: Option<Vec<(String, Option<String>)>>,

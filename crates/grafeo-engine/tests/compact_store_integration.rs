@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use grafeo_core::graph::compact::CompactStoreBuilder;
-use grafeo_core::graph::traits::GraphStore;
+use grafeo_core::graph::traits::GraphStoreSearch;
 use grafeo_engine::{Config, GrafeoDB};
 
 /// Build a CompactStore with test data and wrap it in GrafeoDB::with_store().
@@ -38,8 +38,11 @@ fn build_test_db() -> GrafeoDB {
         .build()
         .expect("CompactStore build failed");
 
-    GrafeoDB::with_read_store(Arc::new(store) as Arc<dyn GraphStore>, Config::default())
-        .expect("GrafeoDB::with_read_store failed")
+    GrafeoDB::with_read_store(
+        Arc::new(store) as Arc<dyn GraphStoreSearch>,
+        Config::default(),
+    )
+    .expect("GrafeoDB::with_read_store failed")
 }
 
 // ── Basic scan queries ──────────────────────────────────────────

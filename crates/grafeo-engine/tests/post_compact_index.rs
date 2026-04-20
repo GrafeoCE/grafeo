@@ -279,7 +279,7 @@ fn layered_store_has_vector_index_forwards_to_overlay() {
     // Now LayeredStore should forward to overlay and report true
     let gs = db.graph_store();
     assert!(gs.has_vector_index("Doc", "embedding"));
-    assert!(gs.get_vector_index_handle("Doc", "embedding").is_some());
+    assert!(gs.vector_index_metric("Doc", "embedding").is_some());
 }
 
 #[test]
