@@ -835,7 +835,16 @@ impl Planner {
             VectorMetric::Manhattan => DistanceMetric::Manhattan,
         });
 
-        let k = scan.k.unwrap_or(usize::MAX);
+        // Top-k mode uses HNSW when available; threshold/unbounded mode
+        // bounds k to the label's node count so we don't feed usize::MAX
+        // into HNSW (which degrades to full traversal and risks overflow
+        // in quantized rescore paths even with saturating_mul).
+        let k = scan.k.unwrap_or_else(|| {
+            scan.label.as_ref().map_or_else(
+                || self.store.node_count(),
+                |l| self.store.nodes_by_label_count(l),
+            )
+        });
 
         // Pick the metric we'll execute under. When the user asked for a
         // specific one, honor it. Otherwise inherit the index's metric (so a
@@ -3446,5 +3455,57 @@ mod tests {
             row_index: 0,
         });
         let _any = boxed.into_any();
+    }
+
+    // ==================== VectorScan k-bounding regression ====================
+
+    /// `VectorScanOp.k = None` means "return every match," but feeding
+    /// `usize::MAX` into the store's vector_search degrades HNSW to a full
+    /// traversal and (pre-saturating-mul) could overflow quantized rescore
+    /// paths. The planner must bound k to the label's node count (or the
+    /// global count when no label is set, or zero when the label is unknown).
+    ///
+    /// We can't inspect VectorScanOperator.k directly — it's private — so the
+    /// assertion here is that planning succeeds across all three branches
+    /// without panicking or surfacing an internal-state error. Paired with
+    /// `LpgStore::nodes_by_label_count` tests, this guards the full path.
+    #[cfg(feature = "vector-index")]
+    #[test]
+    fn test_plan_vector_scan_k_none_bounds_across_label_states() {
+        use crate::query::plan::VectorScanOp;
+
+        let store = create_test_store();
+        // Sanity: the test store has 2 Person nodes, 1 Company, 0 Unknown.
+        assert_eq!(store.nodes_by_label_count("Person"), 2);
+        assert_eq!(store.nodes_by_label_count("Unknown"), 0);
+        assert_eq!(store.node_count(), 3);
+
+        let planner = Planner::new(store);
+        let make_scan = |label: Option<&str>| VectorScanOp {
+            variable: "n".to_string(),
+            index_name: None,
+            property: "embedding".to_string(),
+            label: label.map(str::to_string),
+            query_vector: LogicalExpression::Literal(Value::List(
+                vec![
+                    Value::Float64(1.0),
+                    Value::Float64(0.0),
+                    Value::Float64(0.0),
+                ]
+                .into(),
+            )),
+            k: None,
+            metric: Some(VectorMetric::Cosine),
+            min_similarity: Some(0.5),
+            max_distance: None,
+            input: None,
+        };
+
+        for label in [Some("Person"), Some("Unknown"), None] {
+            let (_op, cols) = planner
+                .plan_vector_scan(&make_scan(label))
+                .unwrap_or_else(|e| panic!("plan_vector_scan failed for {label:?}: {e:?}"));
+            assert_eq!(cols[0], "n", "variable column must be first for {label:?}");
+        }
     }
 }
