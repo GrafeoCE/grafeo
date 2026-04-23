@@ -33,8 +33,9 @@
 //! the old in-memory store. [`persist_to_mmap`](CompactStoreTiered::persist_to_mmap)
 //! consumes the old `Arc<CompactStore>` and replaces it with a fresh one
 //! deserialized from mmap bytes. If the caller kept another `Arc` around
-//! (e.g. in a [`LayeredStore`]), that clone still keeps the old allocation
-//! live; callers under memory pressure should route reads through
+//! (e.g. in a [`LayeredStore`](grafeo_core::graph::compact::layered::LayeredStore)),
+//! that clone still keeps the old allocation live; callers under memory
+//! pressure should route reads through
 //! [`store()`](CompactStoreTiered::store) and hold the tiered wrapper, not
 //! raw CompactStore clones.
 //!
