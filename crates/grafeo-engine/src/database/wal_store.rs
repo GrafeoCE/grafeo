@@ -325,6 +325,12 @@ impl GraphStore for WalGraphStore {
     }
 }
 
+// Pure delegation: the WAL wrapper logs mutations but owns no index state,
+// so every text/vector lookup has to fall through to the underlying
+// `LpgStore`. A stub impl silently turns into "no index exists" at every
+// call site (has_text_index → false, text_search → [], etc.), which
+// regressed hybrid queries on persistent DBs until it was caught by the
+// `_persistent` spec variants — see issue #308.
 impl GraphStoreSearch for WalGraphStore {
     #[cfg(feature = "text-index")]
     fn has_text_index(&self, label: &str, property: &str) -> bool {

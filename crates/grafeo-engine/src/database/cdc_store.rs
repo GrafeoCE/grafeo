@@ -385,6 +385,11 @@ impl GraphStore for CdcGraphStore {
     }
 }
 
+// Pure delegation: CDC wraps the store to buffer mutation events but owns no
+// index state, so every text/vector lookup has to fall through to the
+// underlying `GraphStoreMut` (which is a `GraphStoreSearch` by bound). A stub
+// impl silently turns into "no index exists" at every call site — the same
+// regression that hit the WAL wrapper in issue #308.
 impl GraphStoreSearch for CdcGraphStore {
     #[cfg(feature = "text-index")]
     fn has_text_index(&self, label: &str, property: &str) -> bool {
