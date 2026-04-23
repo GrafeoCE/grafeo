@@ -102,8 +102,7 @@ pub fn simd_support() -> &'static str {
 /// Computes distance using the best available SIMD implementation.
 #[inline]
 pub fn compute_distance_simd(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "Vector dimensions must match");
-
+    // Length equality is enforced at each *_simd dispatcher below.
     match metric {
         DistanceMetric::Cosine => cosine_distance_simd(a, b),
         DistanceMetric::Euclidean => euclidean_distance_simd(a, b),
@@ -116,21 +115,23 @@ pub fn compute_distance_simd(a: &[f32], b: &[f32], metric: DistanceMetric) -> f3
 #[inline]
 #[allow(unreachable_code)]
 pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "vector lengths must match");
+
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            // SAFETY: We checked AVX2 support above
+            // SAFETY: AVX2 support and equal lengths checked above
             return unsafe { dot_product_avx2(a, b) };
         }
         if has_sse() {
-            // SAFETY: We checked SSE support above
+            // SAFETY: SSE support and equal lengths checked above
             return unsafe { dot_product_sse(a, b) };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is always available on aarch64
+        // SAFETY: NEON is always available on aarch64 and lengths are equal
         return unsafe { dot_product_neon(a, b) };
     }
 
@@ -142,21 +143,23 @@ pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 #[allow(unreachable_code)]
 pub fn euclidean_distance_squared_simd(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "vector lengths must match");
+
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            // SAFETY: AVX2+FMA availability is checked by `has_avx2()` above
+            // SAFETY: AVX2+FMA checked by `has_avx2()` and lengths equal above
             return unsafe { euclidean_squared_avx2(a, b) };
         }
         if has_sse() {
-            // SAFETY: SSE availability is checked by `has_sse()` above
+            // SAFETY: SSE checked by `has_sse()` and lengths equal above
             return unsafe { euclidean_squared_sse(a, b) };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is always available on aarch64
+        // SAFETY: NEON is always available on aarch64 and lengths are equal
         return unsafe { euclidean_squared_neon(a, b) };
     }
 
@@ -173,21 +176,23 @@ pub fn euclidean_distance_simd(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 #[allow(unreachable_code)]
 pub fn cosine_distance_simd(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "vector lengths must match");
+
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            // SAFETY: AVX2+FMA availability is checked by `has_avx2()` above
+            // SAFETY: AVX2+FMA checked by `has_avx2()` and lengths equal above
             return unsafe { cosine_distance_avx2(a, b) };
         }
         if has_sse() {
-            // SAFETY: SSE availability is checked by `has_sse()` above
+            // SAFETY: SSE checked by `has_sse()` and lengths equal above
             return unsafe { cosine_distance_sse(a, b) };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is always available on aarch64
+        // SAFETY: NEON is always available on aarch64 and lengths are equal
         return unsafe { cosine_distance_neon(a, b) };
     }
 
@@ -198,21 +203,23 @@ pub fn cosine_distance_simd(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 #[allow(unreachable_code)]
 pub fn manhattan_distance_simd(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "vector lengths must match");
+
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx2() {
-            // SAFETY: AVX2+FMA availability is checked by `has_avx2()` above
+            // SAFETY: AVX2+FMA checked by `has_avx2()` and lengths equal above
             return unsafe { manhattan_distance_avx2(a, b) };
         }
         if has_sse() {
-            // SAFETY: SSE availability is checked by `has_sse()` above
+            // SAFETY: SSE checked by `has_sse()` and lengths equal above
             return unsafe { manhattan_distance_sse(a, b) };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is always available on aarch64
+        // SAFETY: NEON is always available on aarch64 and lengths are equal
         return unsafe { manhattan_distance_neon(a, b) };
     }
 
@@ -853,5 +860,40 @@ mod tests {
         let _ = compute_distance_simd(&a, &b, DistanceMetric::Euclidean);
         let _ = compute_distance_simd(&a, &b, DistanceMetric::DotProduct);
         let _ = compute_distance_simd(&a, &b, DistanceMetric::Manhattan);
+    }
+
+    // The public *_simd dispatchers feed unsafe raw-pointer loads from `b`
+    // bounded by `a.len()`. These panics guarantee we never read past `b` in
+    // release builds.
+    #[test]
+    #[should_panic(expected = "vector lengths must match")]
+    fn test_dot_product_simd_panics_on_mismatched_lengths() {
+        let a = [1.0f32; 8];
+        let b = [1.0f32; 4];
+        let _ = dot_product_simd(&a, &b);
+    }
+
+    #[test]
+    #[should_panic(expected = "vector lengths must match")]
+    fn test_euclidean_distance_squared_simd_panics_on_mismatched_lengths() {
+        let a = [1.0f32; 8];
+        let b = [1.0f32; 4];
+        let _ = euclidean_distance_squared_simd(&a, &b);
+    }
+
+    #[test]
+    #[should_panic(expected = "vector lengths must match")]
+    fn test_cosine_distance_simd_panics_on_mismatched_lengths() {
+        let a = [1.0f32; 8];
+        let b = [1.0f32; 4];
+        let _ = cosine_distance_simd(&a, &b);
+    }
+
+    #[test]
+    #[should_panic(expected = "vector lengths must match")]
+    fn test_manhattan_distance_simd_panics_on_mismatched_lengths() {
+        let a = [1.0f32; 8];
+        let b = [1.0f32; 4];
+        let _ = manhattan_distance_simd(&a, &b);
     }
 }
