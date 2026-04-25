@@ -1416,7 +1416,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "grafeo"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "grafeo-adapters",
  "grafeo-common",
@@ -1428,7 +1428,7 @@ dependencies = [
 
 [[package]]
 name = "grafeo-adapters"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "bincode",
  "grafeo-common",
@@ -1446,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "grafeo-bindings-common"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "grafeo-common",
  "grafeo-engine",
@@ -1455,7 +1455,7 @@ dependencies = [
 
 [[package]]
 name = "grafeo-c"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "grafeo-bindings-common",
  "grafeo-common",
@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "grafeo-cli"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "anyhow",
  "clap",
@@ -1488,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "grafeo-common"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "aes-gcm",
  "arcstr",
@@ -1515,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "grafeo-core"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "arc-swap",
  "arcstr",
@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "grafeo-engine"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "arcstr",
  "arrow-array",
@@ -1586,14 +1586,14 @@ dependencies = [
 
 [[package]]
 name = "grafeo-examples"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "grafeo",
 ]
 
 [[package]]
 name = "grafeo-node"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "grafeo-adapters",
  "grafeo-bindings-common",
@@ -1611,7 +1611,7 @@ dependencies = [
 
 [[package]]
 name = "grafeo-python"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "grafeo-adapters",
  "grafeo-bindings-common",
@@ -1628,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "grafeo-spec-tests"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "grafeo-common",
  "grafeo-engine",
@@ -1638,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "grafeo-storage"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "bincode",
  "byteorder",
@@ -1660,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "grafeo-wasm"
-version = "0.5.41"
+version = "0.5.42"
 dependencies = [
  "console_error_panic_hook",
  "getrandom 0.4.2",
