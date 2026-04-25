@@ -260,37 +260,40 @@ mod merge_action_self_reference {
     }
 
     #[test]
-    fn on_create_self_reference_resolves_against_merged_node_when_variable_is_pre_bound() {
+    fn on_create_property_access_resolves_against_merged_node_when_variable_is_pre_bound() {
         // Regression for the planner duplicate-column resolution bug:
         // when MERGE re-uses a variable already bound by an upstream
         // MATCH, the action-scope columns vector contains that variable
-        // twice (the bound copy AND the appended merge column). Variable
-        // references in ON CREATE / ON MATCH expressions must resolve to
-        // the appended (output) column whose chunk slot the operator
-        // populates with the freshly merged node id; the older bound
-        // column may still hold a different (pre-merge) node and cause
-        // expressions like coalesce(n.x, ...) to read stale data.
+        // twice (the bound copy AND the appended merge column). A direct
+        // property access like `n.x` lowers via the simple-path
+        // PropertySource::PropertyAccess and used to resolve to the
+        // FIRST occurrence of the variable, i.e. the pre-bound (stale)
+        // column. The fix makes the simple path resolve to the LAST
+        // occurrence (the appended column whose chunk slot the operator
+        // populates with the freshly merged node id), so the expression
+        // sees the merged entity, not the upstream binding.
         let db = db();
         let s = db.session();
-        // Pre-existing :Old node carries x=99. The MERGE below cannot
-        // attach to it because the pattern requires a :Tag label.
+        // Pre-existing :Old node carries x=99. MERGE below creates a new
+        // :Tag node (no existing match), so the bound `n` and the merged
+        // `n` reference different nodes.
         s.execute("INSERT (:Old {x: 99})").unwrap();
         s.execute(
             "MATCH (n:Old) \
              MERGE (n:Tag {val: 1}) \
-             ON CREATE SET n.copy_x = coalesce(n.x, -1)",
+             ON CREATE SET n.copy_x = n.x",
         )
         .unwrap();
-        // The newly-created Tag node had no `x`, so the expression must
-        // see NULL there and fall back to -1. If resolution picks the
-        // pre-bound :Old column instead, the value would be 99.
-        let r = s
-            .execute("MATCH (t:Tag {val: 1}) RETURN t.copy_x")
-            .unwrap();
+        // The freshly-created Tag node has no `x`, so reading `n.x`
+        // against it must yield NULL (which the SET would persist as a
+        // null/absent property). Pre-fix planner resolved `n.x` to the
+        // pre-bound :Old column and stamped the new Tag with 99.
+        let r = s.execute("MATCH (t:Tag {val: 1}) RETURN t.copy_x").unwrap();
         assert_eq!(
             r.rows()[0][0],
-            Value::Int64(-1),
-            "ON CREATE expression must read the merged Tag node, not the pre-bound :Old node"
+            Value::Null,
+            "ON CREATE direct property access must read the merged Tag node \
+             (no `x`), not the pre-bound :Old node (`x=99`)"
         );
     }
 

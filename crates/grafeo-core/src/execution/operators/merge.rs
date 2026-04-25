@@ -764,7 +764,8 @@ impl MergeRelationshipOperator {
         resolved_match_props: &[(String, Value)],
         resolved_create_props: &[(String, Value)],
     ) -> Result<EdgeId, super::OperatorError> {
-        let all_props = MergeOperator::merge_node_props(resolved_match_props, resolved_create_props);
+        let all_props =
+            MergeOperator::merge_node_props(resolved_match_props, resolved_create_props);
 
         // Validate constraints before creating the edge
         if let Some(ref validator) = self.validator {
@@ -826,7 +827,8 @@ impl MergeRelationshipOperator {
         for (name, value) in resolved_create_props {
             validator.validate_edge_property(&self.config.edge_type, name, value)?;
         }
-        let all_props = MergeOperator::merge_node_props(resolved_match_props, resolved_create_props);
+        let all_props =
+            MergeOperator::merge_node_props(resolved_match_props, resolved_create_props);
         validator.validate_edge_complete(&self.config.edge_type, &all_props)?;
         Ok(())
     }
@@ -909,18 +911,14 @@ impl Operator for MergeRelationshipOperator {
                     // `validate_on_create_edge_phase_two` so an ON CREATE
                     // property is allowed to satisfy a NOT NULL constraint
                     // that match properties alone would fail.
-                    let new_id =
-                        self.create_edge_phase_one(src_val, dst_val, &resolved_match)?;
+                    let new_id = self.create_edge_phase_one(src_val, dst_val, &resolved_match)?;
                     let resolved_on_create = self.resolve_action_properties(
                         &self.config.on_create_properties,
                         &chunk,
                         row,
                         new_id,
                     )?;
-                    self.validate_on_create_edge_phase_two(
-                        &resolved_match,
-                        &resolved_on_create,
-                    )?;
+                    self.validate_on_create_edge_phase_two(&resolved_match, &resolved_on_create)?;
                     self.apply_on_match_edge(new_id, &resolved_on_create)?;
                     new_id
                 } else {
@@ -1684,9 +1682,9 @@ mod tests {
             required_property: "x",
         }));
 
-        merge_rel
-            .next()
-            .expect("MERGE relationship must succeed because ON CREATE supplies the required property");
+        merge_rel.next().expect(
+            "MERGE relationship must succeed because ON CREATE supplies the required property",
+        );
 
         // Confirm the edge was created with `x` set to the expression value.
         use crate::graph::Direction;
