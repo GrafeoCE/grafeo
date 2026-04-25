@@ -1151,6 +1151,11 @@ impl super::Planner {
             return Ok(PropertySource::Constant(value));
         }
         let filter_expr = self.convert_expression(expr)?;
+        // When the merge variable is already bound from input, it appears
+        // twice in `action_scope_columns`. Collecting via `HashMap::insert`
+        // keeps the LAST occurrence, which is the appended column matching
+        // the operator's augmented row position. Do not switch to a
+        // first-wins collector here.
         let variable_columns: HashMap<String, usize> = action_scope_columns
             .iter()
             .enumerate()
@@ -1163,6 +1168,17 @@ impl super::Planner {
     }
 
     /// Converts a logical expression to a PropertySource.
+    ///
+    /// Variable resolution uses `rposition` rather than `position` so that
+    /// when `columns` legitimately contains a duplicated variable name,
+    /// references resolve to the most recently added (innermost / latest)
+    /// column. The MERGE planner relies on this for ON CREATE / ON MATCH
+    /// expressions whose action scope appends the merge variable on top of
+    /// an input that may already bind it: the appended column is the one
+    /// the operator's augmented row populates with the merged node/edge id,
+    /// and resolving to the earlier bound copy would read the pre-merge
+    /// (potentially stale) value instead. For unique columns the two are
+    /// equivalent.
     pub(super) fn expression_to_property_source(
         &self,
         expr: &LogicalExpression,
@@ -1171,13 +1187,13 @@ impl super::Planner {
         match expr {
             LogicalExpression::Literal(value) => Ok(PropertySource::Constant(value.clone())),
             LogicalExpression::Variable(name) => {
-                let col_idx = columns.iter().position(|c| c == name).ok_or_else(|| {
+                let col_idx = columns.iter().rposition(|c| c == name).ok_or_else(|| {
                     Error::Internal(format!("Variable '{}' not found for property source", name))
                 })?;
                 Ok(PropertySource::Column(col_idx))
             }
             LogicalExpression::Property { variable, property } => {
-                let col_idx = columns.iter().position(|c| c == variable).ok_or_else(|| {
+                let col_idx = columns.iter().rposition(|c| c == variable).ok_or_else(|| {
                     Error::Internal(format!(
                         "Variable '{}' not found for property access '{}.{}'",
                         variable, variable, property
