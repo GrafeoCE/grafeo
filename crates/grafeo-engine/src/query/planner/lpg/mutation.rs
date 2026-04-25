@@ -451,7 +451,7 @@ impl super::Planner {
             (Some(op), cols)
         };
 
-        // Convert match properties to PropertySource (supports both constants and variables)
+        // Match properties cannot reference the MERGE variable (ISO §15.5).
         let match_properties: Vec<(String, PropertySource)> = merge
             .match_properties
             .iter()
@@ -459,7 +459,6 @@ impl super::Planner {
                 let source = self
                     .expression_to_property_source(expr, &columns)
                     .unwrap_or_else(|_| {
-                        // Fallback: try constant folding for complex expressions
                         Self::try_fold_expression(expr).map_or(
                             PropertySource::Constant(Value::Null),
                             PropertySource::Constant,
@@ -469,39 +468,29 @@ impl super::Planner {
             })
             .collect();
 
-        // Convert ON CREATE properties
+        // ON CREATE / ON MATCH expressions are evaluated against an augmented row
+        // that includes the merged node. Build the action-scope columns now so
+        // `coalesce(n.x, 0)` and similar expressions can resolve `n`.
+        let mut action_scope_columns = columns.clone();
+        action_scope_columns.push(merge.variable.clone());
+
         let on_create_properties: Vec<(String, PropertySource)> = merge
             .on_create
             .iter()
             .map(|(name, expr)| {
-                let source = self
-                    .expression_to_property_source(expr, &columns)
-                    .unwrap_or_else(|_| {
-                        Self::try_fold_expression(expr).map_or(
-                            PropertySource::Constant(Value::Null),
-                            PropertySource::Constant,
-                        )
-                    });
-                (name.clone(), source)
+                let source = self.merge_action_property_source(expr, &action_scope_columns)?;
+                Ok::<_, Error>((name.clone(), source))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        // Convert ON MATCH properties
         let on_match_properties: Vec<(String, PropertySource)> = merge
             .on_match
             .iter()
             .map(|(name, expr)| {
-                let source = self
-                    .expression_to_property_source(expr, &columns)
-                    .unwrap_or_else(|_| {
-                        Self::try_fold_expression(expr).map_or(
-                            PropertySource::Constant(Value::Null),
-                            PropertySource::Constant,
-                        )
-                    });
-                (name.clone(), source)
+                let source = self.merge_action_property_source(expr, &action_scope_columns)?;
+                Ok::<_, Error>((name.clone(), source))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         // Detect if the merge variable is already bound from the input.
         // If so, record its column index for NULL-reference checking at runtime.
@@ -531,7 +520,9 @@ impl super::Planner {
                 bound_variable_column,
             },
         )
-        .with_transaction_context(self.viewing_epoch, self.transaction_id);
+        .with_transaction_context(self.viewing_epoch, self.transaction_id)
+        .with_search_store(Arc::clone(&self.store))
+        .with_session_context(self.session_context.clone());
 
         if let Some(ref validator) = self.validator {
             merge_op = merge_op.with_validator(Arc::clone(validator));
