@@ -127,6 +127,10 @@ impl MergeOperator {
     }
 
     /// Resolves property sources to concrete values for a given row.
+    ///
+    /// Skips [`PropertySource::Expression`] sources: those need an augmented
+    /// row containing the merged node/edge and are evaluated separately by
+    /// [`Self::resolve_action_properties`].
     fn resolve_properties(
         props: &[(String, PropertySource)],
         chunk: Option<&DataChunk>,
@@ -148,6 +152,102 @@ impl MergeOperator {
                 (name.clone(), value)
             })
             .collect()
+    }
+
+    /// True when at least one property source in the slice requires the
+    /// augmented-row evaluation path.
+    fn has_expression_source(props: &[(String, PropertySource)]) -> bool {
+        props
+            .iter()
+            .any(|(_, src)| matches!(src, PropertySource::Expression { .. }))
+    }
+
+    /// Builds a one-row chunk containing the input row plus the merged node
+    /// in the column reserved for the MERGE variable.
+    ///
+    /// Used to evaluate `PropertySource::Expression` sources for ON CREATE /
+    /// ON MATCH SET. The augmented chunk's schema matches `output_schema`.
+    fn build_augmented_node_chunk(
+        &self,
+        chunk: Option<&DataChunk>,
+        row: usize,
+        merged_node: NodeId,
+    ) -> DataChunk {
+        let mut builder =
+            DataChunkBuilder::with_capacity(&self.config.output_schema, 1);
+        if let Some(input) = chunk {
+            for col_idx in 0..input.column_count() {
+                let val = input
+                    .column(col_idx)
+                    .and_then(|c| c.get_value(row))
+                    .unwrap_or(Value::Null);
+                if let Some(dst) = builder.column_mut(col_idx) {
+                    dst.push_value(val);
+                }
+            }
+        }
+        if let Some(dst) = builder.column_mut(self.config.output_column) {
+            dst.push_node_id(merged_node);
+        }
+        builder.advance_row();
+        builder.finish()
+    }
+
+    /// Resolves an action-property source list (ON CREATE or ON MATCH) given
+    /// the merged node id. Lazily builds the augmented chunk only if at least
+    /// one source needs it.
+    ///
+    /// Returns an error only when an expression source is present but no
+    /// search store was attached, which would be a planner/wiring bug.
+    fn resolve_action_properties(
+        &self,
+        props: &[(String, PropertySource)],
+        chunk: Option<&DataChunk>,
+        row: usize,
+        merged_node: NodeId,
+    ) -> Result<Vec<(String, Value)>, super::OperatorError> {
+        if !Self::has_expression_source(props) {
+            // Fast path: no runtime expressions, fall through to the existing
+            // resolver which understands Column/Constant/PropertyAccess.
+            return Ok(Self::resolve_properties(
+                props,
+                chunk,
+                row,
+                self.store.as_ref(),
+            ));
+        }
+
+        let augmented = self.build_augmented_node_chunk(chunk, row, merged_node);
+        let mut out = Vec::with_capacity(props.len());
+        for (name, source) in props {
+            let value = match source {
+                PropertySource::Expression {
+                    expr,
+                    variable_columns,
+                } => {
+                    let search_store = self.search_store.as_ref().ok_or_else(|| {
+                        super::OperatorError::Execution(
+                            "MERGE expression source requires search store; planner did not attach one"
+                                .to_string(),
+                        )
+                    })?;
+                    let mut predicate = ExpressionPredicate::new(
+                        (**expr).clone(),
+                        variable_columns.clone(),
+                        Arc::clone(search_store),
+                    )
+                    .with_session_context(self.session_context.clone());
+                    if let Some(epoch) = self.viewing_epoch {
+                        predicate =
+                            predicate.with_transaction_context(epoch, self.transaction_id);
+                    }
+                    predicate.eval_at(&augmented, 0).unwrap_or(Value::Null)
+                }
+                _ => source.resolve(&augmented, 0, self.store.as_ref()),
+            };
+            out.push((name.clone(), value));
+        }
+        Ok(out)
     }
 
     /// Tries to find a matching node with the given resolved properties.
@@ -243,15 +343,38 @@ impl MergeOperator {
         row: usize,
     ) -> Result<NodeId, super::OperatorError> {
         let store_ref: &dyn GraphStore = self.store.as_ref();
+        // Match properties cannot reference the MERGE variable (ISO §15.5),
+        // so they resolve against the input chunk directly.
         let resolved_match =
             Self::resolve_properties(&self.config.match_properties, chunk, row, store_ref);
 
         if let Some(existing_id) = self.find_matching_node(&resolved_match) {
-            let resolved_on_match =
-                Self::resolve_properties(&self.config.on_match_properties, chunk, row, store_ref);
+            // Resolve ON MATCH SET against an augmented row containing the
+            // matched node id, so `coalesce(n.x, 0)` can read the live value.
+            let resolved_on_match = self.resolve_action_properties(
+                &self.config.on_match_properties,
+                chunk,
+                row,
+                existing_id,
+            )?;
             self.apply_on_match(existing_id, &resolved_on_match)?;
             Ok(existing_id)
+        } else if Self::has_expression_source(&self.config.on_create_properties) {
+            // Two-phase create: build the node from match properties first so
+            // the new id exists, then evaluate ON CREATE against an augmented
+            // row referencing it, then write those properties via the same
+            // path used for ON MATCH SET.
+            let new_id = self.create_node(&resolved_match, &[])?;
+            let resolved_on_create = self.resolve_action_properties(
+                &self.config.on_create_properties,
+                chunk,
+                row,
+                new_id,
+            )?;
+            self.apply_on_match(new_id, &resolved_on_create)?;
+            Ok(new_id)
         } else {
+            // Fast path: no runtime expressions; create with all properties at once.
             let resolved_on_create =
                 Self::resolve_properties(&self.config.on_create_properties, chunk, row, store_ref);
             self.create_node(&resolved_match, &resolved_on_create)
