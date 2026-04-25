@@ -1124,6 +1124,135 @@ mod tests {
         );
     }
 
+    // GrafeoDB/grafeo#317. Operator-level test: a `PropertySource::Expression`
+    // for ON CREATE / ON MATCH SET must evaluate against an augmented row that
+    // contains the merged node, not against the (potentially absent) input row.
+
+    #[test]
+    fn test_merge_on_match_resolves_expression_against_merged_node() {
+        use super::super::filter::FilterExpression;
+        use crate::graph::lpg::LpgStore;
+        use std::collections::HashMap;
+
+        let lpg = Arc::new(LpgStore::new().unwrap());
+        let store: Arc<dyn GraphStoreMut> = Arc::clone(&lpg) as Arc<dyn GraphStoreMut>;
+        let search: Arc<dyn GraphStoreSearch> =
+            Arc::clone(&lpg) as Arc<dyn GraphStoreSearch>;
+
+        // Pre-create the matching node so the MERGE goes into the ON MATCH branch.
+        let id = store.create_node_with_props(
+            &["Item"],
+            &[
+                (PropertyKey::new("val"), Value::Int64(1)),
+                (PropertyKey::new("x"), Value::Int64(7)),
+            ],
+        );
+
+        // ON MATCH SET n.x = n.x + 5
+        let expr = FilterExpression::Binary {
+            left: Box::new(FilterExpression::Property {
+                variable: "n".to_string(),
+                property: "x".to_string(),
+            }),
+            op: super::super::filter::BinaryFilterOp::Add,
+            right: Box::new(FilterExpression::Literal(Value::Int64(5))),
+        };
+        let mut variable_columns = HashMap::new();
+        // Standalone MERGE: input is None, so the augmented row only has the
+        // MERGE variable column at index 0.
+        variable_columns.insert("n".to_string(), 0_usize);
+
+        let mut merge = MergeOperator::new(
+            Arc::clone(&store),
+            None,
+            MergeConfig {
+                variable: "n".to_string(),
+                labels: vec!["Item".to_string()],
+                match_properties: const_props(vec![("val", Value::Int64(1))]),
+                on_create_properties: vec![],
+                on_match_properties: vec![(
+                    "x".to_string(),
+                    PropertySource::Expression {
+                        expr: Box::new(expr),
+                        variable_columns,
+                    },
+                )],
+                output_schema: vec![LogicalType::Node],
+                output_column: 0,
+                bound_variable_column: None,
+            },
+        )
+        .with_search_store(Arc::clone(&search));
+
+        merge.next().unwrap();
+
+        let node = store.get_node(id).unwrap();
+        assert_eq!(
+            node.properties.get(&PropertyKey::new("x")),
+            Some(&Value::Int64(12)),
+            "ON MATCH expression must read the merged node, not NULL"
+        );
+    }
+
+    #[test]
+    fn test_merge_on_create_resolves_expression_against_new_node() {
+        // ON CREATE coalesce(n.x, 99) must see the freshly-created node and
+        // fall back to 99 because `x` is not yet set on it.
+        use super::super::filter::FilterExpression;
+        use crate::graph::lpg::LpgStore;
+        use std::collections::HashMap;
+
+        let lpg = Arc::new(LpgStore::new().unwrap());
+        let store: Arc<dyn GraphStoreMut> = Arc::clone(&lpg) as Arc<dyn GraphStoreMut>;
+        let search: Arc<dyn GraphStoreSearch> =
+            Arc::clone(&lpg) as Arc<dyn GraphStoreSearch>;
+
+        let coalesce = FilterExpression::FunctionCall {
+            name: "coalesce".to_string(),
+            args: vec![
+                FilterExpression::Property {
+                    variable: "n".to_string(),
+                    property: "x".to_string(),
+                },
+                FilterExpression::Literal(Value::Int64(99)),
+            ],
+        };
+        let mut variable_columns = HashMap::new();
+        variable_columns.insert("n".to_string(), 0_usize);
+
+        let mut merge = MergeOperator::new(
+            Arc::clone(&store),
+            None,
+            MergeConfig {
+                variable: "n".to_string(),
+                labels: vec!["Item".to_string()],
+                match_properties: const_props(vec![("val", Value::Int64(1))]),
+                on_create_properties: vec![(
+                    "x".to_string(),
+                    PropertySource::Expression {
+                        expr: Box::new(coalesce),
+                        variable_columns,
+                    },
+                )],
+                on_match_properties: vec![],
+                output_schema: vec![LogicalType::Node],
+                output_column: 0,
+                bound_variable_column: None,
+            },
+        )
+        .with_search_store(Arc::clone(&search));
+
+        merge.next().unwrap();
+
+        let nodes = store.nodes_by_label("Item");
+        assert_eq!(nodes.len(), 1);
+        let node = store.get_node(nodes[0]).unwrap();
+        assert_eq!(
+            node.properties.get(&PropertyKey::new("x")),
+            Some(&Value::Int64(99))
+        );
+    }
+
     #[test]
     fn test_merge_into_any() {
         let store: Arc<dyn GraphStoreMut> = Arc::new(LpgStore::new().unwrap());
