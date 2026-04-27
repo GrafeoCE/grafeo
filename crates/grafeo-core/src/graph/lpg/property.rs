@@ -557,8 +557,15 @@ impl<Id: EntityId> PropertyStorage<Id> {
     /// Returns the per-block zone maps for a property column, if any.
     ///
     /// Returns `None` when the column doesn't exist; returns `Some(empty)`
-    /// when the column exists but is uncompressed (Phase 4 will treat
-    /// "no per-block stats" as "fall back to the column-level zone map").
+    /// when the column exists but is uncompressed (the hot buffer is
+    /// unordered, so per-block pruning is meaningless there). Phase 4 will
+    /// treat "no per-block stats" as "fall back to the column-level zone
+    /// map".
+    ///
+    /// **Temporal mode:** always returns `Some(empty)` for any existing
+    /// column. Compression is disabled for `VersionLog`-backed columns,
+    /// so there is no sorted compressed array to chunk into blocks. Use
+    /// the column-level [`zone_map`](Self::zone_map) instead.
     #[must_use]
     pub fn block_zone_maps_for(&self, key: &PropertyKey) -> Option<Vec<ZoneMapEntry>> {
         let columns = self.columns.read();
@@ -1741,6 +1748,14 @@ fn compute_block_zone_maps(values: impl IntoIterator<Item = Value>) -> Vec<ZoneM
             continue;
         }
 
+        // Reflexive-comparison guard: only seed/update min/max with values
+        // that have a defined ordering against themselves. This filters out
+        // `Float64(NaN)` (and any future variant whose `compare_values` arm
+        // returns `None`) so a NaN can never poison the running min/max.
+        if compare_values(&value, &value) != Some(Ordering::Equal) {
+            continue;
+        }
+
         let is_less_than_min = match &current.min {
             None => true,
             Some(existing) => compare_values(&value, existing) == Some(Ordering::Less),
@@ -2275,5 +2290,39 @@ mod tests {
                 .block_zone_maps_for(&PropertyKey::new("missing"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_compute_block_zone_maps_float64_finite_min_max() {
+        // Direct test of the helper: Float64 isn't dispatched by compress_as_*
+        // today, but the helper must handle Float64 correctly so a future
+        // compression path can feed Float64 streams without a behavior change.
+        let values: Vec<Value> = (0u32..2500)
+            .map(|i| Value::Float64(f64::from(i) * 0.5))
+            .collect();
+        let blocks = compute_block_zone_maps(values);
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].row_count, 1024);
+        assert_eq!(blocks[0].min, Some(Value::Float64(0.0)));
+        assert_eq!(blocks[0].max, Some(Value::Float64(1023.0 * 0.5)));
+        assert_eq!(blocks[1].min, Some(Value::Float64(1024.0 * 0.5)));
+    }
+
+    #[test]
+    fn test_compute_block_zone_maps_float64_nan_does_not_poison() {
+        // NaN must never seed or displace min/max: comparisons against NaN
+        // return None, which would otherwise leave min/max permanently
+        // unrecoverable. Reflexive-comparison guard catches this.
+        let mut values: Vec<Value> = vec![Value::Float64(f64::NAN)];
+        values.extend((0u32..50).map(|i| Value::Float64(f64::from(i))));
+        values.push(Value::Float64(f64::NAN));
+
+        let blocks = compute_block_zone_maps(values);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].row_count, 52, "NaN values still count as rows");
+        assert_eq!(blocks[0].null_count, 0, "NaN is not null");
+        assert_eq!(blocks[0].min, Some(Value::Float64(0.0)));
+        assert_eq!(blocks[0].max, Some(Value::Float64(49.0)));
     }
 }

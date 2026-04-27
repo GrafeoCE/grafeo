@@ -333,6 +333,11 @@ impl LpgStore {
     /// when the column exists but is uncompressed (the hot buffer has no
     /// row order, so per-block pruning is meaningless there). Phase 4
     /// consumes these for lazy `range_iter`-style scans.
+    ///
+    /// **Temporal mode:** always returns `Some(empty)` for any existing
+    /// column. Compression is disabled for `VersionLog`-backed columns,
+    /// so the per-block array is never populated. Use the column-level
+    /// [`node_property_zone_map`](Self::node_property_zone_map) instead.
     #[must_use]
     pub fn node_property_block_zone_maps(
         &self,
@@ -342,6 +347,8 @@ impl LpgStore {
     }
 
     /// Gets the per-block zone maps for an edge property.
+    ///
+    /// **Temporal mode:** see [`node_property_block_zone_maps`](Self::node_property_block_zone_maps).
     #[must_use]
     pub fn edge_property_block_zone_maps(
         &self,
