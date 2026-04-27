@@ -608,23 +608,53 @@ impl ColumnCodec {
     /// (the section format's hard limit), so this is unreachable for
     /// any column built through the public APIs.
     pub fn write_to_v2(&self, buf: &mut Vec<u8>) {
+        let (metas, bodies) = self.emit_blocked_codec(buf);
+        write_block_index_and_bodies(buf, &metas, &bodies);
+    }
+
+    /// Serializes this codec to v3 format: like v2, but each block index
+    /// entry is followed by an inline per-block `ZoneMap` for skip
+    /// pruning.
+    ///
+    /// `stats_hint` may pass pre-computed per-block stats from
+    /// `NodeTable::block_zone_maps_for`; when `None` (or wrong shape),
+    /// per-block stats are computed inline during write.
+    ///
+    /// # Panics
+    ///
+    /// Same conditions as [`write_to_v2`](Self::write_to_v2).
+    pub fn write_to_v3(&self, buf: &mut Vec<u8>, stats_hint: Option<&[super::zone_map::ZoneMap]>) {
+        let (metas, bodies) = self.emit_blocked_codec(buf);
+        let computed;
+        let stats: &[super::zone_map::ZoneMap] = match stats_hint {
+            Some(hint) if hint.len() == metas.len() => hint,
+            _ => {
+                computed = super::zone_map::compute_block_zone_maps(self);
+                &computed
+            }
+        };
+        write_block_index_and_bodies_with_stats(buf, &metas, &bodies, stats);
+    }
+
+    /// Pushes the discriminant + global params for this codec into
+    /// `buf`, then collects per-block bodies and metadata. Shared by
+    /// `write_to_v2` and `write_to_v3`.
+    fn emit_blocked_codec(&self, buf: &mut Vec<u8>) -> (Vec<BlockMeta>, Vec<u8>) {
+        let block_count = self.block_count();
+        let block_rows = crate::codec::DEFAULT_BLOCK_ROWS as usize;
+        let mut bodies: Vec<u8> = Vec::new();
+        let mut metas: Vec<BlockMeta> = Vec::with_capacity(block_count);
+
         match self {
             Self::BitPacked(bp) => {
                 buf.push(0);
                 buf.push(bp.bits_per_value());
                 let bits_per_value = bp.bits_per_value();
-                let block_count = self.block_count();
-                let mut bodies: Vec<u8> = Vec::new();
-                let mut metas: Vec<BlockMeta> = Vec::with_capacity(block_count);
-                let block_rows = crate::codec::DEFAULT_BLOCK_ROWS as usize;
                 for i in 0..block_count {
                     let start = i * block_rows;
                     let end = (start + block_rows).min(bp.len());
-                    // reason: block sizes fit in u32 by DEFAULT_BLOCK_ROWS.
                     #[allow(clippy::cast_possible_truncation)]
                     let row_count = (end - start) as u32;
-                    // reason: bodies length grows in step with block packing; bounded by
-                    // total column size which is documented to fit u32.
                     #[allow(clippy::cast_possible_truncation)]
                     let byte_offset = bodies.len() as u32;
                     let row_values: Vec<u64> = (start..end)
@@ -636,7 +666,6 @@ impl ColumnCodec {
                     for &word in block_packed.data() {
                         bodies.extend_from_slice(&word.to_le_bytes());
                     }
-                    // reason: same as above
                     #[allow(clippy::cast_possible_truncation)]
                     let byte_len = (bodies.len() as u32) - byte_offset;
                     metas.push(BlockMeta {
@@ -645,11 +674,9 @@ impl ColumnCodec {
                         row_count,
                     });
                 }
-                write_block_index_and_bodies(buf, &metas, &bodies);
             }
             Self::Dict(dict) => {
                 buf.push(1);
-                // Global dictionary (shared across blocks).
                 let entries = dict.dictionary();
                 write_usize_as_u32(buf, entries.len());
                 for entry in entries.iter() {
@@ -658,14 +685,9 @@ impl ColumnCodec {
                     buf.extend_from_slice(s);
                 }
                 let codes = dict.codes();
-                let block_count = self.block_count();
-                let mut bodies: Vec<u8> = Vec::new();
-                let mut metas: Vec<BlockMeta> = Vec::with_capacity(block_count);
-                let block_rows = crate::codec::DEFAULT_BLOCK_ROWS as usize;
                 for i in 0..block_count {
                     let start = i * block_rows;
                     let end = (start + block_rows).min(codes.len());
-                    // reason: same row-count bound as BitPacked
                     #[allow(clippy::cast_possible_truncation)]
                     let row_count = (end - start) as u32;
                     #[allow(clippy::cast_possible_truncation)]
@@ -681,14 +703,9 @@ impl ColumnCodec {
                         row_count,
                     });
                 }
-                write_block_index_and_bodies(buf, &metas, &bodies);
             }
             Self::Bitmap(bv) => {
                 buf.push(2);
-                let block_count = self.block_count();
-                let mut bodies: Vec<u8> = Vec::new();
-                let mut metas: Vec<BlockMeta> = Vec::with_capacity(block_count);
-                let block_rows = crate::codec::DEFAULT_BLOCK_ROWS as usize;
                 for i in 0..block_count {
                     let start = i * block_rows;
                     let end = (start + block_rows).min(bv.len());
@@ -712,17 +729,12 @@ impl ColumnCodec {
                         row_count,
                     });
                 }
-                write_block_index_and_bodies(buf, &metas, &bodies);
             }
             Self::Int8Vector { data, dimensions } => {
                 buf.push(3);
                 buf.extend_from_slice(&dimensions.to_le_bytes());
                 let dims = *dimensions as usize;
                 let row_count_total = data.len().checked_div(dims).unwrap_or(0);
-                let block_count = self.block_count();
-                let mut bodies: Vec<u8> = Vec::new();
-                let mut metas: Vec<BlockMeta> = Vec::with_capacity(block_count);
-                let block_rows = crate::codec::DEFAULT_BLOCK_ROWS as usize;
                 for i in 0..block_count {
                     let start_row = i * block_rows;
                     let end_row = (start_row + block_rows).min(row_count_total);
@@ -745,14 +757,9 @@ impl ColumnCodec {
                         row_count,
                     });
                 }
-                write_block_index_and_bodies(buf, &metas, &bodies);
             }
             Self::Float64(vec) => {
                 buf.push(4);
-                let block_count = self.block_count();
-                let mut bodies: Vec<u8> = Vec::new();
-                let mut metas: Vec<BlockMeta> = Vec::with_capacity(block_count);
-                let block_rows = crate::codec::DEFAULT_BLOCK_ROWS as usize;
                 for i in 0..block_count {
                     let start = i * block_rows;
                     let end = (start + block_rows).min(vec.len());
@@ -771,17 +778,12 @@ impl ColumnCodec {
                         row_count,
                     });
                 }
-                write_block_index_and_bodies(buf, &metas, &bodies);
             }
             Self::Float32Vector { data, dimensions } => {
                 buf.push(5);
                 buf.extend_from_slice(&dimensions.to_le_bytes());
                 let dims = *dimensions as usize;
                 let row_count_total = data.len().checked_div(dims).unwrap_or(0);
-                let block_count = self.block_count();
-                let mut bodies: Vec<u8> = Vec::new();
-                let mut metas: Vec<BlockMeta> = Vec::with_capacity(block_count);
-                let block_rows = crate::codec::DEFAULT_BLOCK_ROWS as usize;
                 for i in 0..block_count {
                     let start_row = i * block_rows;
                     let end_row = (start_row + block_rows).min(row_count_total);
@@ -804,14 +806,9 @@ impl ColumnCodec {
                         row_count,
                     });
                 }
-                write_block_index_and_bodies(buf, &metas, &bodies);
             }
             Self::RawI64(vec) => {
                 buf.push(6);
-                let block_count = self.block_count();
-                let mut bodies: Vec<u8> = Vec::new();
-                let mut metas: Vec<BlockMeta> = Vec::with_capacity(block_count);
-                let block_rows = crate::codec::DEFAULT_BLOCK_ROWS as usize;
                 for i in 0..block_count {
                     let start = i * block_rows;
                     let end = (start + block_rows).min(vec.len());
@@ -830,9 +827,10 @@ impl ColumnCodec {
                         row_count,
                     });
                 }
-                write_block_index_and_bodies(buf, &metas, &bodies);
             }
         }
+
+        (metas, bodies)
     }
 
     /// Deserializes a codec from v2 format.
@@ -1013,6 +1011,196 @@ impl ColumnCodec {
         }
     }
 
+    /// Deserializes a codec from v3 format, returning the codec and
+    /// per-block zone maps for skip pruning.
+    ///
+    /// The body of each block uses the same layout as v2; only the
+    /// block index is extended with an inline `ZoneMap` per entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static-string error on truncation, unknown
+    /// discriminant, or block-index inconsistency.
+    pub fn read_from_v3(
+        data: &[u8],
+        pos: &mut usize,
+    ) -> Result<(Self, Vec<super::zone_map::ZoneMap>), &'static str> {
+        let discriminant = *data.get(*pos).ok_or("truncated codec discriminant")?;
+        *pos += 1;
+        match discriminant {
+            0 => {
+                let bits = *data.get(*pos).ok_or("truncated bits_per_value")?;
+                *pos += 1;
+                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
+                let mut all_values: Vec<u64> = Vec::new();
+                for meta in &metas {
+                    let body_start = bodies_start + meta.byte_offset as usize;
+                    let body_end = body_start + meta.byte_len as usize;
+                    if body_end > data.len() {
+                        return Err("BitPacked block body out of bounds");
+                    }
+                    let mut bp = body_start;
+                    let word_count = read_u32_le(data, &mut bp)? as usize;
+                    let mut words = Vec::with_capacity(word_count);
+                    for _ in 0..word_count {
+                        words.push(read_u64_le(data, &mut bp)?);
+                    }
+                    let block_bp = crate::codec::BitPackedInts::from_raw_parts(
+                        words,
+                        bits,
+                        meta.row_count as usize,
+                    );
+                    for j in 0..meta.row_count as usize {
+                        all_values.push(
+                            block_bp
+                                .get(j)
+                                .ok_or("BitPacked block index out of range")?,
+                        );
+                    }
+                }
+                *pos = bodies_start + total_bodies_len(&metas);
+                Ok((
+                    Self::BitPacked(crate::codec::BitPackedInts::pack_with_bits(
+                        &all_values,
+                        bits,
+                    )),
+                    stats,
+                ))
+            }
+            1 => {
+                let dict_len = read_u32_le(data, pos)? as usize;
+                let mut entries: Vec<Arc<str>> = Vec::with_capacity(dict_len);
+                for _ in 0..dict_len {
+                    let slen = read_u32_le(data, pos)? as usize;
+                    if *pos + slen > data.len() {
+                        return Err("truncated dict string");
+                    }
+                    let s = std::str::from_utf8(&data[*pos..*pos + slen])
+                        .map_err(|_| "invalid UTF-8 in dict")?;
+                    entries.push(Arc::from(s));
+                    *pos += slen;
+                }
+                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
+                let mut codes: Vec<u32> = Vec::new();
+                for meta in &metas {
+                    let body_start = bodies_start + meta.byte_offset as usize;
+                    let mut bp = body_start;
+                    for _ in 0..meta.row_count {
+                        codes.push(read_u32_le(data, &mut bp)?);
+                    }
+                }
+                *pos = bodies_start + total_bodies_len(&metas);
+                Ok((
+                    Self::Dict(DictionaryEncoding::new(
+                        Arc::from(entries.into_boxed_slice()),
+                        codes,
+                    )),
+                    stats,
+                ))
+            }
+            2 => {
+                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
+                let mut all_bits: Vec<bool> = Vec::new();
+                for meta in &metas {
+                    let body_start = bodies_start + meta.byte_offset as usize;
+                    let mut bp = body_start;
+                    let word_count = read_u32_le(data, &mut bp)? as usize;
+                    let mut words = Vec::with_capacity(word_count);
+                    for _ in 0..word_count {
+                        words.push(read_u64_le(data, &mut bp)?);
+                    }
+                    let block_bv =
+                        crate::codec::BitVector::from_raw_parts(words, meta.row_count as usize);
+                    for j in 0..meta.row_count as usize {
+                        all_bits.push(block_bv.get(j).ok_or("Bitmap block index out of range")?);
+                    }
+                }
+                *pos = bodies_start + total_bodies_len(&metas);
+                Ok((
+                    Self::Bitmap(crate::codec::BitVector::from_bools(&all_bits)),
+                    stats,
+                ))
+            }
+            3 => {
+                let dimensions = read_u16_le(data, pos)?;
+                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
+                let dims = dimensions as usize;
+                let mut all_data: Vec<i8> = Vec::new();
+                for meta in &metas {
+                    let body_start = bodies_start + meta.byte_offset as usize;
+                    let body_end = body_start + meta.byte_len as usize;
+                    if body_end > data.len() {
+                        return Err("Int8Vector block body out of bounds");
+                    }
+                    let expected = (meta.row_count as usize) * dims;
+                    if (meta.byte_len as usize) != expected {
+                        return Err("Int8Vector block byte_len mismatch");
+                    }
+                    for &b in &data[body_start..body_end] {
+                        all_data.push(i8::from_le_bytes([b]));
+                    }
+                }
+                *pos = bodies_start + total_bodies_len(&metas);
+                Ok((
+                    Self::Int8Vector {
+                        data: all_data,
+                        dimensions,
+                    },
+                    stats,
+                ))
+            }
+            4 => {
+                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
+                let mut all_vals: Vec<f64> = Vec::new();
+                for meta in &metas {
+                    let body_start = bodies_start + meta.byte_offset as usize;
+                    let mut bp = body_start;
+                    for _ in 0..meta.row_count {
+                        all_vals.push(read_f64_le(data, &mut bp)?);
+                    }
+                }
+                *pos = bodies_start + total_bodies_len(&metas);
+                Ok((Self::Float64(all_vals), stats))
+            }
+            5 => {
+                let dimensions = read_u16_le(data, pos)?;
+                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
+                let dims = dimensions as usize;
+                let mut all_data: Vec<f32> = Vec::new();
+                for meta in &metas {
+                    let body_start = bodies_start + meta.byte_offset as usize;
+                    let mut bp = body_start;
+                    let elem_count = (meta.row_count as usize) * dims;
+                    for _ in 0..elem_count {
+                        all_data.push(read_f32_le(data, &mut bp)?);
+                    }
+                }
+                *pos = bodies_start + total_bodies_len(&metas);
+                Ok((
+                    Self::Float32Vector {
+                        data: all_data,
+                        dimensions,
+                    },
+                    stats,
+                ))
+            }
+            6 => {
+                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
+                let mut all_vals: Vec<i64> = Vec::new();
+                for meta in &metas {
+                    let body_start = bodies_start + meta.byte_offset as usize;
+                    let mut bp = body_start;
+                    for _ in 0..meta.row_count {
+                        all_vals.push(read_i64_le(data, &mut bp)?);
+                    }
+                }
+                *pos = bodies_start + total_bodies_len(&metas);
+                Ok((Self::RawI64(all_vals), stats))
+            }
+            _ => Err("unknown codec discriminant"),
+        }
+    }
+
     /// Returns an estimate of heap memory used by this column in bytes.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
@@ -1065,6 +1253,25 @@ fn write_block_index_and_bodies(buf: &mut Vec<u8>, metas: &[BlockMeta], bodies: 
     buf.extend_from_slice(bodies);
 }
 
+/// Writes the v3 block index (v2 layout + inline per-block ZoneMap)
+/// followed by the concatenated block bodies.
+fn write_block_index_and_bodies_with_stats(
+    buf: &mut Vec<u8>,
+    metas: &[BlockMeta],
+    bodies: &[u8],
+    stats: &[super::zone_map::ZoneMap],
+) {
+    debug_assert_eq!(metas.len(), stats.len(), "stats must align with metas");
+    write_usize_as_u32(buf, metas.len());
+    for (meta, zm) in metas.iter().zip(stats.iter()) {
+        buf.extend_from_slice(&meta.byte_offset.to_le_bytes());
+        buf.extend_from_slice(&meta.byte_len.to_le_bytes());
+        buf.extend_from_slice(&meta.row_count.to_le_bytes());
+        zm.write_inline(buf);
+    }
+    buf.extend_from_slice(bodies);
+}
+
 /// Reads the v2 block index and returns the parsed metas and the byte
 /// position where the concatenated bodies start.
 fn read_block_index(data: &[u8], pos: &mut usize) -> Result<(Vec<BlockMeta>, usize), &'static str> {
@@ -1088,6 +1295,32 @@ fn read_block_index(data: &[u8], pos: &mut usize) -> Result<(Vec<BlockMeta>, usi
     }
     let bodies_start = *pos;
     Ok((metas, bodies_start))
+}
+
+/// Reads the v3 block index (v2 layout + inline per-block ZoneMap) and
+/// returns the parsed metas, per-block stats, and the byte position
+/// where the concatenated bodies start.
+fn read_block_index_v3(
+    data: &[u8],
+    pos: &mut usize,
+) -> Result<(Vec<BlockMeta>, Vec<super::zone_map::ZoneMap>, usize), &'static str> {
+    let block_count = read_u32_le(data, pos)? as usize;
+    let mut metas = Vec::with_capacity(block_count);
+    let mut stats = Vec::with_capacity(block_count);
+    for _ in 0..block_count {
+        let byte_offset = read_u32_le(data, pos)?;
+        let byte_len = read_u32_le(data, pos)?;
+        let row_count = read_u32_le(data, pos)?;
+        let zm = super::zone_map::ZoneMap::read_inline(data, pos)?;
+        metas.push(BlockMeta {
+            byte_offset,
+            byte_len,
+            row_count,
+        });
+        stats.push(zm);
+    }
+    let bodies_start = *pos;
+    Ok((metas, stats, bodies_start))
 }
 
 // ── Binary read helpers ─────────────────────────────────────────

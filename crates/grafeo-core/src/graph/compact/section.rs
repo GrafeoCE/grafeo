@@ -23,14 +23,16 @@ use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
 /// Magic bytes identifying a CompactStore section.
 const MAGIC: [u8; 4] = *b"GCST";
 
-/// Current section format version. Phase 2b bumped this from 1 to 2 to
-/// switch column bodies from a flat layout to a per-block index +
-/// concatenated bodies. Phase 2c will bump to 3 when per-block stats
-/// (min/max/null/bloom) are added.
-const FORMAT_VERSION: u8 = 2;
+/// Current section format version. Phase 2c bumped this from 2 to 3 to
+/// embed per-block zone maps in the column index for skip pruning.
+const FORMAT_VERSION: u8 = 3;
 
-/// Legacy section format version, retained for one release as a
-/// read-only compat path. Files written by 0.5.41 and earlier carry
+/// v2 (Phase 2b) layout: per-block index + bodies, no per-block stats.
+/// Retained as a read-only compat path for one release.
+const FORMAT_VERSION_V2: u8 = 2;
+
+/// v1 layout: flat columns, no blocks. Retained as a read-only compat
+/// path for one release. Files written by 0.5.41 and earlier carry
 /// this byte; 0.5.42+ writers always emit [`FORMAT_VERSION`].
 const FORMAT_VERSION_V1: u8 = 1;
 
@@ -110,7 +112,12 @@ impl CompactStoreSection {
                 } else {
                     buf.push(0);
                 }
-                write_codec(codec, &mut buf, version);
+                write_codec(
+                    codec,
+                    &mut buf,
+                    version,
+                    nt.block_zone_maps().get(key).map(Vec::as_slice),
+                );
             }
         }
 
@@ -131,7 +138,9 @@ impl CompactStoreSection {
             write_len(&mut buf, properties.len());
             for (key, codec) in properties {
                 write_str(&mut buf, key.as_str());
-                write_codec(codec, &mut buf, version);
+                // Edge property columns don't track per-block zone maps
+                // yet; v3 will compute them inline during write.
+                write_codec(codec, &mut buf, version, None);
             }
         }
         // Continue building buf in `serialize()` epilogue.
@@ -173,11 +182,25 @@ impl CompactStoreSection {
 }
 
 /// Writes a single column codec body using the layout matching the
-/// section's format version. v1 = flat; v2 = per-block index + bodies.
-fn write_codec(codec: &ColumnCodec, buf: &mut Vec<u8>, version: u8) {
+/// section's format version.
+///
+/// - v1 = flat columns (legacy)
+/// - v2 = per-block index + concatenated bodies, no stats
+/// - v3 = v2 layout + inline per-block zone map per index entry
+///
+/// `block_stats_hint` is consulted only at v3; when `None` or with a
+/// mismatched length, [`ColumnCodec::write_to_v3`] computes the stats
+/// from the column itself.
+fn write_codec(
+    codec: &ColumnCodec,
+    buf: &mut Vec<u8>,
+    version: u8,
+    block_stats_hint: Option<&[ZoneMap]>,
+) {
     match version {
         FORMAT_VERSION_V1 => codec.write_to(buf),
-        _ => codec.write_to_v2(buf),
+        FORMAT_VERSION_V2 => codec.write_to_v2(buf),
+        _ => codec.write_to_v3(buf, block_stats_hint),
     }
 }
 
@@ -220,12 +243,29 @@ impl Section for CompactStoreSection {
 
 // ── Deserialization ────────────────────────────────────────────────
 
-/// Reads a single column codec body, dispatching to v1 (flat) or v2
-/// (per-block index) based on the section's version byte.
-fn read_codec(data: &[u8], pos: &mut usize, version: u8) -> Result<ColumnCodec, String> {
+/// Reads a single column codec body, dispatching by section version.
+///
+/// - v1 → [`ColumnCodec::read_from`] (flat layout, no per-block stats)
+/// - v2 → [`ColumnCodec::read_from_v2`] (block index, no stats)
+/// - v3 → [`ColumnCodec::read_from_v3`] (block index + per-block stats)
+///
+/// Returns the codec and an `Option<Vec<ZoneMap>>` carrying per-block
+/// stats when the v3 path was taken.
+fn read_codec(
+    data: &[u8],
+    pos: &mut usize,
+    version: u8,
+) -> Result<(ColumnCodec, Option<Vec<ZoneMap>>), String> {
     match version {
-        FORMAT_VERSION_V1 => ColumnCodec::read_from(data, pos).map_err(|e| e.to_string()),
-        FORMAT_VERSION => ColumnCodec::read_from_v2(data, pos).map_err(|e| e.to_string()),
+        FORMAT_VERSION_V1 => ColumnCodec::read_from(data, pos)
+            .map(|c| (c, None))
+            .map_err(|e| e.to_string()),
+        FORMAT_VERSION_V2 => ColumnCodec::read_from_v2(data, pos)
+            .map(|c| (c, None))
+            .map_err(|e| e.to_string()),
+        FORMAT_VERSION => ColumnCodec::read_from_v3(data, pos)
+            .map(|(c, stats)| (c, Some(stats)))
+            .map_err(|e| e.to_string()),
         _ => Err(format!("unsupported CompactStore version {version}")),
     }
 }
@@ -259,9 +299,9 @@ fn deserialize_compact_store(data: &[u8]) -> Result<CompactStore, String> {
     pos += 4;
     let version = data[pos];
     pos += 1;
-    if version != FORMAT_VERSION && version != FORMAT_VERSION_V1 {
+    if version != FORMAT_VERSION && version != FORMAT_VERSION_V2 && version != FORMAT_VERSION_V1 {
         return Err(format!(
-            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION})"
+            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION})"
         ));
     }
     let flags = data[pos];
@@ -283,6 +323,7 @@ fn deserialize_compact_store(data: &[u8]) -> Result<CompactStore, String> {
 
         let mut columns: FxHashMap<PropertyKey, ColumnCodec> = FxHashMap::default();
         let mut zone_maps: FxHashMap<PropertyKey, ZoneMap> = FxHashMap::default();
+        let mut block_zone_maps: FxHashMap<PropertyKey, Vec<ZoneMap>> = FxHashMap::default();
         let mut col_defs = Vec::with_capacity(num_cols);
 
         for _ in 0..num_cols {
@@ -296,14 +337,24 @@ fn deserialize_compact_store(data: &[u8]) -> Result<CompactStore, String> {
                 zone_maps.insert(key.clone(), zm);
             }
 
-            let codec = read_codec(data, &mut pos, version).map_err(|e| format!("codec: {e}"))?;
+            let (codec, maybe_block_stats) =
+                read_codec(data, &mut pos, version).map_err(|e| format!("codec: {e}"))?;
+            if let Some(stats) = maybe_block_stats {
+                block_zone_maps.insert(key.clone(), stats);
+            }
             let col_type = infer_column_type_from_codec(&codec);
             col_defs.push(ColumnDef::new(&key_str, col_type));
             columns.insert(key, codec);
         }
 
         let schema = TableSchema::new(label.as_str(), table_id, col_defs);
-        let table = NodeTable::from_columns(schema, columns, zone_maps, row_count);
+        let table = NodeTable::from_columns_with_block_stats(
+            schema,
+            columns,
+            zone_maps,
+            block_zone_maps,
+            row_count,
+        );
         node_tables.push(table);
         label_to_table_id.insert(label.clone(), table_id);
         table_id_to_label.push(label);
@@ -338,7 +389,7 @@ fn deserialize_compact_store(data: &[u8]) -> Result<CompactStore, String> {
         for _ in 0..num_props {
             let key_str = read_string(data, &mut pos)?;
             let key = PropertyKey::new(&key_str);
-            let codec =
+            let (codec, _block_stats) =
                 read_codec(data, &mut pos, version).map_err(|e| format!("edge codec: {e}"))?;
             let col_type = infer_column_type_from_codec(&codec);
             prop_defs.push(ColumnDef::new(&key_str, col_type));
@@ -786,6 +837,159 @@ mod tests {
         assert_eq!(
             restored.get_node_property(alix, &PropertyKey::new("age")),
             Some(Value::Int64(30))
+        );
+    }
+
+    // ── Phase 2c: per-block zone maps ────────────────────────────────
+
+    /// The builder must populate per-block zone maps for every column,
+    /// one ZoneMap per block. `1024` rows per block (DEFAULT_BLOCK_ROWS).
+    #[test]
+    fn alix_builder_populates_per_block_zone_maps() {
+        let store = LpgStore::new().unwrap();
+        // 3000 nodes → 3 blocks (1024 + 1024 + 952).
+        for i in 0i64..3000 {
+            let n = store.create_node(&["Person"]);
+            store.set_node_property(n, "age", Value::Int64(i));
+        }
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let table = &compact.node_tables_by_id[0];
+        let block_zms = table
+            .block_zone_maps_for(&PropertyKey::new("age"))
+            .expect("per-block stats present");
+        assert_eq!(block_zms.len(), 3, "3000 rows should produce 3 blocks");
+        assert_eq!(block_zms[0].row_count, 1024);
+        assert_eq!(block_zms[1].row_count, 1024);
+        assert_eq!(block_zms[2].row_count, 952);
+        assert_eq!(block_zms[0].min, Some(Value::Int64(0)));
+        assert_eq!(block_zms[0].max, Some(Value::Int64(1023)));
+        assert_eq!(block_zms[1].min, Some(Value::Int64(1024)));
+        assert_eq!(block_zms[1].max, Some(Value::Int64(2047)));
+        assert_eq!(block_zms[2].min, Some(Value::Int64(2048)));
+        assert_eq!(block_zms[2].max, Some(Value::Int64(2999)));
+    }
+
+    /// v3 round-trip preserves per-block zone maps verbatim.
+    #[test]
+    fn gus_v3_round_trip_preserves_block_zone_maps() {
+        let store = LpgStore::new().unwrap();
+        for i in 0i64..2500 {
+            let n = store.create_node(&["Item"]);
+            store.set_node_property(n, "score", Value::Int64(i));
+        }
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let original = &compact.node_tables_by_id[0];
+        let original_zms = original
+            .block_zone_maps_for(&PropertyKey::new("score"))
+            .expect("original block stats")
+            .to_vec();
+
+        let section = CompactStoreSection::new(Arc::new(compact));
+        let bytes = section.serialize().unwrap();
+        let mut section2 = CompactStoreSection::empty();
+        section2.deserialize(&bytes).unwrap();
+        let restored = section2.store().unwrap();
+        let restored_table = &restored.node_tables_by_id[0];
+        let restored_zms = restored_table
+            .block_zone_maps_for(&PropertyKey::new("score"))
+            .expect("restored block stats");
+
+        assert_eq!(restored_zms.len(), original_zms.len());
+        for (i, (orig, rest)) in original_zms.iter().zip(restored_zms.iter()).enumerate() {
+            assert_eq!(orig.row_count, rest.row_count, "row_count mismatch at {i}");
+            assert_eq!(
+                orig.null_count, rest.null_count,
+                "null_count mismatch at {i}"
+            );
+            assert_eq!(orig.min, rest.min, "min mismatch at {i}");
+            assert_eq!(orig.max, rest.max, "max mismatch at {i}");
+        }
+    }
+
+    /// v2 sections (Phase 2b) carry no per-block zone maps; the v3 reader
+    /// must accept them and leave `block_zone_maps_for` returning `None`.
+    #[test]
+    fn vincent_v2_section_round_trip_leaves_block_zone_maps_empty() {
+        let store = LpgStore::new().unwrap();
+        for i in 0i64..1500 {
+            let n = store.create_node(&["Item"]);
+            store.set_node_property(n, "score", Value::Int64(i));
+        }
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let section = CompactStoreSection::new(Arc::new(compact));
+        let v2_bytes = section.serialize_with_version(FORMAT_VERSION_V2).unwrap();
+        assert_eq!(v2_bytes[4], FORMAT_VERSION_V2);
+
+        let mut section2 = CompactStoreSection::empty();
+        section2.deserialize(&v2_bytes).unwrap();
+        let restored = section2.store().unwrap();
+        let table = &restored.node_tables_by_id[0];
+        assert!(
+            table
+                .block_zone_maps_for(&PropertyKey::new("score"))
+                .is_none(),
+            "v2 stream must not populate block_zone_maps"
+        );
+        // But the column data still survives.
+        assert_eq!(table.len(), 1500);
+    }
+
+    /// v1 sections likewise carry no per-block stats.
+    #[test]
+    fn jules_v1_section_round_trip_leaves_block_zone_maps_empty() {
+        let store = LpgStore::new().unwrap();
+        for i in 0i64..1500 {
+            let n = store.create_node(&["Item"]);
+            store.set_node_property(n, "score", Value::Int64(i));
+        }
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let section = CompactStoreSection::new(Arc::new(compact));
+        let v1_bytes = section.serialize_with_version(FORMAT_VERSION_V1).unwrap();
+        assert_eq!(v1_bytes[4], FORMAT_VERSION_V1);
+
+        let mut section2 = CompactStoreSection::empty();
+        section2.deserialize(&v1_bytes).unwrap();
+        let restored = section2.store().unwrap();
+        let table = &restored.node_tables_by_id[0];
+        assert!(
+            table
+                .block_zone_maps_for(&PropertyKey::new("score"))
+                .is_none(),
+            "v1 stream must not populate block_zone_maps"
+        );
+        assert_eq!(table.len(), 1500);
+    }
+
+    /// String columns also get per-block min/max.
+    #[test]
+    fn mia_block_zone_maps_for_string_column() {
+        let store = LpgStore::new().unwrap();
+        // Use enough nodes to force >= 2 blocks.
+        for i in 0u32..1100 {
+            let n = store.create_node(&["Tag"]);
+            store.set_node_property(n, "name", Value::from(format!("tag_{i:04}")));
+        }
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let table = &compact.node_tables_by_id[0];
+        let block_zms = table
+            .block_zone_maps_for(&PropertyKey::new("name"))
+            .expect("string column block stats");
+        assert_eq!(block_zms.len(), 2);
+        assert_eq!(
+            block_zms[0].min,
+            Some(Value::String(arcstr::ArcStr::from("tag_0000")))
+        );
+        assert_eq!(
+            block_zms[0].max,
+            Some(Value::String(arcstr::ArcStr::from("tag_1023")))
+        );
+        assert_eq!(
+            block_zms[1].min,
+            Some(Value::String(arcstr::ArcStr::from("tag_1024")))
+        );
+        assert_eq!(
+            block_zms[1].max,
+            Some(Value::String(arcstr::ArcStr::from("tag_1099")))
         );
     }
 

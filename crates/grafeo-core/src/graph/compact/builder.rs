@@ -422,7 +422,21 @@ impl CompactStoreBuilder {
 
             let zone_maps: FxHashMap<PropertyKey, ZoneMap> = ntb.zone_maps.into_iter().collect();
 
-            let table = NodeTable::from_columns(schema, columns, zone_maps, row_count);
+            // Phase 2c: compute per-block zone maps so range scans (Phase 4)
+            // can skip entire blocks whose stats prove no match. Empty
+            // when a column is empty; otherwise one entry per block.
+            let block_zone_maps: FxHashMap<PropertyKey, Vec<ZoneMap>> = columns
+                .iter()
+                .map(|(key, codec)| (key.clone(), super::zone_map::compute_block_zone_maps(codec)))
+                .collect();
+
+            let table = NodeTable::from_columns_with_block_stats(
+                schema,
+                columns,
+                zone_maps,
+                block_zone_maps,
+                row_count,
+            );
             node_tables_by_id.push(table);
         }
 
