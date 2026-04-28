@@ -91,6 +91,8 @@ mod config;
 #[cfg(feature = "vector-index")]
 mod hnsw;
 #[cfg(feature = "vector-index")]
+pub mod paged_topology;
+#[cfg(feature = "vector-index")]
 mod quantized_hnsw;
 #[cfg(feature = "vector-index")]
 pub mod section;
