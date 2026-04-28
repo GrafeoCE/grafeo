@@ -136,6 +136,41 @@ impl<'de> Deserialize<'de> for BitVector {
     }
 }
 
+/// Phase 6a: format-validation error returned by [`BitVector::from_mmap`].
+///
+/// Distinct from [`io::Error`] because format mismatches are a recoverable
+/// classification problem (caller may try a different format version),
+/// whereas I/O errors signal an unrelated underlying failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BitVectorFormatError {
+    /// The provided byte buffer doesn't match the declared bit count.
+    ByteLengthMismatch {
+        /// Declared number of bits.
+        len: usize,
+        /// Bytes the caller should have provided.
+        expected_bytes: usize,
+        /// Bytes the caller actually provided.
+        actual_bytes: usize,
+    },
+}
+
+impl std::fmt::Display for BitVectorFormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ByteLengthMismatch {
+                len,
+                expected_bytes,
+                actual_bytes,
+            } => write!(
+                f,
+                "BitVector format mismatch: len={len} requires {expected_bytes} bytes (ceil(len/64)*8), got {actual_bytes}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BitVectorFormatError {}
+
 /// Validates that `len` and `data` are consistent, returning a valid
 /// `BitVector` or an error message.
 fn validate_bitvec(len: usize, data: &[u64]) -> Result<BitVector, String> {
@@ -183,6 +218,31 @@ impl BitVector {
     #[must_use]
     pub fn from_bytes_storage(data: Bytes, len: usize) -> Self {
         Self { data, len }
+    }
+
+    /// Phase 6a: zero-copy mmap constructor.
+    ///
+    /// Adopts a refcounted [`Bytes`] slice (typically produced by
+    /// `Bytes::from_owner(mmap)` or a sub-slice thereof) as the
+    /// backing storage without copying. The on-disk contract is
+    /// little-endian `u64` words, with `len` total bits stored in
+    /// `ceil(len / 64) * 8` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the byte length doesn't match the expected
+    /// `ceil(len / 64) * 8` for the declared bit count. This guards
+    /// against truncated or oversized mmap regions.
+    pub fn from_mmap(data: Bytes, len: usize) -> Result<Self, BitVectorFormatError> {
+        let expected_bytes = len.div_ceil(64) * 8;
+        if data.len() != expected_bytes {
+            return Err(BitVectorFormatError::ByteLengthMismatch {
+                len,
+                expected_bytes,
+                actual_bytes: data.len(),
+            });
+        }
+        Ok(Self { data, len })
     }
 
     /// Creates an empty bit vector.
@@ -894,5 +954,98 @@ mod tests {
         for (i, &b) in bools.iter().enumerate() {
             assert_eq!(bv2.get(i), Some(b));
         }
+    }
+
+    // ── Phase 6a: from_mmap zero-copy constructor ─────────────────────
+
+    /// Round-trip via `from_mmap`: take an existing BitVector's bytes,
+    /// adopt them as a fresh BitVector, verify all bits.
+    #[test]
+    fn alix_from_mmap_round_trips_via_data_bytes() {
+        let bools: Vec<bool> = (0..200).map(|i| i % 5 == 0).collect();
+        let original = BitVector::from_bools(&bools);
+        let bytes = original.data_bytes().clone();
+        let mmapped = BitVector::from_mmap(bytes, original.len()).expect("from_mmap");
+        assert_eq!(mmapped.len(), original.len());
+        for (i, &b) in bools.iter().enumerate() {
+            assert_eq!(mmapped.get(i), Some(b), "bit {i}");
+        }
+        // word-by-word equivalence locks the LE contract.
+        for i in 0..original.word_count() {
+            assert_eq!(mmapped.word_at(i), original.word_at(i));
+        }
+    }
+
+    /// Truncated buffer is rejected — guards against partial mmap regions.
+    #[test]
+    fn gus_from_mmap_rejects_short_buffer() {
+        // len=200 needs ceil(200/64)*8 = 32 bytes; provide only 16.
+        let short = bytes::Bytes::from(vec![0u8; 16]);
+        let result = BitVector::from_mmap(short, 200);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            BitVectorFormatError::ByteLengthMismatch {
+                len: 200,
+                expected_bytes: 32,
+                actual_bytes: 16,
+            }
+        ));
+    }
+
+    /// Oversized buffer is also rejected — symmetric guard.
+    #[test]
+    fn vincent_from_mmap_rejects_long_buffer() {
+        // len=10 needs ceil(10/64)*8 = 8 bytes; provide 16.
+        let long = bytes::Bytes::from(vec![0u8; 16]);
+        let result = BitVector::from_mmap(long, 10);
+        assert!(result.is_err());
+    }
+
+    /// Empty bitvector via from_mmap — len=0, 0 bytes.
+    #[test]
+    fn jules_from_mmap_handles_empty() {
+        let empty = bytes::Bytes::new();
+        let bv = BitVector::from_mmap(empty, 0).expect("empty mmap");
+        assert_eq!(bv.len(), 0);
+        assert!(bv.is_empty());
+    }
+
+    /// Zero-copy assertion: mmap-backed BitVector shares the underlying
+    /// allocation with the source `Bytes` (no heap copy).
+    ///
+    /// We verify by holding both Arcs and asserting `Bytes::as_ptr` returns
+    /// the same address, then mutating one side is impossible (Bytes is
+    /// immutable) — the test confirms shape, not write-isolation.
+    #[test]
+    fn mia_from_mmap_is_zero_copy() {
+        let original = BitVector::from_bools(&[true; 1024]);
+        let source_bytes = original.data_bytes().clone();
+        let source_ptr = source_bytes.as_ptr();
+
+        let mmapped = BitVector::from_mmap(source_bytes, 1024).expect("from_mmap");
+        // The mmapped bitvector's storage points at the same address —
+        // no allocation occurred.
+        assert_eq!(
+            mmapped.data_bytes().as_ptr(),
+            source_ptr,
+            "from_mmap must NOT allocate; Bytes refcount sharing required"
+        );
+    }
+
+    /// LE word contract: a hand-crafted LE byte pattern decodes to the
+    /// expected u64 words. Guards against accidental endianness drift.
+    #[test]
+    fn shosanna_from_mmap_locks_le_word_contract() {
+        // Bytes [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08] in LE
+        // decode to 0x0807060504030201.
+        let bytes = bytes::Bytes::from(vec![
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // word 0
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // word 1: all-ones
+        ]);
+        let bv = BitVector::from_mmap(bytes, 128).expect("from_mmap");
+        assert_eq!(bv.word_at(0), Some(0x0807_0605_0403_0201));
+        assert_eq!(bv.word_at(1), Some(0xFFFF_FFFF_FFFF_FFFF));
     }
 }

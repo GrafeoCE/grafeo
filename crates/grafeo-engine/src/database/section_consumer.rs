@@ -604,6 +604,89 @@ impl MemoryConsumer for CompactStoreConsumer {
     }
 }
 
+// ── Phase 5c: OverlayConsumer ─────────────────────────────────────────
+//
+// Tracks the LpgStore overlay portion of a `LayeredStore`. When memory
+// pressure rises and the consumer is asked to spill, it calls
+// `LayeredStore::merge_overlay_in_place()` which rebuilds the base from
+// the combined view and clears the overlay, freeing all overlay heap.
+//
+// The new base is in-memory; if total memory pressure persists, the
+// `CompactStoreConsumer` will spill that base to mmap on its own. Two
+// independent consumers, one BufferManager — chains naturally.
+
+/// Tracks the mutable overlay (LpgStore) of a `LayeredStore`.
+///
+/// Priority is [`GRAPH_STORAGE`](priorities::GRAPH_STORAGE) (evict-last):
+/// the overlay holds unflushed mutations and merging it requires
+/// rebuilding the base, so this is the last-resort spill before query
+/// failure under sustained mutation pressure.
+#[cfg(all(feature = "compact-store", feature = "lpg"))]
+pub struct OverlayConsumer {
+    layered: Weak<grafeo_core::graph::compact::layered::LayeredStore>,
+}
+
+#[cfg(all(feature = "compact-store", feature = "lpg"))]
+impl OverlayConsumer {
+    /// Creates a consumer that monitors the overlay of `layered`.
+    pub fn new(layered: &Arc<grafeo_core::graph::compact::layered::LayeredStore>) -> Self {
+        Self {
+            layered: Arc::downgrade(layered),
+        }
+    }
+}
+
+#[cfg(all(feature = "compact-store", feature = "lpg"))]
+impl MemoryConsumer for OverlayConsumer {
+    fn name(&self) -> &str {
+        "overlay:LpgStore"
+    }
+
+    fn memory_usage(&self) -> usize {
+        self.layered
+            .upgrade()
+            .map_or(0, |layered| layered.overlay_memory_bytes())
+    }
+
+    fn eviction_priority(&self) -> u8 {
+        priorities::GRAPH_STORAGE
+    }
+
+    fn region(&self) -> MemoryRegion {
+        MemoryRegion::GraphStorage
+    }
+
+    fn evict(&self, _target_bytes: usize) -> usize {
+        // Cannot evict in place; spill via merge.
+        0
+    }
+
+    fn can_spill(&self) -> bool {
+        let Some(layered) = self.layered.upgrade() else {
+            return false;
+        };
+        // Only worth spilling if the overlay actually has mutations.
+        layered.overlay_mutation_count() > 0
+    }
+
+    fn spill(&self, _target_bytes: usize) -> Result<usize, SpillError> {
+        let Some(layered) = self.layered.upgrade() else {
+            return Err(SpillError::IoError("layered store dropped".to_string()));
+        };
+
+        if layered.overlay_mutation_count() == 0 {
+            return Ok(0);
+        }
+
+        let before = layered.overlay_memory_bytes();
+        layered
+            .merge_overlay_in_place()
+            .map_err(SpillError::IoError)?;
+        let after = layered.overlay_memory_bytes();
+        Ok(before.saturating_sub(after))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

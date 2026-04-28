@@ -188,6 +188,54 @@ impl WaveletTree {
         self.sigma
     }
 
+    /// Returns the tree height (number of bitvector levels).
+    #[must_use]
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Returns the underlying `SuccinctBitVector` levels (Phase 6c
+    /// packed-format access). Internal: used by the packed serializer
+    /// to write per-level bytes; not part of the long-term query API.
+    #[must_use]
+    pub fn levels_slice(&self) -> &[SuccinctBitVector] {
+        &self.levels
+    }
+
+    /// Returns the sorted symbol table (Phase 6c packed-format access).
+    /// Used by the packed serializer to write the symbols region.
+    #[must_use]
+    pub fn symbols_slice(&self) -> &[u64] {
+        &self.symbols
+    }
+
+    /// Phase 6c: reconstruction entry point used by
+    /// [`crate::index::ring::packed_wavelet::deserialize_wavelet_tree`]
+    /// after parsing the packed format. Skips the `WaveletTree::new`
+    /// build path because the levels and symbol table are already
+    /// authoritative.
+    #[must_use]
+    pub fn from_packed_parts(
+        levels: Vec<SuccinctBitVector>,
+        height: usize,
+        sigma: u64,
+        len: usize,
+        symbols: Vec<u64>,
+    ) -> Self {
+        let mut symbol_to_code = hashbrown::HashMap::with_capacity(symbols.len());
+        for (code, &sym) in symbols.iter().enumerate() {
+            symbol_to_code.insert(sym, code as u64);
+        }
+        Self {
+            levels,
+            height,
+            sigma,
+            len,
+            symbols,
+            symbol_to_code,
+        }
+    }
+
     /// Returns the symbol at position i.
     ///
     /// # Time complexity

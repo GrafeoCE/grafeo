@@ -241,6 +241,70 @@ impl TripleRing {
         self.dict.len()
     }
 
+    /// Phase 6e packed-format access — returns the SPO→POS permutation.
+    /// Distinct name from the existing query method `spo_to_pos(usize)`.
+    #[must_use]
+    pub fn spo_to_pos_perm(&self) -> &SuccinctPermutation {
+        &self.spo_to_pos
+    }
+
+    /// Phase 6e packed-format access — returns the SPO→OSP permutation.
+    /// Distinct name from the existing query method `spo_to_osp(usize)`.
+    #[must_use]
+    pub fn spo_to_osp_perm(&self) -> &SuccinctPermutation {
+        &self.spo_to_osp
+    }
+
+    /// Phase 6e: reconstruction entry point used by
+    /// [`crate::index::ring::packed_format::deserialize_triple_ring`]
+    /// after parsing the v2 packed format. Skips the build path because
+    /// the sub-components are already authoritative.
+    ///
+    /// `packed_dict` is the parsed packed dictionary; we materialize it
+    /// back to a heap [`TermDictionary`] so the rest of the Ring's
+    /// query path (which uses the heap dict) keeps working unchanged.
+    /// A future pass can teach the query path to read directly from
+    /// the packed dict for true zero-copy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the packed dictionary contains more than `u32::MAX`
+    /// terms — but that's already enforced at packed-dict build time
+    /// (Phase 6b), so this can only fire on a manually-corrupted dict.
+    #[must_use]
+    pub fn from_packed_parts(
+        packed_dict: super::PackedTermDictionary,
+        num_triples: usize,
+        subjects: WaveletTree,
+        predicates: WaveletTree,
+        objects: WaveletTree,
+        spo_to_pos: SuccinctPermutation,
+        spo_to_osp: SuccinctPermutation,
+    ) -> Self {
+        // Materialize the packed dictionary into a heap TermDictionary.
+        // get_or_insert preserves insertion order, so id N in the
+        // packed dict ends up as id N in the heap dict.
+        let mut dict = TermDictionary::with_capacity(packed_dict.len());
+        for id in 0..packed_dict.len() {
+            let id_u32 =
+                u32::try_from(id).expect("packed dict count fits u32 (validated at build)");
+            let term = packed_dict
+                .get_term(id_u32)
+                .expect("id < packed_dict.len()");
+            dict.get_or_insert(term);
+        }
+
+        Self {
+            dict,
+            num_triples,
+            subjects,
+            predicates,
+            objects,
+            spo_to_pos,
+            spo_to_osp,
+        }
+    }
+
     /// Returns the triple at position i in SPO order.
     #[must_use]
     pub fn get_spo(&self, index: usize) -> Option<Triple> {

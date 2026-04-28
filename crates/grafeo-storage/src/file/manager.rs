@@ -596,6 +596,7 @@ impl GrafeoFileManager {
         std::io::Read::read_exact(&mut *file, &mut buf)?;
 
         // Try to parse; if it fails, this is not a v2 file
+        // Try to parse; if it fails, this is not a v2 file
         match SectionDirectory::from_bytes(&buf) {
             Ok(dir) if !dir.is_empty() => Ok(Some(dir)),
             _ => Ok(None),

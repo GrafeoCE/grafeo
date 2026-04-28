@@ -379,6 +379,15 @@ impl GrafeoDB {
 
         let is_read_only = config.access_mode == crate::config::AccessMode::ReadOnly;
 
+        // Phase 5e: capture the deserialized CompactStore base when we
+        // reload a v2 section file that was written by a previously
+        // compacted database. The post-construction wiring uses this to
+        // rebuild the LayeredStore + tier wrapper + overlay consumer.
+        #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+        let mut loaded_compact_base: Option<
+            Arc<grafeo_core::graph::compact::CompactStore>,
+        > = None;
+
         // --- Single-file format (.grafeo) ---
         #[cfg(feature = "grafeo-file")]
         let file_manager: Option<Arc<GrafeoFileManager>> = if is_read_only {
@@ -396,6 +405,10 @@ impl GrafeoDB {
                             #[cfg(feature = "triple-store")]
                             &rdf_store,
                         )?;
+                        #[cfg(feature = "compact-store")]
+                        {
+                            loaded_compact_base = Self::extract_compact_base(&fm)?;
+                        }
                     } else {
                         // Fall back to v1 blob format
                         let snapshot_data = fm.read_snapshot()?;
@@ -449,6 +462,10 @@ impl GrafeoDB {
                         #[cfg(feature = "triple-store")]
                         &rdf_store,
                     )?;
+                    #[cfg(feature = "compact-store")]
+                    {
+                        loaded_compact_base = Self::extract_compact_base(&fm)?;
+                    }
                 } else {
                     let snapshot_data = fm.read_snapshot()?;
                     if !snapshot_data.is_empty() {
@@ -628,6 +645,16 @@ impl GrafeoDB {
 
         // Register storage sections as memory consumers for pressure tracking
         db.register_section_consumers();
+
+        // Phase 5e: if the loaded file has a CompactStore section, the
+        // database was previously compacted. Reconstruct the LayeredStore
+        // wiring (base + overlay + tier wrapper + consumers) so the
+        // engine sees the full picture and the read/write paths route
+        // through the layered store.
+        #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+        if let Some(compact_base) = loaded_compact_base {
+            db.wire_layered_after_load(compact_base)?;
+        }
 
         // Start periodic checkpoint timer if configured
         #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
@@ -928,7 +955,7 @@ impl GrafeoDB {
 
         self.external_read_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreSearch>);
         self.external_write_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreMut>);
-        self.store = Some(Arc::clone(layered.overlay_store()));
+        self.store = Some(layered.overlay_store());
 
         // Install the disk-backed tier wrapper and register its memory
         // consumer so the BufferManager can spill the base to mmap under
@@ -945,6 +972,11 @@ impl GrafeoDB {
             self.buffer_manager.register_consumer(consumer);
             self.compact_tiered = Some(tiered);
         }
+
+        // Phase 5c: register the overlay consumer so growing-overlay
+        // pressure triggers an automatic merge-into-base.
+        let overlay_consumer = Arc::new(section_consumer::OverlayConsumer::new(&layered));
+        self.buffer_manager.register_consumer(overlay_consumer);
 
         self.layered_store = Some(layered);
         self.read_only = false;
@@ -1000,7 +1032,7 @@ impl GrafeoDB {
 
         self.external_read_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStoreSearch>);
         self.external_write_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStoreMut>);
-        self.store = Some(Arc::clone(new_layered.overlay_store()));
+        self.store = Some(new_layered.overlay_store());
 
         // Replace the tier wrapper: old one's Weak refs will now return None,
         // and its consumer (unregistered below) no longer tracks the freshly
@@ -1021,6 +1053,11 @@ impl GrafeoDB {
             self.buffer_manager.register_consumer(consumer);
             self.compact_tiered = Some(tiered);
         }
+
+        // Phase 5c: re-register overlay consumer for the new layered store.
+        self.buffer_manager.unregister_consumer("overlay:LpgStore");
+        let overlay_consumer = Arc::new(section_consumer::OverlayConsumer::new(&new_layered));
+        self.buffer_manager.register_consumer(overlay_consumer);
 
         self.layered_store = Some(new_layered);
         self.query_cache = Arc::new(QueryCache::default());
@@ -1389,6 +1426,87 @@ impl GrafeoDB {
         )
     }
 
+    /// Phase 5e: post-load LayeredStore wiring.
+    ///
+    /// After `load_from_sections` has populated `self.store` (the LpgStore,
+    /// which now holds the overlay data) and `extract_compact_base` has
+    /// produced the base, this rebuilds the same engine state that
+    /// `compact()` establishes:
+    ///
+    /// - `self.layered_store = Some(LayeredStore { base, overlay = self.store })`
+    /// - `self.external_read_store / external_write_store = Arc::clone(layered)`
+    /// - `self.store` swapped to the overlay (which is the same `Arc<LpgStore>`)
+    /// - Tier wrapper installed and `CompactStoreConsumer` + `OverlayConsumer`
+    ///   registered with the BufferManager
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+    fn wire_layered_after_load(
+        &mut self,
+        compact_base: Arc<grafeo_core::graph::compact::CompactStore>,
+    ) -> Result<()> {
+        use grafeo_core::graph::compact::layered::LayeredStore;
+
+        let overlay_store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| Error::Internal("wire_layered_after_load: no LpgStore".into()))?;
+
+        // Adopt the loaded base + the loaded overlay (id allocator state
+        // is preserved on the overlay during deserialization).
+        let layered = Arc::new(LayeredStore::with_overlay(
+            Arc::clone(&compact_base),
+            Arc::clone(overlay_store),
+        ));
+
+        // Sync overlay epoch with the transaction manager.
+        let current_epoch = self.transaction_manager.current_epoch();
+        layered.overlay_store().sync_epoch(current_epoch);
+
+        self.external_read_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreSearch>);
+        self.external_write_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreMut>);
+
+        // Install the tier wrapper + consumers (mirror of compact()'s flow).
+        #[cfg(feature = "mmap")]
+        {
+            let tiered = Arc::new(compact_tiered::CompactStoreTiered::new_in_memory(
+                layered.base_store_arc(),
+            ));
+            let spill_path = self.buffer_manager.config().spill_path.clone();
+            let consumer = Arc::new(section_consumer::CompactStoreConsumer::new(
+                &tiered, &layered, spill_path,
+            ));
+            self.buffer_manager.register_consumer(consumer);
+            self.compact_tiered = Some(tiered);
+        }
+
+        let overlay_consumer = Arc::new(section_consumer::OverlayConsumer::new(&layered));
+        self.buffer_manager.register_consumer(overlay_consumer);
+
+        self.layered_store = Some(layered);
+
+        Ok(())
+    }
+
+    /// Phase 5e: extracts the deserialized CompactStore base from a v2
+    /// section file, if present. Used by the open path to reconstruct
+    /// the LayeredStore wiring after a previously-compacted database
+    /// reopens.
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+    fn extract_compact_base(
+        fm: &GrafeoFileManager,
+    ) -> Result<Option<Arc<grafeo_core::graph::compact::CompactStore>>> {
+        use grafeo_common::storage::{Section, SectionType};
+        let Some(dir) = fm.read_section_directory()? else {
+            return Ok(None);
+        };
+        let Some(entry) = dir.find(SectionType::CompactStore) else {
+            return Ok(None);
+        };
+        let data = fm.read_section_data(entry)?;
+        let mut section = grafeo_core::graph::compact::section::CompactStoreSection::empty();
+        section.deserialize(&data)?;
+        Ok(section.store())
+    }
+
     /// Loads from a section-based `.grafeo` file (v2 format).
     ///
     /// Reads the section directory, then deserializes each section independently.
@@ -1419,7 +1537,9 @@ impl GrafeoDB {
             section.deserialize(&data)?;
         }
 
-        // Load LPG store
+        // Load LPG store (Phase 5e: when the file has a CompactStore section,
+        // this LpgStore data IS the overlay; the caller then wires it into
+        // a LayeredStore via `extract_compact_base`).
         if let Some(entry) = dir.find(SectionType::LpgStore) {
             let data = fm.read_section_data(entry)?;
             let mut section = grafeo_core::graph::lpg::LpgStoreSection::new(Arc::clone(store));
@@ -1620,7 +1740,7 @@ impl GrafeoDB {
         // so MVCC operations (begin_tx, commit, visibility) work correctly.
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if let Some(ref layered) = self.layered_store {
-            let overlay = Arc::clone(layered.overlay_store());
+            let overlay = layered.overlay_store();
             let layered_arc = Arc::clone(layered);
             let mut session = Session::with_adaptive(overlay, session_cfg());
             // Override graph_store/graph_store_mut to use the LayeredStore
@@ -2378,8 +2498,7 @@ impl GrafeoDB {
 
             // Overlay LPG section.
             let overlay = layered.overlay_store();
-            let overlay_section =
-                grafeo_core::graph::lpg::LpgStoreSection::new(Arc::clone(overlay));
+            let overlay_section = grafeo_core::graph::lpg::LpgStoreSection::new(overlay);
             sections.push(Box::new(overlay_section));
 
             return sections;
