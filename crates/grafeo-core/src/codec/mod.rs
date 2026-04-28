@@ -43,7 +43,7 @@ pub mod succinct;
 
 // Re-export commonly used types
 pub use bitpack::{BitPackedInts, DeltaBitPacked};
-pub use bitvec::BitVector;
+pub use bitvec::{BitVector, BitVectorBuilder};
 pub use block::{BlockEntry, DEFAULT_BLOCK_ROWS};
 pub use delta::{DeltaEncoding, zigzag_decode, zigzag_encode};
 pub use dictionary::{DictionaryBuilder, DictionaryEncoding};

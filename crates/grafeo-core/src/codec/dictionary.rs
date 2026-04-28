@@ -24,45 +24,118 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bytes::{Bytes, BytesMut};
+
+/// Reads an LE u32 at byte offset `idx * 4`. Returns `None` if out of range.
+#[inline]
+fn read_code_at(bytes: &Bytes, idx: usize) -> Option<u32> {
+    let start = idx.checked_mul(4)?;
+    let end = start.checked_add(4)?;
+    let chunk: [u8; 4] = bytes.get(start..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(chunk))
+}
+
+/// Encodes `codes` as LE u32 bytes wrapped in a refcounted `Bytes`.
+fn codes_to_bytes(codes: &[u32]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(codes.len() * 4);
+    for &c in codes {
+        buf.extend_from_slice(&c.to_le_bytes());
+    }
+    buf.freeze()
+}
+
+/// Reads a single bit from a u64-word bitmap encoded as LE bytes.
+#[inline]
+fn null_bit_at(bitmap: &Bytes, index: usize) -> bool {
+    let word_idx = index / 64;
+    let bit_idx = index % 64;
+    let start = word_idx * 8;
+    let Some(chunk) = bitmap.get(start..start + 8) else {
+        return false;
+    };
+    let Ok(arr): Result<[u8; 8], _> = chunk.try_into() else {
+        return false;
+    };
+    (u64::from_le_bytes(arr) & (1 << bit_idx)) != 0
+}
+
+/// Encodes a `Vec<u64>` null bitmap as LE bytes wrapped in `Bytes`.
+fn null_bitmap_to_bytes(bitmap: &[u64]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(bitmap.len() * 8);
+    for &w in bitmap {
+        buf.extend_from_slice(&w.to_le_bytes());
+    }
+    buf.freeze()
+}
+
 /// Stores repeated strings efficiently by referencing them with integer codes.
 ///
-/// Each unique string appears once in the dictionary. Values are stored as u32
-/// indices pointing into that dictionary. Great for labels, categories, and
-/// other low-cardinality string columns.
+/// Each unique string appears once in the dictionary. Values are stored as
+/// LE u32 indices pointing into that dictionary, refcounted as
+/// [`bytes::Bytes`] so heap-owned and mmap-backed columns share the same
+/// type (revised D7).
 #[derive(Debug, Clone)]
 pub struct DictionaryEncoding {
     /// The dictionary of unique strings.
     dictionary: Arc<[Arc<str>]>,
-    /// Encoded values as indices into the dictionary.
-    codes: Vec<u32>,
-    /// Null bitmap (bit set = null).
-    null_bitmap: Option<Vec<u64>>,
+    /// Encoded values as LE u32 indices into the dictionary.
+    codes: Bytes,
+    /// Number of code values (== `codes.len() / 4`; cached for clarity).
+    code_count: usize,
+    /// Null bitmap (bit set = null), LE u64 words.
+    null_bitmap: Option<Bytes>,
 }
 
 impl DictionaryEncoding {
-    /// Creates a new dictionary encoding from a dictionary and codes.
+    /// Creates a new dictionary encoding from a dictionary and codes (legacy
+    /// `Vec<u32>` input).
     pub fn new(dictionary: Arc<[Arc<str>]>, codes: Vec<u32>) -> Self {
+        let code_count = codes.len();
         Self {
             dictionary,
-            codes,
+            codes: codes_to_bytes(&codes),
+            code_count,
             null_bitmap: None,
         }
     }
 
-    /// Creates a dictionary encoding with a null bitmap.
+    /// Constructs a dictionary encoding from pre-encoded bytes (Phase 3c
+    /// entry point).
+    ///
+    /// `codes_bytes` must be `code_count * 4` bytes of LE u32 values.
+    pub fn from_bytes_storage(
+        dictionary: Arc<[Arc<str>]>,
+        codes_bytes: Bytes,
+        code_count: usize,
+    ) -> Self {
+        Self {
+            dictionary,
+            codes: codes_bytes,
+            code_count,
+            null_bitmap: None,
+        }
+    }
+
+    /// Adds a null bitmap to this encoding (legacy `Vec<u64>` input).
     pub fn with_nulls(mut self, null_bitmap: Vec<u64>) -> Self {
+        self.null_bitmap = Some(null_bitmap_to_bytes(&null_bitmap));
+        self
+    }
+
+    /// Adds a pre-encoded null bitmap (Phase 3c entry point).
+    pub fn with_null_bytes(mut self, null_bitmap: Bytes) -> Self {
         self.null_bitmap = Some(null_bitmap);
         self
     }
 
     /// Returns the number of values.
     pub fn len(&self) -> usize {
-        self.codes.len()
+        self.code_count
     }
 
     /// Returns whether the encoding is empty.
     pub fn is_empty(&self) -> bool {
-        self.codes.is_empty()
+        self.code_count == 0
     }
 
     /// Returns the number of unique strings in the dictionary.
@@ -75,21 +148,45 @@ impl DictionaryEncoding {
         &self.dictionary
     }
 
-    /// Returns the encoded values.
-    pub fn codes(&self) -> &[u32] {
+    /// Returns the encoded codes as raw LE u32 bytes.
+    ///
+    /// Phase 3b: codes storage is `bytes::Bytes`. Use [`code_at`] for
+    /// indexed access; this returns the raw byte storage for serializers
+    /// that write the storage out directly.
+    pub fn codes_bytes(&self) -> &Bytes {
         &self.codes
+    }
+
+    /// Number of u32 codes stored.
+    pub fn code_count(&self) -> usize {
+        self.code_count
+    }
+
+    /// Returns the code at `idx`, or `None` if out of range.
+    pub fn code_at(&self, idx: usize) -> Option<u32> {
+        if idx >= self.code_count {
+            return None;
+        }
+        read_code_at(&self.codes, idx)
+    }
+
+    /// Returns the codes as a materialized `Vec<u32>` (allocates).
+    ///
+    /// Prefer [`code_at`] or [`code_count`] for reads. This exists for
+    /// callers that need a contiguous slice and accept the allocation
+    /// (e.g., legacy serialization paths).
+    pub fn codes(&self) -> Vec<u32> {
+        (0..self.code_count)
+            .map(|i| read_code_at(&self.codes, i).unwrap_or(0))
+            .collect()
     }
 
     /// Returns whether the value at index is null.
     pub fn is_null(&self, index: usize) -> bool {
-        if let Some(bitmap) = &self.null_bitmap {
-            let word_idx = index / 64;
-            let bit_idx = index % 64;
-            if word_idx < bitmap.len() {
-                return (bitmap[word_idx] & (1 << bit_idx)) != 0;
-            }
+        match &self.null_bitmap {
+            Some(bitmap) => null_bit_at(bitmap, index),
+            None => false,
         }
-        false
     }
 
     /// Returns the string value at the given index.
@@ -99,8 +196,8 @@ impl DictionaryEncoding {
         if self.is_null(index) {
             return None;
         }
-        let code = self.codes.get(index)? as &u32;
-        self.dictionary.get(*code as usize).map(|s| s.as_ref())
+        let code = self.code_at(index)?;
+        self.dictionary.get(code as usize).map(|s| s.as_ref())
     }
 
     /// Returns the code at the given index.
@@ -108,7 +205,7 @@ impl DictionaryEncoding {
         if self.is_null(index) {
             return None;
         }
-        self.codes.get(index).copied()
+        self.code_at(index)
     }
 
     /// Iterates over all values, yielding `Option<&str>`.
@@ -117,29 +214,22 @@ impl DictionaryEncoding {
     }
 
     /// Returns the compression ratio (original size / compressed size).
-    ///
-    /// A ratio > 1.0 means compression is effective.
     pub fn compression_ratio(&self) -> f64 {
-        if self.codes.is_empty() {
+        if self.is_empty() {
             return 1.0;
         }
 
         // Estimate original size: sum of string lengths
-        let original_size: usize = self
-            .codes
-            .iter()
-            .map(|&code| {
-                if (code as usize) < self.dictionary.len() {
-                    self.dictionary[code as usize].len()
-                } else {
-                    0
-                }
+        let original_size: usize = (0..self.code_count)
+            .map(|i| {
+                let code = read_code_at(&self.codes, i).unwrap_or(0) as usize;
+                self.dictionary.get(code).map_or(0, |s| s.len())
             })
             .sum();
 
         // Compressed size: dictionary + codes
         let dict_size: usize = self.dictionary.iter().map(|s| s.len()).sum();
-        let codes_size = self.codes.len() * std::mem::size_of::<u32>();
+        let codes_size = self.codes.len();
         let compressed_size = dict_size + codes_size;
 
         if compressed_size == 0 {
@@ -159,15 +249,15 @@ impl DictionaryEncoding {
 
     /// Filters the encoding to only include rows matching a predicate code.
     pub fn filter_by_code(&self, predicate: impl Fn(u32) -> bool) -> Vec<usize> {
-        self.codes
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &code)| {
-                if !self.is_null(i) && predicate(code) {
-                    Some(i)
-                } else {
-                    None
+        (0..self.code_count)
+            .filter(|&i| {
+                if self.is_null(i) {
+                    return false;
                 }
+                let Some(code) = read_code_at(&self.codes, i) else {
+                    return false;
+                };
+                predicate(code)
             })
             .collect()
     }
@@ -356,7 +446,7 @@ mod tests {
         assert_ne!(code_apple, code_banana);
 
         let dict = builder.build();
-        assert_eq!(dict.codes(), &[0, 1, 0]);
+        assert_eq!(dict.codes(), vec![0, 1, 0]);
     }
 
     #[test]
@@ -468,7 +558,7 @@ mod tests {
 
         assert_eq!(dict.len(), 4);
         assert_eq!(dict.dictionary_size(), 4);
-        assert_eq!(dict.codes(), &[0, 1, 2, 3]);
+        assert_eq!(dict.codes(), vec![0, 1, 2, 3]);
     }
 
     #[test]

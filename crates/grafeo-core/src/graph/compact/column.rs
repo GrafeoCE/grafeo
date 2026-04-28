@@ -533,11 +533,8 @@ impl ColumnCodec {
                 buf.push(0); // discriminant
                 buf.push(bp.bits_per_value());
                 write_usize_as_u32(buf, bp.len());
-                let data = bp.data();
-                write_usize_as_u32(buf, data.len());
-                for &word in data {
-                    buf.extend_from_slice(&word.to_le_bytes());
-                }
+                write_usize_as_u32(buf, bp.word_count());
+                buf.extend_from_slice(bp.data_bytes());
             }
             Self::Dict(dict) => {
                 buf.push(1); // discriminant
@@ -548,20 +545,14 @@ impl ColumnCodec {
                     write_usize_as_u32(buf, s.len());
                     buf.extend_from_slice(s);
                 }
-                let codes = dict.codes();
-                write_usize_as_u32(buf, codes.len());
-                for &code in codes {
-                    buf.extend_from_slice(&code.to_le_bytes());
-                }
+                write_usize_as_u32(buf, dict.code_count());
+                buf.extend_from_slice(dict.codes_bytes());
             }
             Self::Bitmap(bv) => {
                 buf.push(2); // discriminant
                 write_usize_as_u32(buf, bv.len());
-                let data = bv.data();
-                write_usize_as_u32(buf, data.len());
-                for &word in data {
-                    buf.extend_from_slice(&word.to_le_bytes());
-                }
+                write_usize_as_u32(buf, bv.word_count());
+                buf.extend_from_slice(bv.data_bytes());
             }
             Self::Int8Vector { bytes, dimensions } => {
                 buf.push(3); // discriminant
@@ -599,105 +590,129 @@ impl ColumnCodec {
     /// # Errors
     ///
     /// Returns an error if the data is truncated or the discriminant is unknown.
-    pub fn read_from(data: &[u8], pos: &mut usize) -> Result<Self, &'static str> {
-        let discriminant = *data.get(*pos).ok_or("truncated codec discriminant")?;
+    pub fn read_from(data: &Bytes, pos: &mut usize) -> Result<Self, &'static str> {
+        // Phase 3c: take `&Bytes` so storage construction can be zero-copy
+        // via `data.slice(range)` when `data` wraps a mmap (Phase 3c
+        // `Bytes::from_owner`). Scalar helpers below take `&[u8]`; we
+        // pass the underlying view.
+        let bytes = data.as_ref();
+        let discriminant = *bytes.get(*pos).ok_or("truncated codec discriminant")?;
         *pos += 1;
 
         match discriminant {
             0 => {
-                // BitPacked
-                let bits = *data.get(*pos).ok_or("truncated bits_per_value")?;
+                // BitPacked: contiguous LE u64 words → zero-copy slice.
+                let bits = *bytes.get(*pos).ok_or("truncated bits_per_value")?;
                 *pos += 1;
-                let count = read_u32_le(data, pos)? as usize;
-                let data_len = read_u32_le(data, pos)? as usize;
-                let mut words = Vec::with_capacity(data_len);
-                for _ in 0..data_len {
-                    words.push(read_u64_le(data, pos)?);
+                let count = read_u32_le(bytes, pos)? as usize;
+                let word_count = read_u32_le(bytes, pos)? as usize;
+                let need = word_count
+                    .checked_mul(8)
+                    .ok_or("BitPacked word count overflow")?;
+                if *pos + need > bytes.len() {
+                    return Err("truncated BitPacked data");
                 }
-                Ok(Self::BitPacked(BitPackedInts::from_raw_parts(
-                    words, bits, count,
+                let storage = data.slice(*pos..*pos + need);
+                *pos += need;
+                Ok(Self::BitPacked(BitPackedInts::from_bytes_storage(
+                    storage, bits, count,
                 )))
             }
             1 => {
-                // Dict
-                let dict_len = read_u32_le(data, pos)? as usize;
+                // Dict: dict header on heap; codes contiguous LE u32 → slice.
+                let dict_len = read_u32_le(bytes, pos)? as usize;
                 let mut entries: Vec<Arc<str>> = Vec::with_capacity(dict_len);
                 for _ in 0..dict_len {
-                    let slen = read_u32_le(data, pos)? as usize;
-                    if *pos + slen > data.len() {
+                    let slen = read_u32_le(bytes, pos)? as usize;
+                    if *pos + slen > bytes.len() {
                         return Err("truncated dict string");
                     }
-                    let s = std::str::from_utf8(&data[*pos..*pos + slen])
+                    let s = std::str::from_utf8(&bytes[*pos..*pos + slen])
                         .map_err(|_| "invalid UTF-8 in dict")?;
                     entries.push(Arc::from(s));
                     *pos += slen;
                 }
-                let codes_len = read_u32_le(data, pos)? as usize;
-                let mut codes = Vec::with_capacity(codes_len);
-                for _ in 0..codes_len {
-                    codes.push(read_u32_le(data, pos)?);
+                let codes_len = read_u32_le(bytes, pos)? as usize;
+                let need = codes_len.checked_mul(4).ok_or("Dict codes overflow")?;
+                if *pos + need > bytes.len() {
+                    return Err("truncated Dict codes");
                 }
-                Ok(Self::Dict(DictionaryEncoding::new(
+                let codes_bytes = data.slice(*pos..*pos + need);
+                *pos += need;
+                Ok(Self::Dict(DictionaryEncoding::from_bytes_storage(
                     Arc::from(entries.into_boxed_slice()),
-                    codes,
+                    codes_bytes,
+                    codes_len,
                 )))
             }
             2 => {
-                // Bitmap
-                let bit_len = read_u32_le(data, pos)? as usize;
-                let data_len = read_u32_le(data, pos)? as usize;
-                let mut words = Vec::with_capacity(data_len);
-                for _ in 0..data_len {
-                    words.push(read_u64_le(data, pos)?);
+                // Bitmap: contiguous LE u64 words → zero-copy slice.
+                let bit_len = read_u32_le(bytes, pos)? as usize;
+                let word_count = read_u32_le(bytes, pos)? as usize;
+                let need = word_count
+                    .checked_mul(8)
+                    .ok_or("Bitmap word count overflow")?;
+                if *pos + need > bytes.len() {
+                    return Err("truncated Bitmap data");
                 }
-                Ok(Self::Bitmap(BitVector::from_raw_parts(words, bit_len)))
+                let storage = data.slice(*pos..*pos + need);
+                *pos += need;
+                Ok(Self::Bitmap(BitVector::from_bytes_storage(
+                    storage, bit_len,
+                )))
             }
             3 => {
                 // Int8Vector
-                let dimensions = read_u16_le(data, pos)?;
-                let data_len = read_u32_le(data, pos)? as usize;
-                if *pos + data_len > data.len() {
+                let dimensions = read_u16_le(bytes, pos)?;
+                let data_len = read_u32_le(bytes, pos)? as usize;
+                if *pos + data_len > bytes.len() {
                     return Err("truncated Int8Vector data");
                 }
-                let bytes = Bytes::copy_from_slice(&data[*pos..*pos + data_len]);
+                let storage = data.slice(*pos..*pos + data_len);
                 *pos += data_len;
-                Ok(Self::Int8Vector { bytes, dimensions })
+                Ok(Self::Int8Vector {
+                    bytes: storage,
+                    dimensions,
+                })
             }
             4 => {
                 // Float64: count of f64 values; storage is 8 bytes each.
-                let count = read_u32_le(data, pos)? as usize;
+                let count = read_u32_le(bytes, pos)? as usize;
                 let byte_need = count.checked_mul(8).ok_or("Float64 length overflow")?;
-                if *pos + byte_need > data.len() {
+                if *pos + byte_need > bytes.len() {
                     return Err("truncated Float64 data");
                 }
-                let bytes = Bytes::copy_from_slice(&data[*pos..*pos + byte_need]);
+                let storage = data.slice(*pos..*pos + byte_need);
                 *pos += byte_need;
-                Ok(Self::Float64(bytes))
+                Ok(Self::Float64(storage))
             }
             5 => {
                 // Float32Vector: total component count (rows * dims).
-                let dimensions = read_u16_le(data, pos)?;
-                let component_count = read_u32_le(data, pos)? as usize;
+                let dimensions = read_u16_le(bytes, pos)?;
+                let component_count = read_u32_le(bytes, pos)? as usize;
                 let byte_need = component_count
                     .checked_mul(4)
                     .ok_or("Float32Vector length overflow")?;
-                if *pos + byte_need > data.len() {
+                if *pos + byte_need > bytes.len() {
                     return Err("truncated Float32Vector data");
                 }
-                let bytes = Bytes::copy_from_slice(&data[*pos..*pos + byte_need]);
+                let storage = data.slice(*pos..*pos + byte_need);
                 *pos += byte_need;
-                Ok(Self::Float32Vector { bytes, dimensions })
+                Ok(Self::Float32Vector {
+                    bytes: storage,
+                    dimensions,
+                })
             }
             6 => {
                 // RawI64: count of i64 values; storage is 8 bytes each.
-                let count = read_u32_le(data, pos)? as usize;
+                let count = read_u32_le(bytes, pos)? as usize;
                 let byte_need = count.checked_mul(8).ok_or("RawI64 length overflow")?;
-                if *pos + byte_need > data.len() {
+                if *pos + byte_need > bytes.len() {
                     return Err("truncated RawI64 data");
                 }
-                let bytes = Bytes::copy_from_slice(&data[*pos..*pos + byte_need]);
+                let storage = data.slice(*pos..*pos + byte_need);
                 *pos += byte_need;
-                Ok(Self::RawI64(bytes))
+                Ok(Self::RawI64(storage))
             }
             _ => Err("unknown codec discriminant"),
         }
@@ -781,10 +796,8 @@ impl ColumnCodec {
                         .collect();
                     let block_packed =
                         crate::codec::BitPackedInts::pack_with_bits(&row_values, bits_per_value);
-                    write_usize_as_u32(&mut bodies, block_packed.data().len());
-                    for &word in block_packed.data() {
-                        bodies.extend_from_slice(&word.to_le_bytes());
-                    }
+                    write_usize_as_u32(&mut bodies, block_packed.word_count());
+                    bodies.extend_from_slice(block_packed.data_bytes());
                     #[allow(clippy::cast_possible_truncation)]
                     let byte_len = (bodies.len() as u32) - byte_offset;
                     metas.push(BlockMeta {
@@ -803,17 +816,16 @@ impl ColumnCodec {
                     write_usize_as_u32(buf, s.len());
                     buf.extend_from_slice(s);
                 }
-                let codes = dict.codes();
+                let codes_bytes = dict.codes_bytes();
+                let total_codes = dict.code_count();
                 for i in 0..block_count {
                     let start = i * block_rows;
-                    let end = (start + block_rows).min(codes.len());
+                    let end = (start + block_rows).min(total_codes);
                     #[allow(clippy::cast_possible_truncation)]
                     let row_count = (end - start) as u32;
                     #[allow(clippy::cast_possible_truncation)]
                     let byte_offset = bodies.len() as u32;
-                    for &code in &codes[start..end] {
-                        bodies.extend_from_slice(&code.to_le_bytes());
-                    }
+                    bodies.extend_from_slice(&codes_bytes[start * 4..end * 4]);
                     #[allow(clippy::cast_possible_truncation)]
                     let byte_len = (bodies.len() as u32) - byte_offset;
                     metas.push(BlockMeta {
@@ -836,10 +848,8 @@ impl ColumnCodec {
                         .map(|j| bv.get(j).expect("row in range"))
                         .collect();
                     let block_bv = crate::codec::BitVector::from_bools(&bits);
-                    write_usize_as_u32(&mut bodies, block_bv.data().len());
-                    for &word in block_bv.data() {
-                        bodies.extend_from_slice(&word.to_le_bytes());
-                    }
+                    write_usize_as_u32(&mut bodies, block_bv.word_count());
+                    bodies.extend_from_slice(block_bv.data_bytes());
                     #[allow(clippy::cast_possible_truncation)]
                     let byte_len = (bodies.len() as u32) - byte_offset;
                     metas.push(BlockMeta {
@@ -957,27 +967,37 @@ impl ColumnCodec {
     ///
     /// Returns a static-string error on truncation, unknown discriminant,
     /// or block-index inconsistency (offset + len out of bounds).
-    pub fn read_from_v2(data: &[u8], pos: &mut usize) -> Result<Self, &'static str> {
-        let discriminant = *data.get(*pos).ok_or("truncated codec discriminant")?;
+    pub fn read_from_v2(data: &Bytes, pos: &mut usize) -> Result<Self, &'static str> {
+        // Phase 3c: same `&Bytes` switch as `read_from`. Fixed-width and
+        // Dict bodies are contiguous on disk (writer appends per-block in
+        // order), so the whole bodies region can be sliced as one
+        // refcounted view (zero-copy on the mmap path).
+        //
+        // BitPacked and Bitmap blocks carry inline `word_count` prefixes
+        // and are bit-packed independently per block, so they cannot
+        // be zero-copy under the v2/v3 format and continue to materialize
+        // a `Vec<u64>` per load. A future format revision could lift this.
+        let bytes = data.as_ref();
+        let discriminant = *bytes.get(*pos).ok_or("truncated codec discriminant")?;
         *pos += 1;
         match discriminant {
             0 => {
-                // BitPacked: bits_per_value, then block index + bodies.
-                let bits = *data.get(*pos).ok_or("truncated bits_per_value")?;
+                // BitPacked: per-block packing → materialize-on-load.
+                let bits = *bytes.get(*pos).ok_or("truncated bits_per_value")?;
                 *pos += 1;
-                let (metas, bodies_start) = read_block_index(data, pos)?;
+                let (metas, bodies_start) = read_block_index(bytes, pos)?;
                 let mut all_values: Vec<u64> = Vec::new();
                 for meta in &metas {
                     let body_start = bodies_start + meta.byte_offset as usize;
                     let body_end = body_start + meta.byte_len as usize;
-                    if body_end > data.len() {
+                    if body_end > bytes.len() {
                         return Err("BitPacked block body out of bounds");
                     }
                     let mut bp = body_start;
-                    let word_count = read_u32_le(data, &mut bp)? as usize;
+                    let word_count = read_u32_le(bytes, &mut bp)? as usize;
                     let mut words = Vec::with_capacity(word_count);
                     for _ in 0..word_count {
-                        words.push(read_u64_le(data, &mut bp)?);
+                        words.push(read_u64_le(bytes, &mut bp)?);
                     }
                     let block_bp = crate::codec::BitPackedInts::from_raw_parts(
                         words,
@@ -998,45 +1018,44 @@ impl ColumnCodec {
                 ))
             }
             1 => {
-                // Dict: global dictionary, then block index of u32 codes.
-                let dict_len = read_u32_le(data, pos)? as usize;
+                // Dict: global dictionary header on heap; codes contiguous → slice.
+                let dict_len = read_u32_le(bytes, pos)? as usize;
                 let mut entries: Vec<Arc<str>> = Vec::with_capacity(dict_len);
                 for _ in 0..dict_len {
-                    let slen = read_u32_le(data, pos)? as usize;
-                    if *pos + slen > data.len() {
+                    let slen = read_u32_le(bytes, pos)? as usize;
+                    if *pos + slen > bytes.len() {
                         return Err("truncated dict string");
                     }
-                    let s = std::str::from_utf8(&data[*pos..*pos + slen])
+                    let s = std::str::from_utf8(&bytes[*pos..*pos + slen])
                         .map_err(|_| "invalid UTF-8 in dict")?;
                     entries.push(Arc::from(s));
                     *pos += slen;
                 }
-                let (metas, bodies_start) = read_block_index(data, pos)?;
-                let mut codes: Vec<u32> = Vec::new();
-                for meta in &metas {
-                    let body_start = bodies_start + meta.byte_offset as usize;
-                    let mut bp = body_start;
-                    for _ in 0..meta.row_count {
-                        codes.push(read_u32_le(data, &mut bp)?);
-                    }
+                let (metas, bodies_start) = read_block_index(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("Dict v2 bodies out of bounds");
                 }
-                *pos = bodies_start + total_bodies_len(&metas);
-                Ok(Self::Dict(DictionaryEncoding::new(
+                let codes_bytes = data.slice(bodies_start..bodies_start + total);
+                let code_count = total / 4;
+                *pos = bodies_start + total;
+                Ok(Self::Dict(DictionaryEncoding::from_bytes_storage(
                     Arc::from(entries.into_boxed_slice()),
-                    codes,
+                    codes_bytes,
+                    code_count,
                 )))
             }
             2 => {
-                // Bitmap
-                let (metas, bodies_start) = read_block_index(data, pos)?;
+                // Bitmap: per-block packing → materialize-on-load.
+                let (metas, bodies_start) = read_block_index(bytes, pos)?;
                 let mut all_bits: Vec<bool> = Vec::new();
                 for meta in &metas {
                     let body_start = bodies_start + meta.byte_offset as usize;
                     let mut bp = body_start;
-                    let word_count = read_u32_le(data, &mut bp)? as usize;
+                    let word_count = read_u32_le(bytes, &mut bp)? as usize;
                     let mut words = Vec::with_capacity(word_count);
                     for _ in 0..word_count {
-                        words.push(read_u64_le(data, &mut bp)?);
+                        words.push(read_u64_le(bytes, &mut bp)?);
                     }
                     let block_bv =
                         crate::codec::BitVector::from_raw_parts(words, meta.row_count as usize);
@@ -1048,78 +1067,56 @@ impl ColumnCodec {
                 Ok(Self::Bitmap(crate::codec::BitVector::from_bools(&all_bits)))
             }
             3 => {
-                // Int8Vector: each block carries row_count * dims raw bytes.
-                let dimensions = read_u16_le(data, pos)?;
-                let (metas, bodies_start) = read_block_index(data, pos)?;
-                let dims = dimensions as usize;
-                let mut buf = BytesMut::new();
-                for meta in &metas {
-                    let body_start = bodies_start + meta.byte_offset as usize;
-                    let body_end = body_start + meta.byte_len as usize;
-                    if body_end > data.len() {
-                        return Err("Int8Vector block body out of bounds");
-                    }
-                    let expected = (meta.row_count as usize) * dims;
-                    if (meta.byte_len as usize) != expected {
-                        return Err("Int8Vector block byte_len mismatch");
-                    }
-                    buf.extend_from_slice(&data[body_start..body_end]);
+                // Int8Vector: contiguous bytes → zero-copy slice.
+                let dimensions = read_u16_le(bytes, pos)?;
+                let (metas, bodies_start) = read_block_index(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("Int8Vector v2 bodies out of bounds");
                 }
-                *pos = bodies_start + total_bodies_len(&metas);
+                let storage = data.slice(bodies_start..bodies_start + total);
+                *pos = bodies_start + total;
                 Ok(Self::Int8Vector {
-                    bytes: buf.freeze(),
+                    bytes: storage,
                     dimensions,
                 })
             }
             4 => {
-                // Float64: each block carries row_count * 8 LE bytes.
-                let (metas, bodies_start) = read_block_index(data, pos)?;
-                let mut buf = BytesMut::new();
-                for meta in &metas {
-                    let body_start = bodies_start + meta.byte_offset as usize;
-                    let need = (meta.row_count as usize) * 8;
-                    if body_start + need > data.len() {
-                        return Err("truncated Float64 block body");
-                    }
-                    buf.extend_from_slice(&data[body_start..body_start + need]);
+                // Float64: contiguous LE u64 bytes → zero-copy slice.
+                let (metas, bodies_start) = read_block_index(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("Float64 v2 bodies out of bounds");
                 }
-                *pos = bodies_start + total_bodies_len(&metas);
-                Ok(Self::Float64(buf.freeze()))
+                let storage = data.slice(bodies_start..bodies_start + total);
+                *pos = bodies_start + total;
+                Ok(Self::Float64(storage))
             }
             5 => {
-                // Float32Vector: each block carries row_count * dims * 4 LE bytes.
-                let dimensions = read_u16_le(data, pos)?;
-                let (metas, bodies_start) = read_block_index(data, pos)?;
-                let row_byte_size = (dimensions as usize).checked_mul(4).unwrap_or(0);
-                let mut buf = BytesMut::new();
-                for meta in &metas {
-                    let body_start = bodies_start + meta.byte_offset as usize;
-                    let need = (meta.row_count as usize) * row_byte_size;
-                    if body_start + need > data.len() {
-                        return Err("truncated Float32Vector block body");
-                    }
-                    buf.extend_from_slice(&data[body_start..body_start + need]);
+                // Float32Vector: contiguous LE bytes → zero-copy slice.
+                let dimensions = read_u16_le(bytes, pos)?;
+                let (metas, bodies_start) = read_block_index(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("Float32Vector v2 bodies out of bounds");
                 }
-                *pos = bodies_start + total_bodies_len(&metas);
+                let storage = data.slice(bodies_start..bodies_start + total);
+                *pos = bodies_start + total;
                 Ok(Self::Float32Vector {
-                    bytes: buf.freeze(),
+                    bytes: storage,
                     dimensions,
                 })
             }
             6 => {
-                // RawI64: each block carries row_count * 8 LE bytes.
-                let (metas, bodies_start) = read_block_index(data, pos)?;
-                let mut buf = BytesMut::new();
-                for meta in &metas {
-                    let body_start = bodies_start + meta.byte_offset as usize;
-                    let need = (meta.row_count as usize) * 8;
-                    if body_start + need > data.len() {
-                        return Err("truncated RawI64 block body");
-                    }
-                    buf.extend_from_slice(&data[body_start..body_start + need]);
+                // RawI64: contiguous LE i64 bytes → zero-copy slice.
+                let (metas, bodies_start) = read_block_index(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("RawI64 v2 bodies out of bounds");
                 }
-                *pos = bodies_start + total_bodies_len(&metas);
-                Ok(Self::RawI64(buf.freeze()))
+                let storage = data.slice(bodies_start..bodies_start + total);
+                *pos = bodies_start + total;
+                Ok(Self::RawI64(storage))
             }
             _ => Err("unknown codec discriminant"),
         }
@@ -1136,28 +1133,31 @@ impl ColumnCodec {
     /// Returns a static-string error on truncation, unknown
     /// discriminant, or block-index inconsistency.
     pub fn read_from_v3(
-        data: &[u8],
+        data: &Bytes,
         pos: &mut usize,
     ) -> Result<(Self, Vec<super::zone_map::ZoneMap>), &'static str> {
-        let discriminant = *data.get(*pos).ok_or("truncated codec discriminant")?;
+        // Phase 3c: same `&Bytes` shape as `read_from_v2`. v3 differs
+        // only in that the block index carries inline per-block stats.
+        let bytes = data.as_ref();
+        let discriminant = *bytes.get(*pos).ok_or("truncated codec discriminant")?;
         *pos += 1;
         match discriminant {
             0 => {
-                let bits = *data.get(*pos).ok_or("truncated bits_per_value")?;
+                let bits = *bytes.get(*pos).ok_or("truncated bits_per_value")?;
                 *pos += 1;
-                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
+                let (metas, stats, bodies_start) = read_block_index_v3(bytes, pos)?;
                 let mut all_values: Vec<u64> = Vec::new();
                 for meta in &metas {
                     let body_start = bodies_start + meta.byte_offset as usize;
                     let body_end = body_start + meta.byte_len as usize;
-                    if body_end > data.len() {
+                    if body_end > bytes.len() {
                         return Err("BitPacked block body out of bounds");
                     }
                     let mut bp = body_start;
-                    let word_count = read_u32_le(data, &mut bp)? as usize;
+                    let word_count = read_u32_le(bytes, &mut bp)? as usize;
                     let mut words = Vec::with_capacity(word_count);
                     for _ in 0..word_count {
-                        words.push(read_u64_le(data, &mut bp)?);
+                        words.push(read_u64_le(bytes, &mut bp)?);
                     }
                     let block_bp = crate::codec::BitPackedInts::from_raw_parts(
                         words,
@@ -1182,46 +1182,45 @@ impl ColumnCodec {
                 ))
             }
             1 => {
-                let dict_len = read_u32_le(data, pos)? as usize;
+                let dict_len = read_u32_le(bytes, pos)? as usize;
                 let mut entries: Vec<Arc<str>> = Vec::with_capacity(dict_len);
                 for _ in 0..dict_len {
-                    let slen = read_u32_le(data, pos)? as usize;
-                    if *pos + slen > data.len() {
+                    let slen = read_u32_le(bytes, pos)? as usize;
+                    if *pos + slen > bytes.len() {
                         return Err("truncated dict string");
                     }
-                    let s = std::str::from_utf8(&data[*pos..*pos + slen])
+                    let s = std::str::from_utf8(&bytes[*pos..*pos + slen])
                         .map_err(|_| "invalid UTF-8 in dict")?;
                     entries.push(Arc::from(s));
                     *pos += slen;
                 }
-                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
-                let mut codes: Vec<u32> = Vec::new();
-                for meta in &metas {
-                    let body_start = bodies_start + meta.byte_offset as usize;
-                    let mut bp = body_start;
-                    for _ in 0..meta.row_count {
-                        codes.push(read_u32_le(data, &mut bp)?);
-                    }
+                let (metas, stats, bodies_start) = read_block_index_v3(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("Dict v3 bodies out of bounds");
                 }
-                *pos = bodies_start + total_bodies_len(&metas);
+                let codes_bytes = data.slice(bodies_start..bodies_start + total);
+                let code_count = total / 4;
+                *pos = bodies_start + total;
                 Ok((
-                    Self::Dict(DictionaryEncoding::new(
+                    Self::Dict(DictionaryEncoding::from_bytes_storage(
                         Arc::from(entries.into_boxed_slice()),
-                        codes,
+                        codes_bytes,
+                        code_count,
                     )),
                     stats,
                 ))
             }
             2 => {
-                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
+                let (metas, stats, bodies_start) = read_block_index_v3(bytes, pos)?;
                 let mut all_bits: Vec<bool> = Vec::new();
                 for meta in &metas {
                     let body_start = bodies_start + meta.byte_offset as usize;
                     let mut bp = body_start;
-                    let word_count = read_u32_le(data, &mut bp)? as usize;
+                    let word_count = read_u32_le(bytes, &mut bp)? as usize;
                     let mut words = Vec::with_capacity(word_count);
                     for _ in 0..word_count {
-                        words.push(read_u64_le(data, &mut bp)?);
+                        words.push(read_u64_le(bytes, &mut bp)?);
                     }
                     let block_bv =
                         crate::codec::BitVector::from_raw_parts(words, meta.row_count as usize);
@@ -1236,80 +1235,58 @@ impl ColumnCodec {
                 ))
             }
             3 => {
-                let dimensions = read_u16_le(data, pos)?;
-                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
-                let dims = dimensions as usize;
-                let mut buf = BytesMut::new();
-                for meta in &metas {
-                    let body_start = bodies_start + meta.byte_offset as usize;
-                    let body_end = body_start + meta.byte_len as usize;
-                    if body_end > data.len() {
-                        return Err("Int8Vector block body out of bounds");
-                    }
-                    let expected = (meta.row_count as usize) * dims;
-                    if (meta.byte_len as usize) != expected {
-                        return Err("Int8Vector block byte_len mismatch");
-                    }
-                    buf.extend_from_slice(&data[body_start..body_end]);
+                let dimensions = read_u16_le(bytes, pos)?;
+                let (metas, stats, bodies_start) = read_block_index_v3(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("Int8Vector v3 bodies out of bounds");
                 }
-                *pos = bodies_start + total_bodies_len(&metas);
+                let storage = data.slice(bodies_start..bodies_start + total);
+                *pos = bodies_start + total;
                 Ok((
                     Self::Int8Vector {
-                        bytes: buf.freeze(),
+                        bytes: storage,
                         dimensions,
                     },
                     stats,
                 ))
             }
             4 => {
-                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
-                let mut buf = BytesMut::new();
-                for meta in &metas {
-                    let body_start = bodies_start + meta.byte_offset as usize;
-                    let need = (meta.row_count as usize) * 8;
-                    if body_start + need > data.len() {
-                        return Err("truncated Float64 block body");
-                    }
-                    buf.extend_from_slice(&data[body_start..body_start + need]);
+                let (metas, stats, bodies_start) = read_block_index_v3(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("Float64 v3 bodies out of bounds");
                 }
-                *pos = bodies_start + total_bodies_len(&metas);
-                Ok((Self::Float64(buf.freeze()), stats))
+                let storage = data.slice(bodies_start..bodies_start + total);
+                *pos = bodies_start + total;
+                Ok((Self::Float64(storage), stats))
             }
             5 => {
-                let dimensions = read_u16_le(data, pos)?;
-                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
-                let row_byte_size = (dimensions as usize).checked_mul(4).unwrap_or(0);
-                let mut buf = BytesMut::new();
-                for meta in &metas {
-                    let body_start = bodies_start + meta.byte_offset as usize;
-                    let need = (meta.row_count as usize) * row_byte_size;
-                    if body_start + need > data.len() {
-                        return Err("truncated Float32Vector block body");
-                    }
-                    buf.extend_from_slice(&data[body_start..body_start + need]);
+                let dimensions = read_u16_le(bytes, pos)?;
+                let (metas, stats, bodies_start) = read_block_index_v3(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("Float32Vector v3 bodies out of bounds");
                 }
-                *pos = bodies_start + total_bodies_len(&metas);
+                let storage = data.slice(bodies_start..bodies_start + total);
+                *pos = bodies_start + total;
                 Ok((
                     Self::Float32Vector {
-                        bytes: buf.freeze(),
+                        bytes: storage,
                         dimensions,
                     },
                     stats,
                 ))
             }
             6 => {
-                let (metas, stats, bodies_start) = read_block_index_v3(data, pos)?;
-                let mut buf = BytesMut::new();
-                for meta in &metas {
-                    let body_start = bodies_start + meta.byte_offset as usize;
-                    let need = (meta.row_count as usize) * 8;
-                    if body_start + need > data.len() {
-                        return Err("truncated RawI64 block body");
-                    }
-                    buf.extend_from_slice(&data[body_start..body_start + need]);
+                let (metas, stats, bodies_start) = read_block_index_v3(bytes, pos)?;
+                let total = total_bodies_len(&metas);
+                if bodies_start + total > bytes.len() {
+                    return Err("RawI64 v3 bodies out of bounds");
                 }
-                *pos = bodies_start + total_bodies_len(&metas);
-                Ok((Self::RawI64(buf.freeze()), stats))
+                let storage = data.slice(bodies_start..bodies_start + total);
+                *pos = bodies_start + total;
+                Ok((Self::RawI64(storage), stats))
             }
             _ => Err("unknown codec discriminant"),
         }
@@ -1319,13 +1296,13 @@ impl ColumnCodec {
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
         match self {
-            Self::BitPacked(bp) => bp.data().len() * std::mem::size_of::<u64>(),
+            Self::BitPacked(bp) => bp.data_bytes().len(),
             Self::Dict(d) => {
-                let codes_bytes = d.codes().len() * std::mem::size_of::<u32>();
+                let codes_bytes = d.codes_bytes().len();
                 let dict_bytes: usize = d.dictionary().iter().map(|s| s.len()).sum();
                 codes_bytes + dict_bytes
             }
-            Self::Bitmap(bv) => bv.data().len() * std::mem::size_of::<u64>(),
+            Self::Bitmap(bv) => bv.data_bytes().len(),
             Self::Int8Vector { bytes, .. } => bytes.len(),
             Self::Float64(bytes) => bytes.len(),
             Self::Float32Vector { bytes, .. } => bytes.len(),
@@ -1882,7 +1859,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).unwrap();
+        let decoded =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap();
         assert_eq!(pos, buf.len(), "read_from should consume the full buffer");
         assert_eq!(decoded.len(), rows);
 
@@ -1956,23 +1934,35 @@ mod tests {
 
         // Truncate to zero: missing discriminant.
         let mut pos = 0;
-        assert!(ColumnCodec::read_from(&[], &mut pos).is_err());
+        assert!(ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&[]), &mut pos).is_err());
 
         // Truncate after the discriminant but before bits_per_value.
         let mut pos = 0;
-        assert!(ColumnCodec::read_from(&buf[..1], &mut pos).is_err());
+        assert!(
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf[..1]), &mut pos).is_err()
+        );
 
         // Truncate mid-header (before the row count u32 is complete).
         let mut pos = 0;
-        assert!(ColumnCodec::read_from(&buf[..3], &mut pos).is_err());
+        assert!(
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf[..3]), &mut pos).is_err()
+        );
 
         // Truncate mid-payload (drop the last byte of the packed u64 words).
         let mut pos = 0;
-        assert!(ColumnCodec::read_from(&buf[..buf.len() - 1], &mut pos).is_err());
+        assert!(
+            ColumnCodec::read_from(
+                &bytes::Bytes::copy_from_slice(&buf[..buf.len() - 1]),
+                &mut pos
+            )
+            .is_err()
+        );
 
         // Unknown discriminant: must return an error, not panic.
         let mut pos = 0;
-        assert!(ColumnCodec::read_from(&[0xFFu8], &mut pos).is_err());
+        assert!(
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&[0xFFu8]), &mut pos).is_err()
+        );
 
         // Truncated Int8Vector payload (dimensions OK, length promises more
         // bytes than exist). Build a minimal header: discriminant=3, dims=2,
@@ -1982,7 +1972,7 @@ mod tests {
         bad.extend_from_slice(&4u32.to_le_bytes());
         bad.extend_from_slice(&[0u8, 0u8]);
         let mut pos = 0;
-        assert!(ColumnCodec::read_from(&bad, &mut pos).is_err());
+        assert!(ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&bad), &mut pos).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -1998,7 +1988,8 @@ mod tests {
         col.write_to(&mut buf);
 
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).unwrap();
+        let decoded =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap();
         assert_eq!(pos, buf.len(), "read should consume entire buffer");
 
         assert_eq!(decoded.len(), 4);
@@ -2019,7 +2010,8 @@ mod tests {
         col.write_to(&mut buf);
 
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).unwrap();
+        let decoded =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap();
         assert_eq!(pos, buf.len());
         assert_eq!(decoded.len(), 4);
         for i in 0..4 {
@@ -2036,7 +2028,8 @@ mod tests {
         col.write_to(&mut buf);
 
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).unwrap();
+        let decoded =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap();
         assert_eq!(pos, buf.len());
         assert_eq!(decoded.len(), 7);
         for i in 0..7 {
@@ -2053,7 +2046,8 @@ mod tests {
         col.write_to(&mut buf);
 
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).unwrap();
+        let decoded =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap();
         assert_eq!(pos, buf.len());
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded.get_int8_vector(0), Some(&[1i8, -2, 3, -4][..]));
@@ -2067,7 +2061,8 @@ mod tests {
     #[test]
     fn test_read_from_empty_buffer_errors() {
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&[], &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&[]), &mut pos).unwrap_err();
         assert_eq!(err, "truncated codec discriminant");
     }
 
@@ -2076,7 +2071,8 @@ mod tests {
         // Discriminant values 0..=3 are valid; 99 is unknown.
         let buf = vec![99u8];
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
         assert_eq!(err, "unknown codec discriminant");
     }
 
@@ -2085,7 +2081,8 @@ mod tests {
         // Discriminant 0 (BitPacked) but no bits_per_value byte following.
         let buf = vec![0u8];
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
         assert_eq!(err, "truncated bits_per_value");
     }
 
@@ -2094,7 +2091,8 @@ mod tests {
         // Discriminant + bits byte, but truncated before u32 count.
         let buf = vec![0u8, 4, 0, 0]; // only 2 of 4 bytes for u32 count
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
         assert_eq!(err, "truncated u32");
     }
 
@@ -2106,8 +2104,9 @@ mod tests {
         buf.extend_from_slice(&2u32.to_le_bytes()); // data_len=2
         // no u64 words
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
-        assert_eq!(err, "truncated u64");
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
+        assert_eq!(err, "truncated BitPacked data");
     }
 
     #[test]
@@ -2118,7 +2117,8 @@ mod tests {
         buf.extend_from_slice(&5u32.to_le_bytes()); // slen=5
         buf.extend_from_slice(b"abc"); // only 3 bytes, need 5
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
         assert_eq!(err, "truncated dict string");
     }
 
@@ -2129,7 +2129,8 @@ mod tests {
         buf.extend_from_slice(&2u32.to_le_bytes()); // slen=2
         buf.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
         assert_eq!(err, "invalid UTF-8 in dict");
     }
 
@@ -2140,8 +2141,9 @@ mod tests {
         buf.extend_from_slice(&64u32.to_le_bytes()); // bit_len
         buf.extend_from_slice(&1u32.to_le_bytes()); // data_len
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
-        assert_eq!(err, "truncated u64");
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
+        assert_eq!(err, "truncated Bitmap data");
     }
 
     #[test]
@@ -2149,7 +2151,8 @@ mod tests {
         // Discriminant=3 (Int8Vector), only 1 byte of the 2-byte dimensions.
         let buf = vec![3u8, 0];
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
         assert_eq!(err, "truncated u16");
     }
 
@@ -2161,7 +2164,8 @@ mod tests {
         buf.extend_from_slice(&4u32.to_le_bytes()); // data_len=4
         buf.extend_from_slice(&[10u8, 20]); // only 2 of 4 bytes
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
         assert_eq!(err, "truncated Int8Vector data");
     }
 
@@ -2179,7 +2183,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).unwrap();
+        let decoded =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap();
         assert_eq!(pos, buf.len());
         assert!(decoded.is_empty());
     }
@@ -2194,7 +2199,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).unwrap();
+        let decoded =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap();
         assert_eq!(pos, buf.len());
         assert!(decoded.is_empty());
     }
@@ -2208,7 +2214,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).unwrap();
+        let decoded =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap();
         assert_eq!(pos, buf.len());
         assert!(decoded.is_empty());
     }
@@ -2221,7 +2228,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).unwrap();
+        let decoded =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap();
         assert_eq!(pos, buf.len());
         assert!(decoded.is_empty());
     }
@@ -2242,7 +2250,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).unwrap();
+        let decoded =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap();
         assert_eq!(decoded.get(0), Some(Value::String(ArcStr::from(""))));
         assert_eq!(decoded.get(2), Some(Value::String(ArcStr::from(""))));
     }
@@ -2507,7 +2516,8 @@ mod tests {
         col.write_to(&mut buf);
 
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).expect("decode should succeed");
+        let decoded = ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("decode should succeed");
         assert_eq!(pos, buf.len());
         assert_eq!(decoded.len(), col.len());
         for i in 0..col.len() {
@@ -2527,7 +2537,8 @@ mod tests {
         col.write_to(&mut buf);
 
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).expect("decode should succeed");
+        let decoded = ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("decode should succeed");
         assert_eq!(pos, buf.len());
         assert_eq!(decoded.len(), col.len());
         for i in 0..col.len() {
@@ -2544,7 +2555,8 @@ mod tests {
         col.write_to(&mut buf);
 
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).expect("decode should succeed");
+        let decoded = ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("decode should succeed");
         assert_eq!(pos, buf.len());
         assert_eq!(decoded.len(), col.len());
         for i in 0..col.len() {
@@ -2562,7 +2574,8 @@ mod tests {
         col.write_to(&mut buf);
 
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).expect("decode should succeed");
+        let decoded = ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("decode should succeed");
         assert_eq!(pos, buf.len());
         assert_eq!(decoded.len(), col.len());
         for i in 0..col.len() {
@@ -2578,7 +2591,8 @@ mod tests {
     fn test_read_from_truncated_discriminant() {
         let data: &[u8] = &[];
         let mut pos = 0;
-        let err = ColumnCodec::read_from(data, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(data), &mut pos).unwrap_err();
         assert_eq!(err, "truncated codec discriminant");
     }
 
@@ -2586,7 +2600,8 @@ mod tests {
     fn test_read_from_unknown_discriminant() {
         let data: &[u8] = &[42];
         let mut pos = 0;
-        let err = ColumnCodec::read_from(data, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(data), &mut pos).unwrap_err();
         assert_eq!(err, "unknown codec discriminant");
     }
 
@@ -2595,7 +2610,8 @@ mod tests {
         // Discriminant 0 (BitPacked) with no following byte for bits_per_value.
         let data: &[u8] = &[0];
         let mut pos = 0;
-        let err = ColumnCodec::read_from(data, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(data), &mut pos).unwrap_err();
         assert_eq!(err, "truncated bits_per_value");
     }
 
@@ -2608,8 +2624,9 @@ mod tests {
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.extend_from_slice(&[0u8, 0, 0]); // only 3 bytes of the 8-byte word
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
-        assert_eq!(err, "truncated u64");
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
+        assert_eq!(err, "truncated BitPacked data");
     }
 
     #[test]
@@ -2621,7 +2638,8 @@ mod tests {
         // Only add 2 of the 5 needed bytes.
         buf.extend_from_slice(b"ab");
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
         assert_eq!(err, "truncated dict string");
     }
 
@@ -2633,7 +2651,8 @@ mod tests {
         buf.extend_from_slice(&2u32.to_le_bytes()); // slen = 2
         buf.extend_from_slice(&[0xFFu8, 0xFE]); // invalid UTF-8
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
         assert_eq!(err, "invalid UTF-8 in dict");
     }
 
@@ -2645,7 +2664,8 @@ mod tests {
         buf.extend_from_slice(&6u32.to_le_bytes()); // data_len = 6
         buf.extend_from_slice(&[1u8, 2, 3]);
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
         assert_eq!(err, "truncated Int8Vector data");
     }
 
@@ -2654,7 +2674,8 @@ mod tests {
         // Discriminant 3 + only 1 byte (u16 needs 2).
         let buf = vec![3u8, 0];
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
         assert_eq!(err, "truncated u16");
     }
 
@@ -2663,7 +2684,8 @@ mod tests {
         // Discriminant 2 + truncated u32 (bit_len).
         let buf = vec![2u8, 0, 0];
         let mut pos = 0;
-        let err = ColumnCodec::read_from(&buf, &mut pos).unwrap_err();
+        let err =
+            ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos).unwrap_err();
         assert_eq!(err, "truncated u32");
     }
 
@@ -2677,7 +2699,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).expect("decode should succeed");
+        let decoded = ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("decode should succeed");
         assert_eq!(decoded.len(), 0);
         assert!(decoded.is_empty());
     }
@@ -2688,7 +2711,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).expect("decode should succeed");
+        let decoded = ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("decode should succeed");
         assert!(decoded.is_empty());
     }
 
@@ -2698,7 +2722,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).expect("decode should succeed");
+        let decoded = ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("decode should succeed");
         assert_eq!(decoded.len(), 0);
     }
 
@@ -2766,7 +2791,8 @@ mod tests {
         col.write_to(&mut buf);
 
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).expect("decode should succeed");
+        let decoded = ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("decode should succeed");
         assert_eq!(pos, buf.len());
         assert_eq!(decoded.len(), col.len());
         for i in 0..col.len() {
@@ -2780,7 +2806,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let decoded = ColumnCodec::read_from(&buf, &mut pos).expect("decode should succeed");
+        let decoded = ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("decode should succeed");
         assert_eq!(decoded.len(), 0);
     }
 
@@ -2898,7 +2925,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to_v2(&mut buf);
         let mut pos = 0;
-        let recovered = ColumnCodec::read_from_v2(&buf, &mut pos).expect("v2 round-trip");
+        let recovered = ColumnCodec::read_from_v2(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("v2 round-trip");
         assert_eq!(pos, buf.len(), "v2 reader should consume entire buffer");
         assert_eq!(recovered.len(), col.len(), "len after v2 round-trip");
         for i in 0..col.len() {
@@ -3019,7 +3047,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let recovered = ColumnCodec::read_from(&buf, &mut pos).expect("v1 round-trip");
+        let recovered = ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("v1 round-trip");
         assert_eq!(recovered.len(), col.len());
         for i in 0..col.len() {
             assert_eq!(recovered.get(i), col.get(i));
@@ -3100,7 +3129,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let recovered = ColumnCodec::read_from(&buf, &mut pos).expect("v1 round-trip");
+        let recovered = ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("v1 round-trip");
         assert_eq!(recovered.len(), col.len());
         for i in 0..col.len() {
             assert_eq!(recovered.get(i), col.get(i));
@@ -3113,7 +3143,8 @@ mod tests {
         let mut buf = Vec::new();
         col.write_to(&mut buf);
         let mut pos = 0;
-        let recovered = ColumnCodec::read_from(&buf, &mut pos).expect("v1 round-trip");
+        let recovered = ColumnCodec::read_from(&bytes::Bytes::copy_from_slice(&buf), &mut pos)
+            .expect("v1 round-trip");
         assert_eq!(recovered.len(), col.len());
         for i in 0..col.len() {
             assert_eq!(recovered.get(i), col.get(i));

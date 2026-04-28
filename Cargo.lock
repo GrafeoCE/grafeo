@@ -1554,6 +1554,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "bincode",
+ "bytes",
  "codspeed-criterion-compat",
  "crc32fast",
  "crossbeam",

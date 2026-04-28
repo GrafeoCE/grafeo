@@ -1,8 +1,13 @@
 //! Stores booleans as individual bits - 8x smaller than `Vec<bool>`.
 //!
-//! Use this when you're tracking lots of boolean flags (like "visited" markers
-//! in graph traversals, or null bitmaps). Backed by `Vec<u64>` so bitwise
-//! operations like AND/OR/XOR stay cache-friendly.
+//! Use this when you're tracking lots of boolean flags (like null bitmaps
+//! or set membership). Phase 3b: storage split into an immutable
+//! `BitVector` (refcounted [`Bytes`]) and a mutable [`BitVectorBuilder`]
+//! that produces one via [`freeze`](BitVectorBuilder::freeze). This is
+//! the Apache Arrow / Lance "Array + Builder" idiom; the immutable side
+//! supports zero-copy mmap-backing for Phase 3c, while the builder
+//! retains the cheap word-level mutations needed by succinct-index
+//! construction (rank/select, wavelet trees, Elias-Fano).
 //!
 //! # Example
 //!
@@ -19,18 +24,47 @@
 
 use std::io;
 
+use bytes::{Bytes, BytesMut};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
-/// Stores booleans as individual bits - 8x smaller than `Vec<bool>`.
+/// Immutable bitset stored in a refcounted [`Bytes`] buffer of LE u64
+/// words.
 ///
-/// Supports bitwise operations ([`and`](Self::and), [`or`](Self::or),
-/// [`not`](Self::not)) for combining filter results efficiently.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// Supports bitwise combinators ([`and`](Self::and), [`or`](Self::or),
+/// [`not`](Self::not), [`xor`](Self::xor)) that *return new bitvectors*.
+/// Mutation lives on [`BitVectorBuilder`].
+#[derive(Debug, Clone)]
 pub struct BitVector {
-    /// Packed bits (little-endian within each word).
-    data: Vec<u64>,
+    /// LE u64 words concatenated, refcounted. Heap-owned and mmap-backed
+    /// columns share this type — only the constructor differs.
+    data: Bytes,
     /// Number of bits stored.
     len: usize,
+}
+
+impl PartialEq for BitVector {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.data == other.data
+    }
+}
+
+impl Eq for BitVector {}
+
+impl serde::Serialize for BitVector {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // On-disk shape stays `{data: Vec<u64>, len: usize}` for backward
+        // compatibility with the v1 LpgStoreSection format. Internal
+        // storage is now `Bytes`; we materialize a `Vec<u64>` only for
+        // serialization.
+        let words: Vec<u64> = (0..self.word_count())
+            .map(|i| self.word_at(i).unwrap_or(0))
+            .collect();
+        let mut s = serializer.serialize_struct("BitVector", 2)?;
+        s.serialize_field("data", &words)?;
+        s.serialize_field("len", &self.len)?;
+        s.end()
+    }
 }
 
 impl<'de> Deserialize<'de> for BitVector {
@@ -105,7 +139,7 @@ impl<'de> Deserialize<'de> for BitVector {
 /// Validates that `len` and `data` are consistent, returning a valid
 /// `BitVector` or an error message.
 fn validate_bitvec(len: usize, data: &[u64]) -> Result<BitVector, String> {
-    let expected_words = (len + 63) / 64;
+    let expected_words = len.div_ceil(64);
     if data.len() != expected_words {
         return Err(format!(
             "BitVector invariant violated: len={len} requires {expected_words} words, but data contains {} words",
@@ -113,17 +147,41 @@ fn validate_bitvec(len: usize, data: &[u64]) -> Result<BitVector, String> {
         ));
     }
     Ok(BitVector {
-        data: data.to_vec(),
+        data: words_to_bytes(data),
         len,
     })
 }
 
+/// Encodes `words` as little-endian bytes wrapped in a refcounted `Bytes`.
+fn words_to_bytes(words: &[u64]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(words.len() * 8);
+    for &w in words {
+        buf.extend_from_slice(&w.to_le_bytes());
+    }
+    buf.freeze()
+}
+
 impl BitVector {
-    /// Reconstructs from pre-packed raw parts.
+    /// Reconstructs from pre-packed raw parts (legacy: `Vec<u64>` words).
     ///
-    /// Used by section deserialization. The caller ensures data consistency.
+    /// Used by section deserialization that holds words on the heap.
+    /// Phase 3c will add [`from_bytes_storage`](Self::from_bytes_storage)
+    /// for mmap-backed construction.
     #[must_use]
     pub fn from_raw_parts(data: Vec<u64>, len: usize) -> Self {
+        Self {
+            data: words_to_bytes(&data),
+            len,
+        }
+    }
+
+    /// Constructs from pre-encoded bytes (Phase 3c entry point).
+    ///
+    /// `data` must be `ceil(len / 64) * 8` bytes of little-endian
+    /// `u64` words. Used by the mmap path so a column can hold a
+    /// slice of mapped memory without copying.
+    #[must_use]
+    pub fn from_bytes_storage(data: Bytes, len: usize) -> Self {
         Self { data, len }
     }
 
@@ -131,58 +189,38 @@ impl BitVector {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            data: Vec::new(),
-            len: 0,
-        }
-    }
-
-    /// Creates a bit vector with the specified capacity (in bits).
-    #[must_use]
-    pub fn with_capacity(bits: usize) -> Self {
-        let words = (bits + 63) / 64;
-        Self {
-            data: Vec::with_capacity(words),
+            data: Bytes::new(),
             len: 0,
         }
     }
 
     /// Creates a bit vector from a slice of booleans.
+    ///
+    /// Routes through a [`BitVectorBuilder`] internally; Phase 3b
+    /// preserves the original convenience API for callers that already
+    /// have the bools materialized.
     #[must_use]
     pub fn from_bools(bools: &[bool]) -> Self {
-        let num_words = (bools.len() + 63) / 64;
-        let mut data = vec![0u64; num_words];
-
-        for (i, &b) in bools.iter().enumerate() {
-            if b {
-                let word_idx = i / 64;
-                let bit_idx = i % 64;
-                data[word_idx] |= 1 << bit_idx;
-            }
+        let mut builder = BitVectorBuilder::with_capacity(bools.len());
+        for &b in bools {
+            builder.push(b);
         }
-
-        Self {
-            data,
-            len: bools.len(),
-        }
+        builder.freeze()
     }
 
     /// Creates a bit vector with all bits set to the same value.
     #[must_use]
     pub fn filled(len: usize, value: bool) -> Self {
-        let num_words = (len + 63) / 64;
-        let fill = if value { u64::MAX } else { 0 };
-        let data = vec![fill; num_words];
-
-        Self { data, len }
+        BitVectorBuilder::filled(len, value).freeze()
     }
 
-    /// Creates a bit vector with all bits set to false (0).
+    /// Creates a bit vector with all bits set to false.
     #[must_use]
     pub fn zeros(len: usize) -> Self {
         Self::filled(len, false)
     }
 
-    /// Creates a bit vector with all bits set to true (1).
+    /// Creates a bit vector with all bits set to true.
     #[must_use]
     pub fn ones(len: usize) -> Self {
         Self::filled(len, true)
@@ -206,44 +244,37 @@ impl BitVector {
         if index >= self.len {
             return None;
         }
-
         let word_idx = index / 64;
         let bit_idx = index % 64;
-        Some((self.data[word_idx] & (1 << bit_idx)) != 0)
+        let word = self.word_at(word_idx)?;
+        Some((word & (1 << bit_idx)) != 0)
     }
 
-    /// Sets the bit at the given index.
-    ///
-    /// # Panics
-    ///
-    /// Panics if index >= len.
-    pub fn set(&mut self, index: usize, value: bool) {
-        assert!(index < self.len, "Index out of bounds");
-
-        let word_idx = index / 64;
-        let bit_idx = index % 64;
-
-        if value {
-            self.data[word_idx] |= 1 << bit_idx;
-        } else {
-            self.data[word_idx] &= !(1 << bit_idx);
-        }
+    /// Returns the number of `u64` words backing this bit vector.
+    #[must_use]
+    pub fn word_count(&self) -> usize {
+        self.data.len() / 8
     }
 
-    /// Appends a bit to the end.
-    pub fn push(&mut self, value: bool) {
-        let word_idx = self.len / 64;
-        let bit_idx = self.len % 64;
+    /// Returns the word at `idx`, or `None` if out of range.
+    ///
+    /// Reads via `from_le_bytes`; supports unaligned `Bytes` slices
+    /// (e.g., mmap-backed sub-slices in Phase 3c).
+    #[must_use]
+    pub fn word_at(&self, idx: usize) -> Option<u64> {
+        let start = idx.checked_mul(8)?;
+        let end = start.checked_add(8)?;
+        let chunk: [u8; 8] = self.data.get(start..end)?.try_into().ok()?;
+        Some(u64::from_le_bytes(chunk))
+    }
 
-        if word_idx >= self.data.len() {
-            self.data.push(0);
-        }
-
-        if value {
-            self.data[word_idx] |= 1 << bit_idx;
-        }
-
-        self.len += 1;
+    /// Returns the raw byte storage.
+    ///
+    /// Phase 3c serializers use this to write the storage out directly
+    /// (the on-disk format already matches our LE word layout).
+    #[must_use]
+    pub fn data_bytes(&self) -> &Bytes {
+        &self.data
     }
 
     /// Returns the number of bits set to true.
@@ -252,18 +283,18 @@ impl BitVector {
         if self.is_empty() {
             return 0;
         }
-
         let full_words = self.len / 64;
         let remaining_bits = self.len % 64;
 
-        let mut count: usize = self.data[..full_words]
-            .iter()
-            .map(|&w| w.count_ones() as usize)
+        let mut count: usize = (0..full_words)
+            .map(|i| self.word_at(i).unwrap_or(0).count_ones() as usize)
             .sum();
 
-        if remaining_bits > 0 && full_words < self.data.len() {
+        if remaining_bits > 0
+            && let Some(word) = self.word_at(full_words)
+        {
             let mask = (1u64 << remaining_bits) - 1;
-            count += (self.data[full_words] & mask).count_ones() as usize;
+            count += (word & mask).count_ones() as usize;
         }
 
         count
@@ -279,7 +310,10 @@ impl BitVector {
     ///
     /// # Panics
     ///
-    /// Panics if an internal index is out of bounds (invariant violation).
+    /// Panics if internal storage is shorter than `len()` bits — an
+    /// invariant violation that would indicate a bug in
+    /// [`from_bytes_storage`](Self::from_bytes_storage) caller's
+    /// data validation.
     #[must_use]
     pub fn to_bools(&self) -> Vec<bool> {
         (0..self.len)
@@ -291,7 +325,7 @@ impl BitVector {
     ///
     /// # Panics
     ///
-    /// Panics if an internal index is out of bounds (invariant violation).
+    /// Panics if internal storage is shorter than `len()` bits.
     pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {
         (0..self.len).map(move |i| self.get(i).expect("index within len"))
     }
@@ -300,7 +334,7 @@ impl BitVector {
     ///
     /// # Panics
     ///
-    /// Panics if an internal index is out of bounds (invariant violation).
+    /// Panics if internal storage is shorter than `len()` bits.
     pub fn ones_iter(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.len).filter(move |&i| self.get(i).expect("index within len"))
     }
@@ -309,15 +343,9 @@ impl BitVector {
     ///
     /// # Panics
     ///
-    /// Panics if an internal index is out of bounds (invariant violation).
+    /// Panics if internal storage is shorter than `len()` bits.
     pub fn zeros_iter(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.len).filter(move |&i| !self.get(i).expect("index within len"))
-    }
-
-    /// Returns the raw data.
-    #[must_use]
-    pub fn data(&self) -> &[u64] {
-        &self.data
     }
 
     /// Returns the compression ratio (original bytes / compressed bytes).
@@ -326,63 +354,52 @@ impl BitVector {
         if self.is_empty() {
             return 1.0;
         }
-
-        // Original: 1 byte per bool
         let original_size = self.len;
-        // Compressed: ceil(len / 8) bytes
-        let compressed_size = self.data.len() * 8;
-
+        let compressed_size = self.data.len();
         if compressed_size == 0 {
             return 1.0;
         }
-
         original_size as f64 / compressed_size as f64
     }
 
     /// Performs bitwise AND with another bit vector.
-    ///
     /// The result has the length of the shorter vector.
     #[must_use]
     pub fn and(&self, other: &Self) -> Self {
         let len = self.len.min(other.len);
-        let num_words = (len + 63) / 64;
-
-        let data: Vec<u64> = self
-            .data
-            .iter()
-            .zip(&other.data)
-            .take(num_words)
-            .map(|(&a, &b)| a & b)
+        let num_words = len.div_ceil(64);
+        let words: Vec<u64> = (0..num_words)
+            .map(|i| self.word_at(i).unwrap_or(0) & other.word_at(i).unwrap_or(0))
             .collect();
-
-        Self { data, len }
+        Self {
+            data: words_to_bytes(&words),
+            len,
+        }
     }
 
     /// Performs bitwise OR with another bit vector.
-    ///
-    /// The result has the length of the shorter vector.
     #[must_use]
     pub fn or(&self, other: &Self) -> Self {
         let len = self.len.min(other.len);
-        let num_words = (len + 63) / 64;
-
-        let data: Vec<u64> = self
-            .data
-            .iter()
-            .zip(&other.data)
-            .take(num_words)
-            .map(|(&a, &b)| a | b)
+        let num_words = len.div_ceil(64);
+        let words: Vec<u64> = (0..num_words)
+            .map(|i| self.word_at(i).unwrap_or(0) | other.word_at(i).unwrap_or(0))
             .collect();
-
-        Self { data, len }
+        Self {
+            data: words_to_bytes(&words),
+            len,
+        }
     }
 
     /// Performs bitwise NOT.
     #[must_use]
     pub fn not(&self) -> Self {
-        let data: Vec<u64> = self.data.iter().map(|&w| !w).collect();
+        let num_words = self.word_count();
+        let words: Vec<u64> = (0..num_words)
+            .map(|i| !self.word_at(i).unwrap_or(0))
+            .collect();
         Self {
-            data,
+            data: words_to_bytes(&words),
             len: self.len,
         }
     }
@@ -391,17 +408,14 @@ impl BitVector {
     #[must_use]
     pub fn xor(&self, other: &Self) -> Self {
         let len = self.len.min(other.len);
-        let num_words = (len + 63) / 64;
-
-        let data: Vec<u64> = self
-            .data
-            .iter()
-            .zip(&other.data)
-            .take(num_words)
-            .map(|(&a, &b)| a ^ b)
+        let num_words = len.div_ceil(64);
+        let words: Vec<u64> = (0..num_words)
+            .map(|i| self.word_at(i).unwrap_or(0) ^ other.word_at(i).unwrap_or(0))
             .collect();
-
-        Self { data, len }
+        Self {
+            data: words_to_bytes(&words),
+            len,
+        }
     }
 
     /// Serializes to bytes.
@@ -419,11 +433,10 @@ impl BitVector {
                 ),
             )
         })?;
-        let mut buf = Vec::with_capacity(4 + self.data.len() * 8);
+        let mut buf = Vec::with_capacity(4 + self.data.len());
         buf.extend_from_slice(&len_u32.to_le_bytes());
-        for &word in &self.data {
-            buf.extend_from_slice(&word.to_le_bytes());
-        }
+        // Storage is already LE bytes — append directly.
+        buf.extend_from_slice(&self.data);
         Ok(buf)
     }
 
@@ -445,27 +458,20 @@ impl BitVector {
                 .try_into()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
         ) as usize;
-        let num_words = (len + 63) / 64;
+        let num_words = len.div_ceil(64);
+        let needed = 4 + num_words * 8;
 
-        if bytes.len() < 4 + num_words * 8 {
+        if bytes.len() < needed {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "BitVector truncated",
             ));
         }
 
-        let mut data = Vec::with_capacity(num_words);
-        for i in 0..num_words {
-            let offset = 4 + i * 8;
-            let word = u64::from_le_bytes(
-                bytes[offset..offset + 8]
-                    .try_into()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            );
-            data.push(word);
-        }
-
-        Ok(Self { data, len })
+        Ok(Self {
+            data: Bytes::copy_from_slice(&bytes[4..needed]),
+            len,
+        })
     }
 }
 
@@ -477,11 +483,146 @@ impl Default for BitVector {
 
 impl FromIterator<bool> for BitVector {
     fn from_iter<T: IntoIterator<Item = bool>>(iter: T) -> Self {
-        let mut bitvec = BitVector::new();
+        let mut builder = BitVectorBuilder::new();
         for b in iter {
-            bitvec.push(b);
+            builder.push(b);
         }
-        bitvec
+        builder.freeze()
+    }
+}
+
+// ── BitVectorBuilder ─────────────────────────────────────────────────
+
+/// Mutable bit-vector builder. Word-level mutations stay cheap (`Vec<u64>`
+/// indexed access); call [`freeze`](Self::freeze) to produce an immutable
+/// [`BitVector`].
+///
+/// Mirrors the `BytesMut` → `Bytes` and Apache Arrow `BooleanBuilder` →
+/// `BooleanArray` pattern.
+#[derive(Debug, Clone)]
+pub struct BitVectorBuilder {
+    data: Vec<u64>,
+    len: usize,
+}
+
+impl BitVectorBuilder {
+    /// Creates an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            len: 0,
+        }
+    }
+
+    /// Creates a builder with capacity for at least `bits` bits.
+    #[must_use]
+    pub fn with_capacity(bits: usize) -> Self {
+        let words = bits.div_ceil(64);
+        Self {
+            data: Vec::with_capacity(words),
+            len: 0,
+        }
+    }
+
+    /// Creates a builder with all bits set to `value`, length `len`.
+    #[must_use]
+    pub fn filled(len: usize, value: bool) -> Self {
+        let num_words = len.div_ceil(64);
+        let fill = if value { u64::MAX } else { 0 };
+        Self {
+            data: vec![fill; num_words],
+            len,
+        }
+    }
+
+    /// Creates a builder with all bits set to false.
+    #[must_use]
+    pub fn zeros(len: usize) -> Self {
+        Self::filled(len, false)
+    }
+
+    /// Creates a builder with all bits set to true.
+    #[must_use]
+    pub fn ones(len: usize) -> Self {
+        Self::filled(len, true)
+    }
+
+    /// Returns the current bit length.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns whether no bits have been pushed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Gets the bit at the given index (read access during build).
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<bool> {
+        if index >= self.len {
+            return None;
+        }
+        let word_idx = index / 64;
+        let bit_idx = index % 64;
+        Some((self.data[word_idx] & (1 << bit_idx)) != 0)
+    }
+
+    /// Sets the bit at the given index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= len()`.
+    pub fn set(&mut self, index: usize, value: bool) {
+        assert!(index < self.len, "Index out of bounds");
+        let word_idx = index / 64;
+        let bit_idx = index % 64;
+        if value {
+            self.data[word_idx] |= 1 << bit_idx;
+        } else {
+            self.data[word_idx] &= !(1 << bit_idx);
+        }
+    }
+
+    /// Appends a bit to the end.
+    pub fn push(&mut self, value: bool) {
+        let word_idx = self.len / 64;
+        let bit_idx = self.len % 64;
+        if word_idx >= self.data.len() {
+            self.data.push(0);
+        }
+        if value {
+            self.data[word_idx] |= 1 << bit_idx;
+        }
+        self.len += 1;
+    }
+
+    /// Freezes the builder into an immutable [`BitVector`].
+    #[must_use]
+    pub fn freeze(self) -> BitVector {
+        BitVector {
+            data: words_to_bytes(&self.data),
+            len: self.len,
+        }
+    }
+}
+
+impl Default for BitVectorBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FromIterator<bool> for BitVectorBuilder {
+    fn from_iter<T: IntoIterator<Item = bool>>(iter: T) -> Self {
+        let mut builder = BitVectorBuilder::new();
+        for b in iter {
+            builder.push(b);
+        }
+        builder
     }
 }
 
@@ -508,11 +649,12 @@ mod tests {
     }
 
     #[test]
-    fn test_bitvec_push() {
-        let mut bitvec = BitVector::new();
-        bitvec.push(true);
-        bitvec.push(false);
-        bitvec.push(true);
+    fn test_bitvec_builder_push() {
+        let mut builder = BitVectorBuilder::new();
+        builder.push(true);
+        builder.push(false);
+        builder.push(true);
+        let bitvec = builder.freeze();
 
         assert_eq!(bitvec.len(), 3);
         assert_eq!(bitvec.get(0), Some(true));
@@ -521,12 +663,13 @@ mod tests {
     }
 
     #[test]
-    fn test_bitvec_set() {
-        let mut bitvec = BitVector::zeros(8);
+    fn test_bitvec_builder_set() {
+        let mut builder = BitVectorBuilder::zeros(8);
 
-        bitvec.set(0, true);
-        bitvec.set(3, true);
-        bitvec.set(7, true);
+        builder.set(0, true);
+        builder.set(3, true);
+        builder.set(7, true);
+        let bitvec = builder.freeze();
 
         assert_eq!(bitvec.get(0), Some(true));
         assert_eq!(bitvec.get(1), Some(false));
@@ -709,5 +852,47 @@ mod tests {
         let bv: BitVector = serde_json::from_str(json).unwrap();
         assert_eq!(bv.len(), 64);
         assert_eq!(bv.count_ones(), 64);
+    }
+
+    // ── Phase 3b: Bytes-backed storage ────────────────────────────────
+
+    #[test]
+    fn test_bitvec_word_at_returns_words_from_bytes() {
+        // Pattern: alternating bits → 0xAAAAAAAAAAAAAAAA in word 0.
+        let bools: Vec<bool> = (0..64).map(|i| i % 2 == 1).collect();
+        let bv = BitVector::from_bools(&bools);
+        assert_eq!(bv.word_count(), 1);
+        assert_eq!(bv.word_at(0), Some(0xAAAA_AAAA_AAAA_AAAA));
+    }
+
+    #[test]
+    fn test_bitvec_word_at_out_of_range_returns_none() {
+        let bv = BitVector::from_bools(&[true, false, true]);
+        assert!(bv.word_at(bv.word_count()).is_none());
+    }
+
+    #[test]
+    fn test_bitvec_data_bytes_length_matches_word_count() {
+        let bools: Vec<bool> = (0..200).map(|i| i % 3 == 0).collect();
+        let bv = BitVector::from_bools(&bools);
+        assert_eq!(bv.data_bytes().len(), bv.word_count() * 8);
+        // Round-trip via get(): every bit recoverable.
+        for (i, &b) in bools.iter().enumerate() {
+            assert_eq!(bv.get(i), Some(b));
+        }
+    }
+
+    #[test]
+    fn test_bitvec_serde_round_trip_with_bytes_storage() {
+        let bools: Vec<bool> = (0..130).map(|i| i % 7 == 0).collect();
+        let bv = BitVector::from_bools(&bools);
+        // Serialize to JSON, deserialize back: the on-disk shape stays
+        // `Vec<u64>` even though internal storage is now `Bytes`.
+        let json = serde_json::to_string(&bv).unwrap();
+        let bv2: BitVector = serde_json::from_str(&json).unwrap();
+        assert_eq!(bv.len(), bv2.len());
+        for (i, &b) in bools.iter().enumerate() {
+            assert_eq!(bv2.get(i), Some(b));
+        }
     }
 }

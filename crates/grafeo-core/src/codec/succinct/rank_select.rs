@@ -139,9 +139,10 @@ impl SuccinctBitVector {
         let mut cumulative_zeros: u32 = 0;
         let mut superblock_start_ones: u32 = 0;
 
-        let data = inner.data();
+        let word_count = inner.word_count();
 
-        for (block_idx, word) in data.iter().enumerate() {
+        for block_idx in 0..word_count {
+            let word = inner.word_at(block_idx).unwrap_or(0);
             let bit_pos = block_idx * BLOCK_BITS;
 
             // Start of new superblock?
@@ -293,8 +294,9 @@ impl SuccinctBitVector {
         }
 
         // Add popcount within the current word
-        if bit_offset > 0 && block_idx < self.inner.data().len() {
-            let word = self.inner.data()[block_idx];
+        if bit_offset > 0
+            && let Some(word) = self.inner.word_at(block_idx)
+        {
             let mask = (1u64 << bit_offset) - 1;
             rank += (word & mask).count_ones() as usize;
         }
@@ -370,11 +372,7 @@ impl SuccinctBitVector {
         let block_base_rank = superblock_base_rank + self.block_ranks[block_idx] as usize;
         let remaining = k - block_base_rank;
 
-        if block_idx >= self.inner.data().len() {
-            return None;
-        }
-
-        let word = self.inner.data()[block_idx];
+        let word = self.inner.word_at(block_idx)?;
         let bit_pos = Self::select_in_word(word, remaining)?;
 
         let result = block_idx * BLOCK_BITS + bit_pos;
@@ -487,13 +485,13 @@ impl SuccinctBitVector {
     /// Returns the total size in bytes (data + auxiliary).
     #[must_use]
     pub fn size_bytes(&self) -> usize {
-        self.inner.data().len() * 8 + self.auxiliary_size_bytes()
+        self.inner.data_bytes().len() + self.auxiliary_size_bytes()
     }
 
     /// Returns the space overhead as a fraction (auxiliary / data).
     #[must_use]
     pub fn space_overhead(&self) -> f64 {
-        let data_size = self.inner.data().len() * 8;
+        let data_size = self.inner.data_bytes().len();
         if data_size == 0 {
             return 0.0;
         }

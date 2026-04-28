@@ -22,14 +22,35 @@
 
 use std::io;
 
+use bytes::{Bytes, BytesMut};
+
+/// Converts a slice of `u64` words to a refcounted `Bytes` buffer of
+/// little-endian bytes (8 bytes per word). Used by builders that produce
+/// `Vec<u64>` and need to expose it as `Bytes` storage.
+fn words_to_bytes(words: &[u64]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(words.len() * 8);
+    for &w in words {
+        buf.extend_from_slice(&w.to_le_bytes());
+    }
+    buf.freeze()
+}
+
 /// Stores integers using only as many bits as the largest value needs.
 ///
 /// Pass your values to [`pack()`](Self::pack) and we'll figure out the optimal
 /// bit width automatically. Random access via [`get()`](Self::get) is O(1).
+///
+/// # Storage
+///
+/// Phase 3b: word storage is a refcounted `bytes::Bytes` slice carrying
+/// the packed `u64` words in little-endian byte order. Heap-owned and
+/// mmap-backed columns share the same type; only the constructor differs.
+/// Word access goes through [`word_at`](Self::word_at) (`from_le_bytes`
+/// from the slice).
 #[derive(Debug, Clone)]
 pub struct BitPackedInts {
-    /// Packed data.
-    data: Vec<u64>,
+    /// Packed data: little-endian `u64` words concatenated, refcounted.
+    data: Bytes,
     /// Number of bits per value.
     bits_per_value: u8,
     /// Number of values.
@@ -44,6 +65,20 @@ impl BitPackedInts {
     #[must_use]
     pub fn from_raw_parts(data: Vec<u64>, bits_per_value: u8, count: usize) -> Self {
         Self {
+            data: words_to_bytes(&data),
+            bits_per_value,
+            count,
+        }
+    }
+
+    /// Reconstructs from pre-encoded bytes (Phase 3c entry point).
+    ///
+    /// The byte slice must be `word_count * 8` bytes of little-endian
+    /// `u64` words. Used by the mmap path so a column can hold a slice
+    /// of mapped memory without copying.
+    #[must_use]
+    pub fn from_bytes_storage(data: Bytes, bits_per_value: u8, count: usize) -> Self {
+        Self {
             data,
             bits_per_value,
             count,
@@ -55,7 +90,7 @@ impl BitPackedInts {
     pub fn pack(values: &[u64]) -> Self {
         if values.is_empty() {
             return Self {
-                data: Vec::new(),
+                data: Bytes::new(),
                 bits_per_value: 0,
                 count: 0,
             };
@@ -75,7 +110,7 @@ impl BitPackedInts {
     pub fn pack_with_bits(values: &[u64], bits_per_value: u8) -> Self {
         if values.is_empty() {
             return Self {
-                data: Vec::new(),
+                data: Bytes::new(),
                 bits_per_value,
                 count: 0,
             };
@@ -85,7 +120,7 @@ impl BitPackedInts {
             // All values must be 0
             debug_assert!(values.iter().all(|&v| v == 0));
             return Self {
-                data: Vec::new(),
+                data: Bytes::new(),
                 bits_per_value: 0,
                 count: values.len(),
             };
@@ -93,9 +128,9 @@ impl BitPackedInts {
 
         let bits = bits_per_value as usize;
         let values_per_word = 64 / bits;
-        let num_words = (values.len() + values_per_word - 1) / values_per_word;
+        let num_words = values.len().div_ceil(values_per_word);
 
-        let mut data = vec![0u64; num_words];
+        let mut words = vec![0u64; num_words];
         let mask = if bits >= 64 {
             u64::MAX
         } else {
@@ -112,11 +147,11 @@ impl BitPackedInts {
 
             let word_idx = i / values_per_word;
             let bit_offset = (i % values_per_word) * bits;
-            data[word_idx] |= (value & mask) << bit_offset;
+            words[word_idx] |= (value & mask) << bit_offset;
         }
 
         Self {
-            data,
+            data: words_to_bytes(&words),
             bits_per_value,
             count: values.len(),
         }
@@ -146,7 +181,8 @@ impl BitPackedInts {
         for i in 0..self.count {
             let word_idx = i / values_per_word;
             let bit_offset = (i % values_per_word) * bits;
-            let value = (self.data[word_idx] >> bit_offset) & mask;
+            let word = self.word_at(word_idx).unwrap_or(0);
+            let value = (word >> bit_offset) & mask;
             result.push(value);
         }
 
@@ -174,7 +210,8 @@ impl BitPackedInts {
             (1u64 << bits) - 1
         };
 
-        Some((self.data[word_idx] >> bit_offset) & mask)
+        let word = self.word_at(word_idx)?;
+        Some((word >> bit_offset) & mask)
     }
 
     /// Returns the number of values.
@@ -195,10 +232,32 @@ impl BitPackedInts {
         self.bits_per_value
     }
 
-    /// Returns the raw packed data.
+    /// Returns the raw packed bytes.
+    ///
+    /// Phase 3b: word storage is now `bytes::Bytes`. Use [`word_at`] for
+    /// indexed access; this returns the concatenated little-endian word
+    /// bytes for serializers that need to write the storage out.
     #[must_use]
-    pub fn data(&self) -> &[u64] {
+    pub fn data_bytes(&self) -> &Bytes {
         &self.data
+    }
+
+    /// Returns the number of `u64` words backing this column.
+    #[must_use]
+    pub fn word_count(&self) -> usize {
+        self.data.len() / 8
+    }
+
+    /// Returns the word at `idx`, or `None` if out of range.
+    ///
+    /// Reads via `from_le_bytes`; supports unaligned `Bytes` slices
+    /// (e.g., mmap-backed sub-slices in Phase 3c).
+    #[must_use]
+    pub fn word_at(&self, idx: usize) -> Option<u64> {
+        let start = idx.checked_mul(8)?;
+        let end = start.checked_add(8)?;
+        let chunk: [u8; 8] = self.data.get(start..end)?.try_into().ok()?;
+        Some(u64::from_le_bytes(chunk))
     }
 
     /// Returns the compression ratio compared to storing full u64s.
@@ -209,7 +268,7 @@ impl BitPackedInts {
         }
 
         let original_size = self.count * 8; // 8 bytes per u64
-        let packed_size = self.data.len() * 8;
+        let packed_size = self.data.len();
 
         if packed_size == 0 {
             return f64::INFINITY; // All zeros, perfect compression
@@ -252,12 +311,11 @@ impl BitPackedInts {
                 ),
             )
         })?;
-        let mut buf = Vec::with_capacity(1 + 4 + self.data.len() * 8);
+        let mut buf = Vec::with_capacity(1 + 4 + self.data.len());
         buf.push(self.bits_per_value);
         buf.extend_from_slice(&count_u32.to_le_bytes());
-        for &word in &self.data {
-            buf.extend_from_slice(&word.to_le_bytes());
-        }
+        // Storage is already LE bytes — append directly.
+        buf.extend_from_slice(&self.data);
         Ok(buf)
     }
 
@@ -294,23 +352,15 @@ impl BitPackedInts {
             (count + values_per_word - 1) / values_per_word
         };
 
-        if bytes.len() < 5 + num_words * 8 {
+        let needed = 5 + num_words * 8;
+        if bytes.len() < needed {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "BitPackedInts truncated",
             ));
         }
 
-        let mut data = Vec::with_capacity(num_words);
-        for i in 0..num_words {
-            let offset = 5 + i * 8;
-            let word = u64::from_le_bytes(
-                bytes[offset..offset + 8]
-                    .try_into()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            );
-            data.push(word);
-        }
+        let data = Bytes::copy_from_slice(&bytes[5..needed]);
 
         Ok(Self {
             data,
@@ -412,7 +462,7 @@ impl DeltaBitPacked {
         }
 
         let original_size = count * 8;
-        let packed_size = 8 + self.deltas.data().len() * 8; // base + packed deltas
+        let packed_size = 8 + self.deltas.data_bytes().len(); // base + packed deltas
 
         original_size as f64 / packed_size as f64
     }
@@ -594,5 +644,51 @@ mod tests {
         assert_eq!(BitPackedInts::bits_needed(255), 8);
         assert_eq!(BitPackedInts::bits_needed(256), 9);
         assert_eq!(BitPackedInts::bits_needed(u64::MAX), 64);
+    }
+
+    // ── Phase 3b: Bytes-backed storage ────────────────────────────────
+
+    #[test]
+    fn test_bitpack_word_at_returns_words_from_bytes() {
+        // Pack 5 values at 4 bits each → fits in one u64 word.
+        let packed = BitPackedInts::pack(&[1u64, 3, 7, 15, 4]);
+        assert_eq!(packed.word_count(), 1);
+        let word = packed.word_at(0).unwrap();
+        // 4-bit values packed LE: bit 0..3 = 1, 4..7 = 3, 8..11 = 7, 12..15 = 15, 16..19 = 4.
+        assert_eq!(word & 0xF, 1);
+        assert_eq!((word >> 4) & 0xF, 3);
+        assert_eq!((word >> 8) & 0xF, 7);
+        assert_eq!((word >> 12) & 0xF, 15);
+        assert_eq!((word >> 16) & 0xF, 4);
+    }
+
+    #[test]
+    fn test_bitpack_word_at_out_of_range_returns_none() {
+        let packed = BitPackedInts::pack(&[1u64, 2, 3]);
+        assert!(packed.word_at(packed.word_count()).is_none());
+        assert!(packed.word_at(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn test_bitpack_data_bytes_length_matches_word_count() {
+        let packed = BitPackedInts::pack_with_bits(
+            &(0u64..200).collect::<Vec<_>>(),
+            8, // 200 values × 8 bits = 1600 bits = 25 u64 words = 200 bytes
+        );
+        assert_eq!(packed.data_bytes().len(), packed.word_count() * 8);
+        // Round-trip: read each word via word_at, recombine, unpack still works.
+        let unpacked = packed.unpack();
+        assert_eq!(unpacked, (0u64..200).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_bitpack_round_trip_through_to_bytes_and_from_bytes() {
+        let values: Vec<u64> = (0u64..50).map(|i| i * 7 % 1024).collect();
+        let packed = BitPackedInts::pack(&values);
+        let serialized = packed.to_bytes().unwrap();
+        let restored = BitPackedInts::from_bytes(&serialized).unwrap();
+        assert_eq!(packed.unpack(), restored.unpack());
+        assert_eq!(packed.bits_per_value(), restored.bits_per_value());
+        assert_eq!(packed.len(), restored.len());
     }
 }

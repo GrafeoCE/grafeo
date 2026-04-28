@@ -33,7 +33,7 @@
 //! assert_eq!(wt.select(1, 1), Some(4));  // Second 1 at position 4
 //! ```
 
-use super::super::BitVector;
+use super::super::BitVectorBuilder;
 use super::rank_select::SuccinctBitVector;
 
 /// Wavelet tree for sequence rank/select/access operations.
@@ -139,15 +139,15 @@ impl WaveletTree {
 
         for level in 0..height {
             let bit_pos = height - 1 - level;
-            let mut bits = BitVector::with_capacity(current_sequence.len());
+            let mut builder = BitVectorBuilder::with_capacity(current_sequence.len());
 
             // Build bitvector for this level
             for &(code, _) in &current_sequence {
                 let bit = (code >> bit_pos) & 1;
-                bits.push(bit == 1);
+                builder.push(bit == 1);
             }
 
-            levels.push(SuccinctBitVector::from_bitvec(bits));
+            levels.push(SuccinctBitVector::from_bitvec(builder.freeze()));
 
             // Partition for next level: 0-bits go left, 1-bits go right
             let mut left = Vec::new();

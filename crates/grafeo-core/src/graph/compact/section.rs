@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bytes::Bytes;
 use grafeo_common::storage::section::{Section, SectionType};
 use grafeo_common::types::{EdgeId, NodeId, PropertyKey};
 use grafeo_common::utils::hash::FxHashMap;
@@ -70,6 +71,31 @@ impl CompactStoreSection {
     #[must_use]
     pub fn store(&self) -> Option<Arc<CompactStore>> {
         self.store.read().clone()
+    }
+
+    /// Deserializes from a refcounted [`Bytes`] buffer (Phase 3c).
+    ///
+    /// This is the zero-copy entry point: when `data` wraps a mmap
+    /// region (via [`bytes::Bytes::from_owner`]), column codec storage
+    /// is constructed via `data.slice(range)` rather than copying. The
+    /// trait [`Section::deserialize`] entry point still works on
+    /// `&[u8]` and incurs one heap copy (a single `Bytes::copy_from_slice`
+    /// at the boundary).
+    ///
+    /// # Errors
+    ///
+    /// Same error semantics as [`Section::deserialize`].
+    pub fn deserialize_from_bytes(
+        &mut self,
+        data: bytes::Bytes,
+    ) -> grafeo_common::utils::error::Result<()> {
+        let store = deserialize_compact_store(&data).map_err(|e| {
+            grafeo_common::utils::error::Error::Internal(format!(
+                "CompactStore deserialization failed: {e}"
+            ))
+        })?;
+        *self.store.write() = Some(Arc::new(store));
+        Ok(())
     }
 
     /// Serializes at the requested format version.
@@ -218,14 +244,11 @@ impl Section for CompactStoreSection {
     }
 
     fn deserialize(&mut self, data: &[u8]) -> grafeo_common::utils::error::Result<()> {
-        let store = deserialize_compact_store(data).map_err(|e| {
-            grafeo_common::utils::error::Error::Internal(format!(
-                "CompactStore deserialization failed: {e}"
-            ))
-        })?;
-
-        *self.store.write() = Some(Arc::new(store));
-        Ok(())
+        // Heap-copy entry point (Section trait). Phase 3c adds
+        // [`deserialize_from_bytes`](Self::deserialize_from_bytes) which
+        // skips the copy on the mmap path.
+        let owned = bytes::Bytes::copy_from_slice(data);
+        self.deserialize_from_bytes(owned)
     }
 
     fn is_dirty(&self) -> bool {
@@ -252,7 +275,7 @@ impl Section for CompactStoreSection {
 /// Returns the codec and an `Option<Vec<ZoneMap>>` carrying per-block
 /// stats when the v3 path was taken.
 fn read_codec(
-    data: &[u8],
+    data: &Bytes,
     pos: &mut usize,
     version: u8,
 ) -> Result<(ColumnCodec, Option<Vec<ZoneMap>>), String> {
@@ -270,7 +293,8 @@ fn read_codec(
     }
 }
 
-fn deserialize_compact_store(data: &[u8]) -> Result<CompactStore, String> {
+fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, String> {
+    let data: &[u8] = data_bytes.as_ref();
     if data.len() < 10 {
         return Err("data too short for CompactStore section".into());
     }
@@ -338,7 +362,7 @@ fn deserialize_compact_store(data: &[u8]) -> Result<CompactStore, String> {
             }
 
             let (codec, maybe_block_stats) =
-                read_codec(data, &mut pos, version).map_err(|e| format!("codec: {e}"))?;
+                read_codec(data_bytes, &mut pos, version).map_err(|e| format!("codec: {e}"))?;
             if let Some(stats) = maybe_block_stats {
                 block_zone_maps.insert(key.clone(), stats);
             }
@@ -389,8 +413,8 @@ fn deserialize_compact_store(data: &[u8]) -> Result<CompactStore, String> {
         for _ in 0..num_props {
             let key_str = read_string(data, &mut pos)?;
             let key = PropertyKey::new(&key_str);
-            let (codec, _block_stats) =
-                read_codec(data, &mut pos, version).map_err(|e| format!("edge codec: {e}"))?;
+            let (codec, _block_stats) = read_codec(data_bytes, &mut pos, version)
+                .map_err(|e| format!("edge codec: {e}"))?;
             let col_type = infer_column_type_from_codec(&codec);
             prop_defs.push(ColumnDef::new(&key_str, col_type));
             properties.insert(key, codec);
