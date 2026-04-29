@@ -11,6 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// - Creating unique spill files with prefixes
 /// - Tracking total bytes spilled to disk
 /// - Automatic cleanup of all spill files on drop
+///
+/// By default the spill directory itself outlives the manager (the caller
+/// owns it). Per-query callers that pass a unique throwaway directory should
+/// chain [`with_owned_dir`](Self::with_owned_dir) so `Drop` also removes the
+/// directory once its files are gone.
 pub struct SpillManager {
     /// Directory for spill files.
     spill_dir: PathBuf,
@@ -20,12 +25,16 @@ pub struct SpillManager {
     active_files: Mutex<Vec<PathBuf>>,
     /// Total bytes currently spilled to disk.
     total_spilled_bytes: AtomicU64,
+    /// Whether `Drop` should remove `spill_dir` itself (non-recursive).
+    owns_dir: bool,
 }
 
 impl SpillManager {
     /// Creates a new spill manager with the given directory.
     ///
-    /// Creates the directory if it doesn't exist.
+    /// Creates the directory if it doesn't exist. The directory is *not*
+    /// removed on drop unless [`with_owned_dir`](Self::with_owned_dir) is
+    /// chained on the result.
     ///
     /// # Errors
     ///
@@ -39,7 +48,21 @@ impl SpillManager {
             next_file_id: AtomicU64::new(0),
             active_files: Mutex::new(Vec::new()),
             total_spilled_bytes: AtomicU64::new(0),
+            owns_dir: false,
         })
+    }
+
+    /// Marks the spill directory as owned by this manager so that `Drop`
+    /// removes it (non-recursive) after spill files are cleaned up.
+    ///
+    /// Use for per-query spill subdirectories (e.g. `<base>/query_<id>/`)
+    /// where leaving the empty directory behind would accumulate over time.
+    /// The removal is best-effort: if anything unexpected is left in the
+    /// directory, `remove_dir` fails and the directory is preserved.
+    #[must_use]
+    pub fn with_owned_dir(mut self) -> Self {
+        self.owns_dir = true;
+        self
     }
 
     /// Creates a new spill manager using a system temp directory.
@@ -141,6 +164,12 @@ impl Drop for SpillManager {
     fn drop(&mut self) {
         // Best-effort cleanup on drop
         let _ = self.cleanup();
+        if self.owns_dir {
+            // Non-recursive remove_dir: succeeds only if cleanup left the
+            // directory empty. If something else (a stray file, a subdir we
+            // didn't track) is in there, the directory is preserved.
+            let _ = std::fs::remove_dir(&self.spill_dir);
+        }
     }
 }
 
@@ -228,5 +257,69 @@ mod tests {
 
         // After manager is dropped, the file should be cleaned up
         assert!(!file_path.exists());
+    }
+
+    #[test]
+    fn unowned_dir_survives_drop() {
+        // Default behavior: caller owns the directory, manager leaves it
+        // alone on drop. Per-query subdirs should opt into ownership; shared
+        // / caller-managed dirs should not.
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().join("shared_spill");
+
+        {
+            let _manager = SpillManager::new(&dir_path).unwrap();
+        }
+
+        assert!(
+            dir_path.exists(),
+            "default SpillManager must not remove its directory on drop"
+        );
+    }
+
+    #[test]
+    fn owned_dir_removed_after_files_cleaned_on_drop() {
+        // Regression test for the per-query spill leak (#323 follow-up):
+        // session-created `<base>/query_<id>/` subdirs accumulated empty
+        // because Drop only removed files, not the directory itself.
+        let temp_dir = TempDir::new().unwrap();
+        let query_dir = temp_dir.path().join("query_42");
+
+        {
+            let manager = SpillManager::new(&query_dir).unwrap().with_owned_dir();
+            let _file = manager.create_file("sort").unwrap();
+            assert!(query_dir.exists());
+        }
+
+        assert!(
+            !query_dir.exists(),
+            "with_owned_dir manager must remove its empty directory on drop"
+        );
+    }
+
+    #[test]
+    fn owned_dir_preserved_when_unexpected_contents_remain() {
+        // remove_dir is non-recursive on purpose: if something the manager
+        // did not track is sitting in the directory, the directory survives
+        // rather than being silently deleted.
+        let temp_dir = TempDir::new().unwrap();
+        let query_dir = temp_dir.path().join("query_with_extra");
+
+        let stray_file = {
+            let manager = SpillManager::new(&query_dir).unwrap().with_owned_dir();
+            let _file = manager.create_file("sort").unwrap();
+            let stray = query_dir.join("not_tracked.dat");
+            std::fs::write(&stray, b"keep me").unwrap();
+            stray
+        };
+
+        assert!(
+            query_dir.exists(),
+            "directory with untracked content must not be removed"
+        );
+        assert!(
+            stray_file.exists(),
+            "untracked file must not be touched by SpillManager Drop"
+        );
     }
 }

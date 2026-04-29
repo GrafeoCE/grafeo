@@ -664,7 +664,10 @@ fn corrupt_snapshot_detected_on_open() {
         db.close().unwrap();
     }
 
-    // Corrupt the snapshot data region (offset 12288+)
+    // Corrupt the post-header region at offset 12288 (0x3000). In v1 files
+    // this is the snapshot blob; in v2 files it is the section directory.
+    // Either way, the bytes here are integrity-checked at open and the
+    // corruption must be surfaced rather than masked.
     {
         use std::io::{Seek, SeekFrom, Write};
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -672,13 +675,15 @@ fn corrupt_snapshot_detected_on_open() {
         file.write_all(b"CORRUPTED DATA HERE!!!").unwrap();
     }
 
-    // Opening should fail with a checksum error
     let result = GrafeoDB::with_config(Config::persistent(&path));
     assert!(result.is_err());
     let err_msg = result.err().unwrap().to_string();
+    let signals_corruption = err_msg.contains("checksum")
+        || err_msg.contains("section directory")
+        || err_msg.contains("failed to parse");
     assert!(
-        err_msg.contains("checksum"),
-        "expected checksum error, got: {err_msg}"
+        signals_corruption,
+        "expected a corruption-related error, got: {err_msg}"
     );
 }
 
