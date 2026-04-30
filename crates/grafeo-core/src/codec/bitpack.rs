@@ -105,7 +105,7 @@ impl WordStore {
 ///
 /// # Storage
 ///
-/// Phase 3c: word storage is a [`WordStore`] enum with two shapes.
+/// Phase 3c: word storage has two shapes.
 /// `Inline(Vec<u64>)` is used for in-RAM builds (`pack`, `from_raw_parts`)
 /// so scans can iterate the `&[u64]` slice directly with no per-element
 /// decode. `Mapped(Bytes)` is used for mmap-backed loads
