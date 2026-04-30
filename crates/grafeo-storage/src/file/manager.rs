@@ -315,6 +315,13 @@ impl GrafeoFileManager {
             return Ok(Vec::new());
         }
 
+        // v2 files store sections rather than a v1 snapshot blob. They set
+        // snapshot_length == 0 and put the directory CRC in the checksum field.
+        // Reading 0 bytes here would CRC to 0 and mismatch the directory CRC.
+        if active_header.snapshot_length == 0 {
+            return Ok(Vec::new());
+        }
+
         // reason: snapshot_length is the size of serialized in-memory data, fits in usize on 64-bit targets;
         // on 32-bit targets the database would OOM long before reaching 4 GiB
         // reason: value bounded by collection size, fits usize
@@ -556,37 +563,49 @@ impl GrafeoFileManager {
 
     /// Reads the section directory from the file.
     ///
-    /// Returns `None` if the file uses v1 format (no section directory).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if read fails or directory is corrupt.
-    /// Reads the section directory from the file.
-    ///
     /// Detects v2 format by checking the `snapshot_length` field in the active
     /// DbHeader: v2 writes set `snapshot_length = 0`, while v1 always has a
     /// non-zero snapshot length when data exists.
     ///
-    /// Returns `None` if the file uses v1 format or the directory cannot be parsed.
+    /// Returns `None` only when the file is unambiguously v1
+    /// (`snapshot_length` non-zero) or uninitialized (header iteration is 0).
+    /// Once the header asserts v2, any failure to locate or parse the
+    /// directory is surfaced as an error: misreporting v2 corruption as a v1
+    /// file would cause callers to fall back to v1 read paths and mask the
+    /// underlying problem.
     ///
     /// # Errors
     ///
-    /// Returns an error only for I/O failures (not for v1 format detection).
+    /// Returns an error if:
+    /// - I/O fails
+    /// - The header asserts v2 but the file is too short to hold a directory page
+    /// - The directory page bytes fail to parse as a `SectionDirectory`
+    /// - The directory page CRC does not match the value recorded in the active header
     pub fn read_section_directory(&self) -> Result<Option<crate::container::SectionDirectory>> {
         use crate::container::SectionDirectory;
         use crate::container::directory::DIRECTORY_OFFSET;
 
         let active_header = self.active_header.lock();
 
-        // v1 format uses snapshot_length > 0, v2 sets it to 0
+        // v1 files have snapshot_length > 0; v2 files set it to 0 and put the
+        // directory CRC in the checksum field. An uninitialized header (iteration
+        // == 0) means no data has been written yet.
         if active_header.is_empty() || active_header.snapshot_length > 0 {
             return Ok(None);
         }
+        let expected_checksum = active_header.checksum;
         drop(active_header);
 
+        // Past this point the header asserts v2: any failure to read or parse
+        // the directory is real corruption, not a v1/v2 misdetection. Surface
+        // it instead of silently falling through to read_snapshot, where v1 CRC
+        // logic would mask the underlying cause.
         let file_size = self.file.lock().metadata()?.len();
         if file_size < DIRECTORY_OFFSET + 4096 {
-            return Ok(None);
+            return Err(Error::Internal(format!(
+                "v2 header indicates section directory at offset {DIRECTORY_OFFSET:#X}, \
+                 but file is only {file_size} bytes",
+            )));
         }
 
         let mut file = self.file.lock();
@@ -595,11 +614,28 @@ impl GrafeoFileManager {
         let mut buf = vec![0u8; 4096];
         std::io::Read::read_exact(&mut *file, &mut buf)?;
 
-        // Try to parse; if it fails, this is not a v2 file
-        match SectionDirectory::from_bytes(&buf) {
-            Ok(dir) if !dir.is_empty() => Ok(Some(dir)),
-            _ => Ok(None),
+        let dir = SectionDirectory::from_bytes(&buf).map_err(|e| {
+            Error::Internal(format!(
+                "v2 section directory at offset {DIRECTORY_OFFSET:#X} failed to parse: {e}",
+            ))
+        })?;
+
+        // Cross-check the directory bytes against the CRC the writer recorded
+        // in the active header. A mismatch means the directory page is torn or
+        // corrupted (e.g. a partial write from a crashed checkpoint), not a
+        // format ambiguity.
+        let actual_checksum = crc32fast::hash(&buf);
+        if actual_checksum != expected_checksum {
+            return Err(Error::Internal(format!(
+                "v2 section directory checksum mismatch: \
+                 header recorded {expected_checksum:#010X}, computed {actual_checksum:#010X}",
+            )));
         }
+
+        if dir.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(dir))
     }
 
     /// Reads a single section's data from the file.
@@ -889,6 +925,113 @@ mod tests {
         let manager = GrafeoFileManager::create(&path).unwrap();
         let data = manager.read_snapshot().unwrap();
         assert!(data.is_empty());
+    }
+
+    #[test]
+    fn read_snapshot_returns_empty_on_v2_header() {
+        // After write_sections, snapshot_length == 0 in the active header and the
+        // checksum field holds the section-directory CRC. The pre-fix v1 reader
+        // would read 0 bytes, CRC empty data to 0, and mismatch the directory CRC.
+        // The fix early-returns Ok(Vec::new()) when snapshot_length == 0.
+        use grafeo_common::storage::SectionType;
+
+        let dir = test_dir();
+        let path = dir.path().join("v2.grafeo");
+
+        let manager = GrafeoFileManager::create(&path).unwrap();
+        manager
+            .write_sections(&[(SectionType::LpgStore, b"section payload")], 1, 1, 0, 0)
+            .unwrap();
+
+        // Pre-fix: this returned Err("snapshot checksum mismatch").
+        // Post-fix: returns Ok(Vec::new()), letting engine fall through to v2 dispatch.
+        let data = manager.read_snapshot().unwrap();
+        assert!(
+            data.is_empty(),
+            "v2 file should produce empty snapshot vec, not an error"
+        );
+
+        // Sanity: header confirms this is a v2 file (snapshot_length == 0 with non-zero checksum).
+        let header = manager.active_header();
+        assert_eq!(header.snapshot_length, 0);
+        assert!(!header.is_empty());
+    }
+
+    #[test]
+    fn read_section_directory_surfaces_parse_error_on_v2_header() {
+        // A v2 header with a corrupted directory page must not silently
+        // degrade to "this is a v1 file" — that masking is what made the
+        // GRAFEO-X001 in #323 surface as a misleading snapshot CRC error
+        // instead of pointing at the real directory corruption.
+        use crate::container::directory::DIRECTORY_OFFSET;
+        use grafeo_common::storage::SectionType;
+
+        let dir = test_dir();
+        let path = dir.path().join("corrupt_dir.grafeo");
+
+        {
+            let manager = GrafeoFileManager::create(&path).unwrap();
+            manager
+                .write_sections(&[(SectionType::LpgStore, b"section payload")], 1, 1, 0, 0)
+                .unwrap();
+        }
+
+        // Overwrite the directory page count field with a value above MAX_SECTIONS
+        // so SectionDirectory::from_bytes rejects it as malformed.
+        {
+            let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(DIRECTORY_OFFSET)).unwrap();
+            file.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        }
+
+        let manager = GrafeoFileManager::open(&path).unwrap();
+        let err = manager
+            .read_section_directory()
+            .expect_err("corrupt v2 directory must surface as Err, not Ok(None)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("v2 section directory") && msg.contains("failed to parse"),
+            "error should name the v2 directory and the parse failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_section_directory_surfaces_checksum_mismatch_on_v2_header() {
+        // A torn write (e.g. a crashed checkpoint) can leave the directory page
+        // bytes inconsistent with the CRC the writer recorded in the active
+        // header. The pre-fix wildcard match swallowed this, falling through to
+        // v1 read logic that reported a misleading snapshot checksum mismatch.
+        use crate::container::directory::DIRECTORY_OFFSET;
+        use grafeo_common::storage::SectionType;
+
+        let dir = test_dir();
+        let path = dir.path().join("torn_dir.grafeo");
+
+        {
+            let manager = GrafeoFileManager::create(&path).unwrap();
+            manager
+                .write_sections(&[(SectionType::LpgStore, b"section payload")], 1, 1, 0, 0)
+                .unwrap();
+        }
+
+        // Flip a byte in the reserved area of the directory page (bytes 4-7).
+        // The page still parses (count is intact, no entries change) but the
+        // CRC over the page no longer matches the value in the active header.
+        {
+            let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(DIRECTORY_OFFSET + 4)).unwrap();
+            file.write_all(&[0xAA]).unwrap();
+        }
+
+        let manager = GrafeoFileManager::open(&path).unwrap();
+        let err = manager
+            .read_section_directory()
+            .expect_err("torn v2 directory must surface as Err, not Ok(None)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("v2 section directory checksum mismatch"),
+            "error should identify the directory CRC mismatch, got: {msg}"
+        );
     }
 
     #[test]

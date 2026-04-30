@@ -379,6 +379,24 @@ impl GrafeoDB {
 
         let is_read_only = config.access_mode == crate::config::AccessMode::ReadOnly;
 
+        // Phase 5e: capture the deserialized CompactStore base when we
+        // reload a v2 section file that was written by a previously
+        // compacted database. The post-construction wiring uses this to
+        // rebuild the LayeredStore + tier wrapper + overlay consumer.
+        #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+        let mut loaded_compact_base: Option<
+            Arc<grafeo_core::graph::compact::CompactStore>,
+        > = None;
+
+        // Phase 5e: snapshot of the OverlayDeletions section (if present),
+        // applied after the LayeredStore is wired so that previously-deleted
+        // base nodes/edges remain deleted across reload.
+        #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+        let mut loaded_overlay_deletions: Option<(
+            Vec<grafeo_common::types::NodeId>,
+            Vec<grafeo_common::types::EdgeId>,
+        )> = None;
+
         // --- Single-file format (.grafeo) ---
         #[cfg(feature = "grafeo-file")]
         let file_manager: Option<Arc<GrafeoFileManager>> = if is_read_only {
@@ -396,6 +414,11 @@ impl GrafeoDB {
                             #[cfg(feature = "triple-store")]
                             &rdf_store,
                         )?;
+                        #[cfg(feature = "compact-store")]
+                        {
+                            loaded_compact_base = Self::extract_compact_base(&fm)?;
+                            loaded_overlay_deletions = Self::extract_overlay_deletions(&fm)?;
+                        }
                     } else {
                         // Fall back to v1 blob format
                         let snapshot_data = fm.read_snapshot()?;
@@ -449,6 +472,11 @@ impl GrafeoDB {
                         #[cfg(feature = "triple-store")]
                         &rdf_store,
                     )?;
+                    #[cfg(feature = "compact-store")]
+                    {
+                        loaded_compact_base = Self::extract_compact_base(&fm)?;
+                        loaded_overlay_deletions = Self::extract_overlay_deletions(&fm)?;
+                    }
                 } else {
                     let snapshot_data = fm.read_snapshot()?;
                     if !snapshot_data.is_empty() {
@@ -629,6 +657,16 @@ impl GrafeoDB {
         // Register storage sections as memory consumers for pressure tracking
         db.register_section_consumers();
 
+        // Phase 5e: if the loaded file has a CompactStore section, the
+        // database was previously compacted. Reconstruct the LayeredStore
+        // wiring (base + overlay + tier wrapper + consumers) so the
+        // engine sees the full picture and the read/write paths route
+        // through the layered store.
+        #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+        if let Some(compact_base) = loaded_compact_base {
+            db.wire_layered_after_load(compact_base, loaded_overlay_deletions)?;
+        }
+
         // Start periodic checkpoint timer if configured
         #[cfg(all(feature = "grafeo-file", feature = "lpg"))]
         if let (Some(interval), Some(fm)) = (checkpoint_interval, &db.file_manager)
@@ -658,17 +696,12 @@ impl GrafeoDB {
         ))]
         db.restore_spill_files();
 
-        // If VectorStore is configured as ForceDisk, immediately spill embeddings.
-        // This must happen after register_section_consumers() which creates the consumer.
-        #[cfg(all(feature = "vector-index", feature = "mmap", not(feature = "temporal")))]
-        if db
-            .config
-            .section_configs
-            .get(&grafeo_common::storage::SectionType::VectorStore)
-            .is_some_and(|c| c.tier == grafeo_common::storage::TierOverride::ForceDisk)
-        {
-            db.buffer_manager.spill_all();
-        }
+        // Phase 8a: apply per-section ForceDisk overrides. Each section
+        // type configured as ForceDisk triggers a targeted spill of its
+        // matching consumer; sections with Auto/ForceRam are left alone.
+        // Must happen after register_section_consumers() which creates
+        // the consumers we're about to spill.
+        db.apply_force_disk_overrides();
 
         Ok(db)
     }
@@ -928,7 +961,7 @@ impl GrafeoDB {
 
         self.external_read_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreSearch>);
         self.external_write_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreMut>);
-        self.store = Some(Arc::clone(layered.overlay_store()));
+        self.store = Some(layered.overlay_store());
 
         // Install the disk-backed tier wrapper and register its memory
         // consumer so the BufferManager can spill the base to mmap under
@@ -945,6 +978,11 @@ impl GrafeoDB {
             self.buffer_manager.register_consumer(consumer);
             self.compact_tiered = Some(tiered);
         }
+
+        // Phase 5c: register the overlay consumer so growing-overlay
+        // pressure triggers an automatic merge-into-base.
+        let overlay_consumer = Arc::new(section_consumer::OverlayConsumer::new(&layered));
+        self.buffer_manager.register_consumer(overlay_consumer);
 
         self.layered_store = Some(layered);
         self.read_only = false;
@@ -1000,7 +1038,7 @@ impl GrafeoDB {
 
         self.external_read_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStoreSearch>);
         self.external_write_store = Some(Arc::clone(&new_layered) as Arc<dyn GraphStoreMut>);
-        self.store = Some(Arc::clone(new_layered.overlay_store()));
+        self.store = Some(new_layered.overlay_store());
 
         // Replace the tier wrapper: old one's Weak refs will now return None,
         // and its consumer (unregistered below) no longer tracks the freshly
@@ -1021,6 +1059,11 @@ impl GrafeoDB {
             self.buffer_manager.register_consumer(consumer);
             self.compact_tiered = Some(tiered);
         }
+
+        // Phase 5c: re-register overlay consumer for the new layered store.
+        self.buffer_manager.unregister_consumer("overlay:LpgStore");
+        let overlay_consumer = Arc::new(section_consumer::OverlayConsumer::new(&new_layered));
+        self.buffer_manager.register_consumer(overlay_consumer);
 
         self.layered_store = Some(new_layered);
         self.query_cache = Arc::new(QueryCache::default());
@@ -1389,6 +1432,126 @@ impl GrafeoDB {
         )
     }
 
+    /// Phase 5e: post-load LayeredStore wiring.
+    ///
+    /// After `load_from_sections` has populated `self.store` (the LpgStore,
+    /// which now holds the overlay data) and `extract_compact_base` has
+    /// produced the base, this rebuilds the same engine state that
+    /// `compact()` establishes:
+    ///
+    /// - `self.layered_store = Some(LayeredStore { base, overlay = self.store })`
+    /// - `self.external_read_store / external_write_store = Arc::clone(layered)`
+    /// - `self.store` swapped to the overlay (which is the same `Arc<LpgStore>`)
+    /// - Tier wrapper installed and `CompactStoreConsumer` + `OverlayConsumer`
+    ///   registered with the BufferManager
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+    fn wire_layered_after_load(
+        &mut self,
+        compact_base: Arc<grafeo_core::graph::compact::CompactStore>,
+        deletion_log: Option<(
+            Vec<grafeo_common::types::NodeId>,
+            Vec<grafeo_common::types::EdgeId>,
+        )>,
+    ) -> Result<()> {
+        use grafeo_core::graph::compact::layered::LayeredStore;
+
+        let overlay_store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| Error::Internal("wire_layered_after_load: no LpgStore".into()))?;
+
+        // Adopt the loaded base + the loaded overlay (id allocator state
+        // is preserved on the overlay during deserialization).
+        let layered = Arc::new(LayeredStore::with_overlay(
+            Arc::clone(&compact_base),
+            Arc::clone(overlay_store),
+        ));
+
+        // Restore base-entity tombstones from the persisted deletion log,
+        // if the file carried one. Without this, base nodes/edges deleted
+        // by the previous session silently reappear after reload.
+        if let Some((nodes, edges)) = deletion_log {
+            layered.seed_deleted_from_base(nodes, edges);
+        }
+
+        // Sync overlay epoch with the transaction manager.
+        let current_epoch = self.transaction_manager.current_epoch();
+        layered.overlay_store().sync_epoch(current_epoch);
+
+        self.external_read_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreSearch>);
+        self.external_write_store = Some(Arc::clone(&layered) as Arc<dyn GraphStoreMut>);
+
+        // Install the tier wrapper + consumers (mirror of compact()'s flow).
+        #[cfg(feature = "mmap")]
+        {
+            let tiered = Arc::new(compact_tiered::CompactStoreTiered::new_in_memory(
+                layered.base_store_arc(),
+            ));
+            let spill_path = self.buffer_manager.config().spill_path.clone();
+            let consumer = Arc::new(section_consumer::CompactStoreConsumer::new(
+                &tiered, &layered, spill_path,
+            ));
+            self.buffer_manager.register_consumer(consumer);
+            self.compact_tiered = Some(tiered);
+        }
+
+        let overlay_consumer = Arc::new(section_consumer::OverlayConsumer::new(&layered));
+        self.buffer_manager.register_consumer(overlay_consumer);
+
+        self.layered_store = Some(layered);
+
+        Ok(())
+    }
+
+    /// Phase 5e: extracts the deserialized CompactStore base from a v2
+    /// section file, if present. Used by the open path to reconstruct
+    /// the LayeredStore wiring after a previously-compacted database
+    /// reopens.
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+    fn extract_compact_base(
+        fm: &GrafeoFileManager,
+    ) -> Result<Option<Arc<grafeo_core::graph::compact::CompactStore>>> {
+        use grafeo_common::storage::{Section, SectionType};
+        let Some(dir) = fm.read_section_directory()? else {
+            return Ok(None);
+        };
+        let Some(entry) = dir.find(SectionType::CompactStore) else {
+            return Ok(None);
+        };
+        let data = fm.read_section_data(entry)?;
+        let mut section = grafeo_core::graph::compact::section::CompactStoreSection::empty();
+        section.deserialize(&data)?;
+        Ok(section.store())
+    }
+
+    /// Reads the persisted overlay deletion log from the container, if
+    /// the file carries one. Returns `(deleted_nodes, deleted_edges)` so
+    /// the caller can seed `LayeredStore::seed_deleted_from_base` after
+    /// the layered store is constructed. Returns `None` when no
+    /// deletions were recorded (the section is omitted in that case).
+    #[cfg(all(feature = "grafeo-file", feature = "lpg", feature = "compact-store"))]
+    fn extract_overlay_deletions(
+        fm: &GrafeoFileManager,
+    ) -> Result<
+        Option<(
+            Vec<grafeo_common::types::NodeId>,
+            Vec<grafeo_common::types::EdgeId>,
+        )>,
+    > {
+        use grafeo_common::storage::{Section, SectionType};
+        let Some(dir) = fm.read_section_directory()? else {
+            return Ok(None);
+        };
+        let Some(entry) = dir.find(SectionType::OverlayDeletions) else {
+            return Ok(None);
+        };
+        let data = fm.read_section_data(entry)?;
+        let mut section =
+            grafeo_core::graph::compact::deletions_section::OverlayDeletionsSection::empty();
+        section.deserialize(&data)?;
+        Ok(Some(section.take()))
+    }
+
     /// Loads from a section-based `.grafeo` file (v2 format).
     ///
     /// Reads the section directory, then deserializes each section independently.
@@ -1419,7 +1582,9 @@ impl GrafeoDB {
             section.deserialize(&data)?;
         }
 
-        // Load LPG store
+        // Load LPG store (Phase 5e: when the file has a CompactStore section,
+        // this LpgStore data IS the overlay; the caller then wires it into
+        // a LayeredStore via `extract_compact_base`).
         if let Some(entry) = dir.find(SectionType::LpgStore) {
             let data = fm.read_section_data(entry)?;
             let mut section = grafeo_core::graph::lpg::LpgStoreSection::new(Arc::clone(store));
@@ -1620,7 +1785,7 @@ impl GrafeoDB {
         // so MVCC operations (begin_tx, commit, visibility) work correctly.
         #[cfg(all(feature = "compact-store", feature = "lpg"))]
         if let Some(ref layered) = self.layered_store {
-            let overlay = Arc::clone(layered.overlay_store());
+            let overlay = layered.overlay_store();
             let layered_arc = Arc::clone(layered);
             let mut session = Session::with_adaptive(overlay, session_cfg());
             // Override graph_store/graph_store_mut to use the LayeredStore
@@ -2226,9 +2391,16 @@ impl GrafeoDB {
         #[cfg(feature = "ring-index")]
         if self.rdf_store.ring().is_some() {
             let ring = grafeo_core::index::ring::RdfRingSection::new(Arc::clone(&self.rdf_store));
-            self.buffer_manager.register_consumer(Arc::new(
-                section_consumer::SectionConsumer::new(Arc::new(ring)),
-            ));
+            // Ring is the first index section to opt into spill wiring.
+            // The Ring's `swap_to_mmap` still returns `NotSupported` until
+            // its packed disk format lands, so a spill attempt today fails
+            // cleanly without leaking files; once the format is in place,
+            // no engine-side change is required to enable real eviction.
+            let consumer = match self.buffer_manager.config().spill_path.clone() {
+                Some(path) => section_consumer::SectionConsumer::with_spill(Arc::new(ring), path),
+                None => section_consumer::SectionConsumer::new(Arc::new(ring)),
+            };
+            self.buffer_manager.register_consumer(Arc::new(consumer));
         }
 
         // Vector indexes: dynamic consumer that re-queries the store on each
@@ -2262,6 +2434,112 @@ impl GrafeoDB {
         self.buffer_manager.register_consumer(
             Arc::clone(&self.cdc_log) as Arc<dyn grafeo_common::memory::MemoryConsumer>
         );
+    }
+
+    /// Applies `TierOverride::ForceDisk` and `TierOverride::ForceRam`
+    /// overrides at database open time.
+    ///
+    /// For each section type in [`Config::section_configs`]:
+    ///
+    /// - `ForceDisk`: spills the matching registered consumer (named
+    ///   `"section:<TypeName>"`) once.
+    /// - `ForceRam` (Phase 8g): pins the matching consumer in the buffer
+    ///   manager so subsequent spill loops (pressure-driven, explicit, or
+    ///   targeted) skip it.
+    /// - `Auto`: no action; the BufferManager applies its default policy.
+    ///
+    /// Must be called after [`Self::register_section_consumers`].
+    fn apply_force_disk_overrides(&self) {
+        use grafeo_common::storage::TierOverride;
+
+        for (section_type, mem_config) in &self.config.section_configs {
+            let consumer_name = format!("section:{section_type:?}");
+            match mem_config.tier {
+                TierOverride::ForceDisk => {
+                    #[cfg(feature = "tracing")]
+                    tracing::info!(
+                        target: "grafeo::tier",
+                        section = ?section_type,
+                        tier = "ForceDisk",
+                        "applying tier override at db open"
+                    );
+                    self.buffer_manager.spill_consumer_by_name(&consumer_name);
+                }
+                TierOverride::ForceRam => {
+                    #[cfg(feature = "tracing")]
+                    tracing::info!(
+                        target: "grafeo::tier",
+                        section = ?section_type,
+                        tier = "ForceRam",
+                        "pinning consumer to RAM"
+                    );
+                    self.buffer_manager.mark_force_ram(&consumer_name);
+                }
+                TierOverride::Auto => {}
+                _ => {}
+            }
+        }
+    }
+
+    /// Reloads spilled consumers back into RAM up to a target memory fraction.
+    ///
+    /// Phase 9a: closes the spill / reload loop. After memory pressure drops
+    /// (e.g. a workload finishes, or a checkpoint freed mutation overlay
+    /// state), call this to bring spilled section data back into RAM for
+    /// faster subsequent reads.
+    ///
+    /// Walks consumers currently reporting `StorageTier::OnDisk`, in priority
+    /// order (highest first), reloading each as long as projected memory
+    /// usage stays below `target_fraction * memory_limit`.
+    ///
+    /// Returns the number of consumers successfully reloaded.
+    ///
+    /// `target_fraction` is clamped to `[0.0, 1.0]`. A typical value is `0.7`
+    /// (matching the default `soft_limit_fraction`).
+    pub fn reload_eligible(&self, target_fraction: f64) -> usize {
+        self.buffer_manager.reload_eligible(target_fraction)
+    }
+
+    /// Returns the current [`StorageTier`] of every registered section consumer.
+    ///
+    /// The map keys are the [`SectionType`]s parsed from each consumer's name
+    /// (consumers whose names don't follow the `"section:<TypeName>"` convention
+    /// are skipped). Tier classification is best-effort: a consumer reporting
+    /// zero `memory_usage()` and `can_spill() == true` is reported as `OnDisk`,
+    /// otherwise `InMemory` (or `Uninitialized` if both are zero).
+    ///
+    /// Useful for tests, observability, and binding-side introspection.
+    ///
+    /// [`StorageTier`]: grafeo_common::memory::buffer::StorageTier
+    /// [`SectionType`]: grafeo_common::storage::SectionType
+    #[must_use]
+    pub fn storage_tiers(
+        &self,
+    ) -> hashbrown::HashMap<
+        grafeo_common::storage::SectionType,
+        grafeo_common::memory::buffer::StorageTier,
+    > {
+        use grafeo_common::storage::SectionType;
+        let snapshot = self.buffer_manager.snapshot_consumer_tiers();
+        let mut out = hashbrown::HashMap::new();
+        for (name, tier) in snapshot {
+            let Some(suffix) = name.strip_prefix("section:") else {
+                continue;
+            };
+            let section_type = match suffix {
+                "LpgStore" => SectionType::LpgStore,
+                "RdfStore" => SectionType::RdfStore,
+                "CompactStore" => SectionType::CompactStore,
+                "VectorStore" => SectionType::VectorStore,
+                "TextIndex" => SectionType::TextIndex,
+                "RdfRing" => SectionType::RdfRing,
+                "PropertyIndex" => SectionType::PropertyIndex,
+                "Catalog" => SectionType::Catalog,
+                _ => continue,
+            };
+            out.insert(section_type, tier);
+        }
+        out
     }
 
     /// Discovers and re-opens spill files from a previous session.
@@ -2371,9 +2649,26 @@ impl GrafeoDB {
 
             // Overlay LPG section.
             let overlay = layered.overlay_store();
-            let overlay_section =
-                grafeo_core::graph::lpg::LpgStoreSection::new(Arc::clone(overlay));
+            let overlay_section = grafeo_core::graph::lpg::LpgStoreSection::new(overlay);
             sections.push(Box::new(overlay_section));
+
+            // Overlay deletion log: persists base-node/edge tombstones
+            // that have not yet been merged into the base. Without this,
+            // close+reopen silently un-deletes those entities. Only push
+            // when there is actually something to record so we don't
+            // emit an empty section on every checkpoint.
+            let deletions = grafeo_core::graph::compact::deletions_section::OverlayDeletionsSection::from_layered(
+                Arc::clone(layered),
+            );
+            if !deletions.is_empty() {
+                sections.push(Box::new(deletions));
+            } else {
+                // The set may have transitioned from non-empty to empty
+                // (e.g. a compact merged the deletes); make sure the
+                // dirty flag is cleared so subsequent checkpoints don't
+                // think they need to keep flushing.
+                layered.mark_deletions_clean();
+            }
 
             return sections;
         }

@@ -11,6 +11,11 @@ use tokio::sync::Mutex;
 /// - Creating unique spill files with prefixes using async I/O
 /// - Tracking total bytes spilled to disk
 /// - Automatic cleanup of all spill files on drop
+///
+/// By default the spill directory itself outlives the manager (the caller
+/// owns it). Per-query callers that pass a unique throwaway directory should
+/// chain [`with_owned_dir`](Self::with_owned_dir) so `Drop` also removes the
+/// directory once its files are gone.
 pub struct AsyncSpillManager {
     /// Directory for spill files.
     spill_dir: PathBuf,
@@ -20,12 +25,16 @@ pub struct AsyncSpillManager {
     active_files: Mutex<Vec<PathBuf>>,
     /// Total bytes currently spilled to disk.
     total_spilled_bytes: AtomicU64,
+    /// Whether `Drop` should remove `spill_dir` itself (non-recursive).
+    owns_dir: bool,
 }
 
 impl AsyncSpillManager {
     /// Creates a new async spill manager with the given directory.
     ///
-    /// Creates the directory if it doesn't exist.
+    /// Creates the directory if it doesn't exist. The directory is *not*
+    /// removed on drop unless [`with_owned_dir`](Self::with_owned_dir) is
+    /// chained on the result.
     ///
     /// # Errors
     ///
@@ -39,7 +48,21 @@ impl AsyncSpillManager {
             next_file_id: AtomicU64::new(0),
             active_files: Mutex::new(Vec::new()),
             total_spilled_bytes: AtomicU64::new(0),
+            owns_dir: false,
         })
+    }
+
+    /// Marks the spill directory as owned by this manager so that `Drop`
+    /// removes it (non-recursive) after spill files are cleaned up.
+    ///
+    /// Use for per-query spill subdirectories where leaving the empty
+    /// directory behind would accumulate over time. The removal is
+    /// best-effort: if anything unexpected is left in the directory,
+    /// `remove_dir` fails and the directory is preserved.
+    #[must_use]
+    pub fn with_owned_dir(mut self) -> Self {
+        self.owns_dir = true;
+        self
     }
 
     /// Creates a new async spill manager using a system temp directory.
@@ -153,6 +176,11 @@ impl Drop for AsyncSpillManager {
     fn drop(&mut self) {
         // Best-effort synchronous cleanup on drop
         self.cleanup_sync();
+        if self.owns_dir {
+            // Non-recursive remove_dir: succeeds only if cleanup_sync left
+            // the directory empty. Anything untracked keeps the directory.
+            let _ = std::fs::remove_dir(&self.spill_dir);
+        }
     }
 }
 

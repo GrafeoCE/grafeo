@@ -664,7 +664,10 @@ fn corrupt_snapshot_detected_on_open() {
         db.close().unwrap();
     }
 
-    // Corrupt the snapshot data region (offset 12288+)
+    // Corrupt the post-header region at offset 12288 (0x3000). In v1 files
+    // this is the snapshot blob; in v2 files it is the section directory.
+    // Either way, the bytes here are integrity-checked at open and the
+    // corruption must be surfaced rather than masked.
     {
         use std::io::{Seek, SeekFrom, Write};
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -672,13 +675,15 @@ fn corrupt_snapshot_detected_on_open() {
         file.write_all(b"CORRUPTED DATA HERE!!!").unwrap();
     }
 
-    // Opening should fail with a checksum error
     let result = GrafeoDB::with_config(Config::persistent(&path));
     assert!(result.is_err());
     let err_msg = result.err().unwrap().to_string();
+    let signals_corruption = err_msg.contains("checksum")
+        || err_msg.contains("section directory")
+        || err_msg.contains("failed to parse");
     assert!(
-        err_msg.contains("checksum"),
-        "expected checksum error, got: {err_msg}"
+        signals_corruption,
+        "expected a corruption-related error, got: {err_msg}"
     );
 }
 
@@ -1308,4 +1313,120 @@ fn save_from_read_only_database() {
     let restored = GrafeoDB::open(&dest_path).unwrap();
     assert_eq!(restored.node_count(), 2);
     restored.close().unwrap();
+}
+
+// =========================================================================
+// Layered overlay deletion durability (#323 follow-up)
+// =========================================================================
+
+/// Regression test: when a database has been compacted (so deletes go
+/// through the LayeredStore's `deleted_from_base_*` sets rather than
+/// directly modifying an LpgStore), those deletions must survive a
+/// close/reopen cycle. Before the OverlayDeletions section landed, the
+/// deletion sets were in-memory only and previously-deleted base nodes
+/// silently reappeared on reopen.
+#[cfg(all(feature = "compact-store", feature = "lpg"))]
+#[test]
+fn deleted_base_nodes_stay_deleted_across_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("layered_delete_persist.grafeo");
+
+    {
+        let mut db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+        let session = db.session();
+        session.execute("INSERT (:Person {name: 'Alix'})").unwrap();
+        session.execute("INSERT (:Person {name: 'Gus'})").unwrap();
+        session
+            .execute("INSERT (:Person {name: 'Vincent'})")
+            .unwrap();
+        // Drop the session so its lock is released before compact() takes
+        // the write lock on the store.
+        drop(session);
+
+        // Compact: pushes the three nodes into the columnar base and
+        // installs a LayeredStore. Subsequent deletes go through
+        // `LayeredStore::delete_node` and write to
+        // `deleted_from_base_nodes`, which is exactly the path we need
+        // to durably persist.
+        db.compact().expect("compact should succeed");
+
+        let session = db.session();
+        session
+            .execute("MATCH (p:Person {name: 'Gus'}) DELETE p")
+            .unwrap();
+        drop(session);
+
+        // Verify the delete is visible in the running database.
+        let session = db.session();
+        let result = session
+            .execute("MATCH (p:Person) RETURN p.name ORDER BY p.name")
+            .unwrap();
+        assert_eq!(extract_strings(result.rows()), vec!["Alix", "Vincent"]);
+        drop(session);
+
+        db.close().unwrap();
+    }
+
+    // Reopen and confirm Gus did not reappear.
+    let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+    let session = db.session();
+    let result = session
+        .execute("MATCH (p:Person) RETURN p.name ORDER BY p.name")
+        .unwrap();
+    assert_eq!(
+        extract_strings(result.rows()),
+        vec!["Alix", "Vincent"],
+        "previously-deleted base node must stay deleted across reopen"
+    );
+    drop(session);
+    db.close().unwrap();
+}
+
+/// Companion test for edge deletion through the LayeredStore.
+#[cfg(all(feature = "compact-store", feature = "lpg"))]
+#[test]
+fn deleted_base_edges_stay_deleted_across_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("layered_edge_delete_persist.grafeo");
+
+    {
+        let mut db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+        let session = db.session();
+        session.execute("INSERT (:Person {name: 'Alix'})").unwrap();
+        session.execute("INSERT (:Person {name: 'Gus'})").unwrap();
+        session
+            .execute(
+                "MATCH (a:Person {name: 'Alix'}), (b:Person {name: 'Gus'}) \
+                 INSERT (a)-[:KNOWS]->(b)",
+            )
+            .unwrap();
+        drop(session);
+
+        db.compact().expect("compact should succeed");
+
+        let session = db.session();
+        session
+            .execute("MATCH (:Person)-[r:KNOWS]->(:Person) DELETE r")
+            .unwrap();
+        let result = session
+            .execute("MATCH (:Person)-[r:KNOWS]->(:Person) RETURN count(r)")
+            .unwrap();
+        assert_eq!(result.rows()[0][0], Value::Int64(0));
+        drop(session);
+
+        db.close().unwrap();
+    }
+
+    let db = GrafeoDB::with_config(Config::persistent(&path)).unwrap();
+    let session = db.session();
+    let result = session
+        .execute("MATCH (:Person)-[r:KNOWS]->(:Person) RETURN count(r)")
+        .unwrap();
+    assert_eq!(
+        result.rows()[0][0],
+        Value::Int64(0),
+        "previously-deleted base edge must stay deleted across reopen"
+    );
+    drop(session);
+    db.close().unwrap();
 }

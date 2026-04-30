@@ -5,6 +5,7 @@ use super::grant::{GrantReleaser, MemoryGrant};
 use super::region::MemoryRegion;
 use super::stats::{BufferStats, PressureLevel};
 use parking_lot::RwLock;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -125,6 +126,13 @@ pub struct BufferManager {
     region_allocated: [AtomicUsize; 4],
     /// Registered memory consumers.
     consumers: RwLock<Vec<Arc<dyn MemoryConsumer>>>,
+    /// Set of consumer names pinned to RAM via `TierOverride::ForceRam`.
+    ///
+    /// Phase 8g enforcement: any spill loop ([`Self::run_eviction_internal`],
+    /// [`Self::spill_all`], [`Self::spill_consumer_by_name`]) skips consumers
+    /// whose name is in this set. Populated by the engine at startup based on
+    /// `Config.section_configs`.
+    force_ram_consumers: RwLock<HashSet<String>>,
     /// Computed soft limit in bytes.
     soft_limit: usize,
     /// Computed eviction limit in bytes.
@@ -159,6 +167,7 @@ impl BufferManager {
                 AtomicUsize::new(0),
             ],
             consumers: RwLock::new(Vec::new()),
+            force_ram_consumers: RwLock::new(HashSet::new()),
             soft_limit,
             evict_limit,
             hard_limit,
@@ -248,6 +257,34 @@ impl BufferManager {
     /// Unregisters a memory consumer by name.
     pub fn unregister_consumer(&self, name: &str) {
         self.consumers.write().retain(|c| c.name() != name);
+        // Also drop any ForceRam pin so re-registering with a different
+        // tier doesn't carry over stale state.
+        self.force_ram_consumers.write().remove(name);
+    }
+
+    /// Pins a consumer to RAM via [`crate::storage::TierOverride::ForceRam`].
+    ///
+    /// After this call, no spill loop in the buffer manager will spill the
+    /// consumer with the given name. Allocation pressure that would otherwise
+    /// have spilled this consumer instead falls through to other consumers,
+    /// or fails if no other spillable consumer can free enough.
+    ///
+    /// Idempotent: calling twice with the same name is a no-op.
+    pub fn mark_force_ram(&self, name: &str) {
+        self.force_ram_consumers.write().insert(name.to_string());
+    }
+
+    /// Removes the [`crate::storage::TierOverride::ForceRam`] pin from a
+    /// consumer (Phase 8g). After this call, the consumer participates in
+    /// spill again like any other.
+    pub fn clear_force_ram(&self, name: &str) {
+        self.force_ram_consumers.write().remove(name);
+    }
+
+    /// Returns `true` if a consumer is currently pinned via ForceRam.
+    #[must_use]
+    pub fn is_force_ram(&self, name: &str) -> bool {
+        self.force_ram_consumers.read().contains(name)
     }
 
     /// Forces eviction to reach the target usage.
@@ -266,10 +303,15 @@ impl BufferManager {
     /// Spills all consumers that support it, regardless of memory pressure.
     ///
     /// Used when `TierOverride::ForceDisk` is configured. Returns total bytes freed.
+    /// Consumers pinned via [`Self::mark_force_ram`] are skipped.
     pub fn spill_all(&self) -> usize {
         let consumers = self.consumers.read();
+        let force_ram = self.force_ram_consumers.read();
         let mut total_freed = 0;
         for consumer in consumers.iter() {
+            if force_ram.contains(consumer.name()) {
+                continue;
+            }
             if consumer.can_spill()
                 && let Ok(freed) = consumer.spill(usize::MAX)
             {
@@ -277,6 +319,147 @@ impl BufferManager {
             }
         }
         total_freed
+    }
+
+    /// Spills all consumers whose [`MemoryConsumer::name`] equals `name`.
+    ///
+    /// Used for targeted [`crate::storage::TierOverride::ForceDisk`] enforcement
+    /// at database open: each section type configured as `ForceDisk` triggers a
+    /// spill on its matching consumer only, leaving other consumers untouched.
+    ///
+    /// Best-effort: a failure on one consumer does not stop the others. Returns
+    /// total bytes freed across all matching consumers.
+    ///
+    /// If `name` is pinned via [`Self::mark_force_ram`], this call is a no-op
+    /// and returns `0`. The pin is honored even on explicit-by-name spill
+    /// requests: `ForceRam` is a hard contract.
+    pub fn spill_consumer_by_name(&self, name: &str) -> usize {
+        if self.is_force_ram(name) {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                target: "grafeo::buffer",
+                consumer = name,
+                "spill skipped: consumer pinned ForceRam"
+            );
+            return 0;
+        }
+        let consumers = self.consumers.read();
+        let mut total_freed = 0;
+        for consumer in consumers.iter() {
+            if consumer.name() == name
+                && consumer.can_spill()
+                && let Ok(freed) = consumer.spill(usize::MAX)
+            {
+                total_freed += freed;
+            }
+        }
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            target: "grafeo::buffer",
+            consumer = name,
+            freed_bytes = total_freed,
+            "tier transition: spill"
+        );
+        total_freed
+    }
+
+    /// Reloads OnDisk consumers back into RAM, in priority order (highest
+    /// priority first), as long as projected usage stays below
+    /// `target_fraction` of the budget.
+    ///
+    /// Phase 9a: closes the loop on the spill / reload lifecycle. Today
+    /// consumers spill on memory pressure and stay OnDisk forever; this
+    /// method gives users (or a future background thread) an explicit
+    /// trigger to bring spilled state back into RAM after pressure drops.
+    ///
+    /// The walk visits consumers whose
+    /// [`MemoryConsumer::current_tier`] is
+    /// [`super::tiered::StorageTier::OnDisk`] and calls
+    /// [`MemoryConsumer::reload`] on each. After each reload, if current
+    /// allocation exceeds `target_fraction * budget`, the loop stops and
+    /// leaves remaining consumers on disk. `reload()` errors are
+    /// logged-and-skipped: the operation is best-effort.
+    ///
+    /// Returns the number of consumers successfully reloaded.
+    ///
+    /// `target_fraction` is clamped to `[0.0, 1.0]`. A value of 0.7 means
+    /// "stop bringing things back when we'd hit 70% of the budget" —
+    /// matching the soft-limit threshold default.
+    pub fn reload_eligible(&self, target_fraction: f64) -> usize {
+        let target_fraction = target_fraction.clamp(0.0, 1.0);
+        // reason: target byte count from a bounded fraction is non-negative and bounded by budget
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let target_bytes = (self.config.budget as f64 * target_fraction) as usize;
+
+        let candidates: Vec<Arc<dyn MemoryConsumer>> = {
+            let consumers = self.consumers.read();
+            let mut out: Vec<_> = consumers
+                .iter()
+                .filter(|c| c.current_tier() == super::tiered::StorageTier::OnDisk)
+                .map(Arc::clone)
+                .collect();
+            // Highest priority first: graph storage > active txn > index > query cache.
+            out.sort_by_key(|c| std::cmp::Reverse(c.eviction_priority()));
+            out
+        };
+
+        let mut reloaded = 0;
+        for consumer in candidates {
+            let current = self.allocated.load(Ordering::Relaxed);
+            if current >= target_bytes {
+                break;
+            }
+            match consumer.reload() {
+                Ok(()) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::info!(
+                        target: "grafeo::buffer",
+                        consumer = consumer.name(),
+                        "tier transition: reload"
+                    );
+                    reloaded += 1;
+                }
+                Err(_e) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        target: "grafeo::buffer",
+                        consumer = consumer.name(),
+                        error = %_e,
+                        "tier reload failed"
+                    );
+                    continue;
+                }
+            }
+        }
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            target: "grafeo::buffer",
+            reloaded_count = reloaded,
+            target_fraction = target_fraction,
+            "reload_eligible cycle complete"
+        );
+        reloaded
+    }
+
+    /// Returns the current tier reported by each registered consumer that
+    /// wraps a section.
+    ///
+    /// Tier is sourced from [`MemoryConsumer::current_tier`]. Consumers whose
+    /// names don't follow the `"section:<TypeName>"` convention are skipped
+    /// (e.g. CDC, overlay).
+    #[must_use]
+    pub fn snapshot_consumer_tiers(&self) -> Vec<(String, super::tiered::StorageTier)> {
+        let consumers = self.consumers.read();
+        consumers
+            .iter()
+            .filter_map(|c| {
+                let name = c.name();
+                if !name.starts_with("section:") {
+                    return None;
+                }
+                Some((name.to_string(), c.current_tier()))
+            })
+            .collect()
     }
 
     /// Returns the configuration.
@@ -352,6 +535,7 @@ impl BufferManager {
 
     fn run_eviction_internal(&self, to_free: usize) -> usize {
         let consumers = self.consumers.read();
+        let force_ram = self.force_ram_consumers.read();
 
         // Sort consumers by priority (lowest first = evict first)
         let mut sorted: Vec<_> = consumers.iter().collect();
@@ -361,6 +545,13 @@ impl BufferManager {
         for consumer in &sorted {
             if total_freed >= to_free {
                 break;
+            }
+
+            // Phase 8g: respect ForceRam pin even on the evict path.
+            // evict() is typically a no-op for these consumers anyway,
+            // but skipping is the principled choice.
+            if force_ram.contains(consumer.name()) {
+                continue;
             }
 
             let remaining = to_free - total_freed;
@@ -376,10 +567,15 @@ impl BufferManager {
 
         // If eviction was not enough, try spilling to disk for consumers
         // that support it (e.g., vector indexes with mmap storage).
+        // Phase 8g: ForceRam consumers are skipped here too — that's the
+        // hard contract ("never move me to disk").
         if total_freed < to_free {
             for consumer in &sorted {
                 if total_freed >= to_free {
                     break;
+                }
+                if force_ram.contains(consumer.name()) {
+                    continue;
                 }
                 if !consumer.can_spill() {
                     continue;
@@ -476,6 +672,14 @@ mod tests {
             self.usage.fetch_sub(to_evict, Ordering::Relaxed);
             self.evicted.fetch_add(to_evict, Ordering::Relaxed);
             to_evict
+        }
+
+        fn current_tier(&self) -> super::super::tiered::StorageTier {
+            if self.memory_usage() == 0 {
+                super::super::tiered::StorageTier::Uninitialized
+            } else {
+                super::super::tiered::StorageTier::InMemory
+            }
         }
     }
 
@@ -733,6 +937,16 @@ mod tests {
             self.usage.fetch_sub(to_spill, Ordering::Relaxed);
             self.spilled.fetch_add(to_spill, Ordering::Relaxed);
             Ok(to_spill)
+        }
+
+        fn current_tier(&self) -> super::super::tiered::StorageTier {
+            if self.spilled.load(Ordering::Relaxed) > 0 {
+                super::super::tiered::StorageTier::OnDisk
+            } else if self.memory_usage() == 0 {
+                super::super::tiered::StorageTier::Uninitialized
+            } else {
+                super::super::tiered::StorageTier::InMemory
+            }
         }
     }
 
@@ -1026,6 +1240,14 @@ mod tests {
             Err(crate::memory::buffer::consumer::SpillError::IoError(
                 "disk full".to_string(),
             ))
+        }
+
+        fn current_tier(&self) -> super::super::tiered::StorageTier {
+            if self.memory_usage() == 0 {
+                super::super::tiered::StorageTier::Uninitialized
+            } else {
+                super::super::tiered::StorageTier::InMemory
+            }
         }
     }
 

@@ -326,6 +326,80 @@ impl LpgStore {
         self.edge_properties.zone_map(property)
     }
 
+    /// Gets the per-block zone maps for a node property, populated when
+    /// the column is compressed.
+    ///
+    /// Returns `None` when the column doesn't exist; returns `Some(empty)`
+    /// when the column exists but is uncompressed (the hot buffer has no
+    /// row order, so per-block pruning is meaningless there). Phase 4
+    /// consumes these for lazy `range_iter`-style scans.
+    ///
+    /// **Temporal mode:** always returns `Some(empty)` for any existing
+    /// column. Compression is disabled for `VersionLog`-backed columns,
+    /// so the per-block array is never populated. Use the column-level
+    /// [`node_property_zone_map`](Self::node_property_zone_map) instead.
+    #[must_use]
+    pub fn node_property_block_zone_maps(
+        &self,
+        property: &PropertyKey,
+    ) -> Option<Vec<ZoneMapEntry>> {
+        self.node_properties.block_zone_maps_for(property)
+    }
+
+    /// Gets the per-block zone maps for an edge property.
+    ///
+    /// **Temporal mode:** see [`node_property_block_zone_maps`](Self::node_property_block_zone_maps).
+    #[must_use]
+    pub fn edge_property_block_zone_maps(
+        &self,
+        property: &PropertyKey,
+    ) -> Option<Vec<ZoneMapEntry>> {
+        self.edge_properties.block_zone_maps_for(property)
+    }
+
+    /// Returns the number of compressed blocks for a node property.
+    ///
+    /// Phase 4's iterator-bounds operator uses this together with
+    /// [`Self::node_property_block_zone_maps`] to walk blocks and prune
+    /// by zone map before decoding.
+    #[cfg(not(feature = "temporal"))]
+    #[must_use]
+    pub fn node_property_block_count(&self, property: &PropertyKey) -> Option<usize> {
+        self.node_properties.block_count_for(property)
+    }
+
+    /// Returns the number of compressed blocks for an edge property.
+    #[cfg(not(feature = "temporal"))]
+    #[must_use]
+    pub fn edge_property_block_count(&self, property: &PropertyKey) -> Option<usize> {
+        self.edge_properties.block_count_for(property)
+    }
+
+    /// Decodes a single compressed block of a node property.
+    ///
+    /// Returns `None` when the property is missing, uncompressed, or
+    /// `block_idx` is out of range.
+    #[cfg(not(feature = "temporal"))]
+    #[must_use]
+    pub fn decode_node_property_block(
+        &self,
+        property: &PropertyKey,
+        block_idx: usize,
+    ) -> Option<crate::graph::lpg::DecodedBlock<grafeo_common::types::NodeId>> {
+        self.node_properties.decode_block_for(property, block_idx)
+    }
+
+    /// Decodes a single compressed block of an edge property.
+    #[cfg(not(feature = "temporal"))]
+    #[must_use]
+    pub fn decode_edge_property_block(
+        &self,
+        property: &PropertyKey,
+        block_idx: usize,
+    ) -> Option<crate::graph::lpg::DecodedBlock<grafeo_common::types::EdgeId>> {
+        self.edge_properties.decode_block_for(property, block_idx)
+    }
+
     /// Rebuilds zone maps for all properties.
     #[doc(hidden)]
     pub fn rebuild_zone_maps(&self) {

@@ -451,7 +451,7 @@ impl super::Planner {
             (Some(op), cols)
         };
 
-        // Convert match properties to PropertySource (supports both constants and variables)
+        // Match properties cannot reference the MERGE variable (ISO §15.5).
         let match_properties: Vec<(String, PropertySource)> = merge
             .match_properties
             .iter()
@@ -459,7 +459,6 @@ impl super::Planner {
                 let source = self
                     .expression_to_property_source(expr, &columns)
                     .unwrap_or_else(|_| {
-                        // Fallback: try constant folding for complex expressions
                         Self::try_fold_expression(expr).map_or(
                             PropertySource::Constant(Value::Null),
                             PropertySource::Constant,
@@ -469,39 +468,29 @@ impl super::Planner {
             })
             .collect();
 
-        // Convert ON CREATE properties
+        // ON CREATE / ON MATCH expressions are evaluated against an augmented row
+        // that includes the merged node. Build the action-scope columns now so
+        // `coalesce(n.x, 0)` and similar expressions can resolve `n`.
+        let mut action_scope_columns = columns.clone();
+        action_scope_columns.push(merge.variable.clone());
+
         let on_create_properties: Vec<(String, PropertySource)> = merge
             .on_create
             .iter()
             .map(|(name, expr)| {
-                let source = self
-                    .expression_to_property_source(expr, &columns)
-                    .unwrap_or_else(|_| {
-                        Self::try_fold_expression(expr).map_or(
-                            PropertySource::Constant(Value::Null),
-                            PropertySource::Constant,
-                        )
-                    });
-                (name.clone(), source)
+                let source = self.merge_action_property_source(expr, &action_scope_columns)?;
+                Ok::<_, Error>((name.clone(), source))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        // Convert ON MATCH properties
         let on_match_properties: Vec<(String, PropertySource)> = merge
             .on_match
             .iter()
             .map(|(name, expr)| {
-                let source = self
-                    .expression_to_property_source(expr, &columns)
-                    .unwrap_or_else(|_| {
-                        Self::try_fold_expression(expr).map_or(
-                            PropertySource::Constant(Value::Null),
-                            PropertySource::Constant,
-                        )
-                    });
-                (name.clone(), source)
+                let source = self.merge_action_property_source(expr, &action_scope_columns)?;
+                Ok::<_, Error>((name.clone(), source))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         // Detect if the merge variable is already bound from the input.
         // If so, record its column index for NULL-reference checking at runtime.
@@ -531,7 +520,9 @@ impl super::Planner {
                 bound_variable_column,
             },
         )
-        .with_transaction_context(self.viewing_epoch, self.transaction_id);
+        .with_transaction_context(self.viewing_epoch, self.transaction_id)
+        .with_search_store(Arc::clone(&self.store))
+        .with_session_context(self.session_context.clone());
 
         if let Some(ref validator) = self.validator {
             merge_op = merge_op.with_validator(Arc::clone(validator));
@@ -587,37 +578,28 @@ impl super::Planner {
             })
             .collect();
 
+        // ON CREATE / ON MATCH SET on a MERGE relationship may reference the
+        // edge variable itself: build an augmented scope that includes it.
+        let mut action_scope_columns = columns.clone();
+        action_scope_columns.push(merge_rel.variable.clone());
+
         let on_create_properties: Vec<(String, PropertySource)> = merge_rel
             .on_create
             .iter()
             .map(|(name, expr)| {
-                let source = self
-                    .expression_to_property_source(expr, &columns)
-                    .unwrap_or_else(|_| {
-                        Self::try_fold_expression(expr).map_or(
-                            PropertySource::Constant(Value::Null),
-                            PropertySource::Constant,
-                        )
-                    });
-                (name.clone(), source)
+                let source = self.merge_action_property_source(expr, &action_scope_columns)?;
+                Ok::<_, Error>((name.clone(), source))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let on_match_properties: Vec<(String, PropertySource)> = merge_rel
             .on_match
             .iter()
             .map(|(name, expr)| {
-                let source = self
-                    .expression_to_property_source(expr, &columns)
-                    .unwrap_or_else(|_| {
-                        Self::try_fold_expression(expr).map_or(
-                            PropertySource::Constant(Value::Null),
-                            PropertySource::Constant,
-                        )
-                    });
-                (name.clone(), source)
+                let source = self.merge_action_property_source(expr, &action_scope_columns)?;
+                Ok::<_, Error>((name.clone(), source))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         // Add the edge variable to output columns and track it as an edge
         let edge_output_column = columns.len();
@@ -647,7 +629,9 @@ impl super::Planner {
 
         let mut merge_rel_op =
             MergeRelationshipOperator::new(self.write_store()?, input_op, config)
-                .with_transaction_context(self.viewing_epoch, self.transaction_id);
+                .with_transaction_context(self.viewing_epoch, self.transaction_id)
+                .with_search_store(Arc::clone(&self.store))
+                .with_session_context(self.session_context.clone());
 
         if let Some(ref validator) = self.validator {
             merge_rel_op = merge_rel_op.with_validator(Arc::clone(validator));
@@ -1143,7 +1127,58 @@ impl super::Planner {
         Ok((operator, output_columns))
     }
 
+    /// Lowers an ON CREATE / ON MATCH SET expression for a MERGE clause.
+    ///
+    /// Resolution order:
+    /// 1. Simple lowering against the augmented action scope (input columns +
+    ///    the MERGE variable). Catches literals, plain variable refs, and
+    ///    direct property access.
+    /// 2. Constant folding for plan-time-evaluable expressions like
+    ///    `vector([1,2,3])` or `date('2024-01-01')`.
+    /// 3. Fall back to a runtime [`PropertySource::Expression`] carrying the
+    ///    converted [`FilterExpression`] and the variable-column map. The
+    ///    operator builds an augmented row containing the merged node/edge
+    ///    and evaluates the expression via [`ExpressionPredicate`].
+    pub(super) fn merge_action_property_source(
+        &self,
+        expr: &LogicalExpression,
+        action_scope_columns: &[String],
+    ) -> Result<PropertySource> {
+        if let Ok(source) = self.expression_to_property_source(expr, action_scope_columns) {
+            return Ok(source);
+        }
+        if let Some(value) = Self::try_fold_expression(expr) {
+            return Ok(PropertySource::Constant(value));
+        }
+        let filter_expr = self.convert_expression(expr)?;
+        // When the merge variable is already bound from input, it appears
+        // twice in `action_scope_columns`. Collecting via `HashMap::insert`
+        // keeps the LAST occurrence, which is the appended column matching
+        // the operator's augmented row position. Do not switch to a
+        // first-wins collector here.
+        let variable_columns: HashMap<String, usize> = action_scope_columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.clone(), i))
+            .collect();
+        Ok(PropertySource::Expression {
+            expr: Box::new(filter_expr),
+            variable_columns,
+        })
+    }
+
     /// Converts a logical expression to a PropertySource.
+    ///
+    /// Variable resolution uses `rposition` rather than `position` so that
+    /// when `columns` legitimately contains a duplicated variable name,
+    /// references resolve to the most recently added (innermost / latest)
+    /// column. The MERGE planner relies on this for ON CREATE / ON MATCH
+    /// expressions whose action scope appends the merge variable on top of
+    /// an input that may already bind it: the appended column is the one
+    /// the operator's augmented row populates with the merged node/edge id,
+    /// and resolving to the earlier bound copy would read the pre-merge
+    /// (potentially stale) value instead. For unique columns the two are
+    /// equivalent.
     pub(super) fn expression_to_property_source(
         &self,
         expr: &LogicalExpression,
@@ -1152,13 +1187,13 @@ impl super::Planner {
         match expr {
             LogicalExpression::Literal(value) => Ok(PropertySource::Constant(value.clone())),
             LogicalExpression::Variable(name) => {
-                let col_idx = columns.iter().position(|c| c == name).ok_or_else(|| {
+                let col_idx = columns.iter().rposition(|c| c == name).ok_or_else(|| {
                     Error::Internal(format!("Variable '{}' not found for property source", name))
                 })?;
                 Ok(PropertySource::Column(col_idx))
             }
             LogicalExpression::Property { variable, property } => {
-                let col_idx = columns.iter().position(|c| c == variable).ok_or_else(|| {
+                let col_idx = columns.iter().rposition(|c| c == variable).ok_or_else(|| {
                     Error::Internal(format!(
                         "Variable '{}' not found for property access '{}.{}'",
                         variable, variable, property

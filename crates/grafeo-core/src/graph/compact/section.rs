@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bytes::Bytes;
 use grafeo_common::storage::section::{Section, SectionType};
 use grafeo_common::types::{EdgeId, NodeId, PropertyKey};
 use grafeo_common::utils::hash::FxHashMap;
@@ -23,8 +24,18 @@ use crate::statistics::{EdgeTypeStatistics, LabelStatistics, Statistics};
 /// Magic bytes identifying a CompactStore section.
 const MAGIC: [u8; 4] = *b"GCST";
 
-/// Current section format version.
-const FORMAT_VERSION: u8 = 1;
+/// Current section format version. Phase 2c bumped this from 2 to 3 to
+/// embed per-block zone maps in the column index for skip pruning.
+const FORMAT_VERSION: u8 = 3;
+
+/// v2 (Phase 2b) layout: per-block index + bodies, no per-block stats.
+/// Retained as a read-only compat path for one release.
+const FORMAT_VERSION_V2: u8 = 2;
+
+/// v1 layout: flat columns, no blocks. Retained as a read-only compat
+/// path for one release. Files written by 0.5.41 and earlier carry
+/// this byte; 0.5.42+ writers always emit [`FORMAT_VERSION`].
+const FORMAT_VERSION_V1: u8 = 1;
 
 /// Wraps a [`CompactStore`] as a container [`Section`].
 pub struct CompactStoreSection {
@@ -61,18 +72,42 @@ impl CompactStoreSection {
     pub fn store(&self) -> Option<Arc<CompactStore>> {
         self.store.read().clone()
     }
-}
 
-impl Section for CompactStoreSection {
-    fn section_type(&self) -> SectionType {
-        SectionType::CompactStore
+    /// Deserializes from a refcounted [`Bytes`] buffer (Phase 3c).
+    ///
+    /// This is the zero-copy entry point: when `data` wraps a mmap
+    /// region (via [`bytes::Bytes::from_owner`]), column codec storage
+    /// is constructed via `data.slice(range)` rather than copying. The
+    /// trait [`Section::deserialize`] entry point still works on
+    /// `&[u8]` and incurs one heap copy (a single `Bytes::copy_from_slice`
+    /// at the boundary).
+    ///
+    /// # Errors
+    ///
+    /// Same error semantics as [`Section::deserialize`].
+    pub fn deserialize_from_bytes(
+        &mut self,
+        data: bytes::Bytes,
+    ) -> grafeo_common::utils::error::Result<()> {
+        let store = deserialize_compact_store(&data).map_err(|e| {
+            grafeo_common::utils::error::Error::Internal(format!(
+                "CompactStore deserialization failed: {e}"
+            ))
+        })?;
+        *self.store.write() = Some(Arc::new(store));
+        Ok(())
     }
 
-    fn version(&self) -> u8 {
-        FORMAT_VERSION
-    }
-
-    fn serialize(&self) -> grafeo_common::utils::error::Result<Vec<u8>> {
+    /// Serializes at the requested format version.
+    ///
+    /// The default [`Section::serialize`] always writes [`FORMAT_VERSION`].
+    /// This entry point is kept (test-only outside this crate) so the
+    /// v1 compat reader can be exercised without keeping any externally
+    /// committed v1 fixtures.
+    pub(crate) fn serialize_with_version(
+        &self,
+        version: u8,
+    ) -> grafeo_common::utils::error::Result<Vec<u8>> {
         let guard = self.store.read();
         let store = guard.as_ref().ok_or_else(|| {
             grafeo_common::utils::error::Error::Internal("no CompactStore to serialize".into())
@@ -82,7 +117,7 @@ impl Section for CompactStoreSection {
 
         // Header.
         buf.extend_from_slice(&MAGIC);
-        buf.push(FORMAT_VERSION);
+        buf.push(version);
         let flags: u8 = u8::from(store.preserves_ids());
         buf.push(flags);
 
@@ -103,7 +138,12 @@ impl Section for CompactStoreSection {
                 } else {
                     buf.push(0);
                 }
-                codec.write_to(&mut buf);
+                write_codec(
+                    codec,
+                    &mut buf,
+                    version,
+                    nt.block_zone_maps().get(key).map(Vec::as_slice),
+                );
             }
         }
 
@@ -124,10 +164,22 @@ impl Section for CompactStoreSection {
             write_len(&mut buf, properties.len());
             for (key, codec) in properties {
                 write_str(&mut buf, key.as_str());
-                codec.write_to(&mut buf);
+                // Edge property columns don't track per-block zone maps
+                // yet; v3 will compute them inline during write.
+                write_codec(codec, &mut buf, version, None);
             }
         }
+        // Continue building buf in `serialize()` epilogue.
+        Ok(self.append_id_maps_and_crc(buf, store, version))
+    }
 
+    /// Appends ID maps (if applicable) and trailing CRC to the buffer.
+    fn append_id_maps_and_crc(
+        &self,
+        mut buf: Vec<u8>,
+        store: &CompactStore,
+        _version: u8,
+    ) -> Vec<u8> {
         // ID maps.
         if store.preserves_ids() {
             if let Some(ref node_map) = store.node_id_map {
@@ -151,19 +203,52 @@ impl Section for CompactStoreSection {
         // CRC32 at end.
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+}
 
-        Ok(buf)
+/// Writes a single column codec body using the layout matching the
+/// section's format version.
+///
+/// - v1 = flat columns (legacy)
+/// - v2 = per-block index + concatenated bodies, no stats
+/// - v3 = v2 layout + inline per-block zone map per index entry
+///
+/// `block_stats_hint` is consulted only at v3; when `None` or with a
+/// mismatched length, [`ColumnCodec::write_to_v3`] computes the stats
+/// from the column itself.
+fn write_codec(
+    codec: &ColumnCodec,
+    buf: &mut Vec<u8>,
+    version: u8,
+    block_stats_hint: Option<&[ZoneMap]>,
+) {
+    match version {
+        FORMAT_VERSION_V1 => codec.write_to(buf),
+        FORMAT_VERSION_V2 => codec.write_to_v2(buf),
+        _ => codec.write_to_v3(buf, block_stats_hint),
+    }
+}
+
+impl Section for CompactStoreSection {
+    fn section_type(&self) -> SectionType {
+        SectionType::CompactStore
+    }
+
+    fn version(&self) -> u8 {
+        FORMAT_VERSION
+    }
+
+    fn serialize(&self) -> grafeo_common::utils::error::Result<Vec<u8>> {
+        self.serialize_with_version(FORMAT_VERSION)
     }
 
     fn deserialize(&mut self, data: &[u8]) -> grafeo_common::utils::error::Result<()> {
-        let store = deserialize_compact_store(data).map_err(|e| {
-            grafeo_common::utils::error::Error::Internal(format!(
-                "CompactStore deserialization failed: {e}"
-            ))
-        })?;
-
-        *self.store.write() = Some(Arc::new(store));
-        Ok(())
+        // Heap-copy entry point (Section trait). Phase 3c adds
+        // [`deserialize_from_bytes`](Self::deserialize_from_bytes) which
+        // skips the copy on the mmap path.
+        let owned = bytes::Bytes::copy_from_slice(data);
+        self.deserialize_from_bytes(owned)
     }
 
     fn is_dirty(&self) -> bool {
@@ -181,7 +266,35 @@ impl Section for CompactStoreSection {
 
 // ── Deserialization ────────────────────────────────────────────────
 
-fn deserialize_compact_store(data: &[u8]) -> Result<CompactStore, String> {
+/// Reads a single column codec body, dispatching by section version.
+///
+/// - v1 → [`ColumnCodec::read_from`] (flat layout, no per-block stats)
+/// - v2 → [`ColumnCodec::read_from_v2`] (block index, no stats)
+/// - v3 → [`ColumnCodec::read_from_v3`] (block index + per-block stats)
+///
+/// Returns the codec and an `Option<Vec<ZoneMap>>` carrying per-block
+/// stats when the v3 path was taken.
+fn read_codec(
+    data: &Bytes,
+    pos: &mut usize,
+    version: u8,
+) -> Result<(ColumnCodec, Option<Vec<ZoneMap>>), String> {
+    match version {
+        FORMAT_VERSION_V1 => ColumnCodec::read_from(data, pos)
+            .map(|c| (c, None))
+            .map_err(|e| e.to_string()),
+        FORMAT_VERSION_V2 => ColumnCodec::read_from_v2(data, pos)
+            .map(|c| (c, None))
+            .map_err(|e| e.to_string()),
+        FORMAT_VERSION => ColumnCodec::read_from_v3(data, pos)
+            .map(|(c, stats)| (c, Some(stats)))
+            .map_err(|e| e.to_string()),
+        _ => Err(format!("unsupported CompactStore version {version}")),
+    }
+}
+
+fn deserialize_compact_store(data_bytes: &bytes::Bytes) -> Result<CompactStore, String> {
+    let data: &[u8] = data_bytes.as_ref();
     if data.len() < 10 {
         return Err("data too short for CompactStore section".into());
     }
@@ -210,8 +323,10 @@ fn deserialize_compact_store(data: &[u8]) -> Result<CompactStore, String> {
     pos += 4;
     let version = data[pos];
     pos += 1;
-    if version != FORMAT_VERSION {
-        return Err(format!("unsupported version {version}"));
+    if version != FORMAT_VERSION && version != FORMAT_VERSION_V2 && version != FORMAT_VERSION_V1 {
+        return Err(format!(
+            "unsupported CompactStore section version {version} (supported: {FORMAT_VERSION_V1}, {FORMAT_VERSION_V2}, {FORMAT_VERSION})"
+        ));
     }
     let flags = data[pos];
     pos += 1;
@@ -232,6 +347,7 @@ fn deserialize_compact_store(data: &[u8]) -> Result<CompactStore, String> {
 
         let mut columns: FxHashMap<PropertyKey, ColumnCodec> = FxHashMap::default();
         let mut zone_maps: FxHashMap<PropertyKey, ZoneMap> = FxHashMap::default();
+        let mut block_zone_maps: FxHashMap<PropertyKey, Vec<ZoneMap>> = FxHashMap::default();
         let mut col_defs = Vec::with_capacity(num_cols);
 
         for _ in 0..num_cols {
@@ -245,15 +361,24 @@ fn deserialize_compact_store(data: &[u8]) -> Result<CompactStore, String> {
                 zone_maps.insert(key.clone(), zm);
             }
 
-            let codec =
-                ColumnCodec::read_from(data, &mut pos).map_err(|e| format!("codec: {e}"))?;
+            let (codec, maybe_block_stats) =
+                read_codec(data_bytes, &mut pos, version).map_err(|e| format!("codec: {e}"))?;
+            if let Some(stats) = maybe_block_stats {
+                block_zone_maps.insert(key.clone(), stats);
+            }
             let col_type = infer_column_type_from_codec(&codec);
             col_defs.push(ColumnDef::new(&key_str, col_type));
             columns.insert(key, codec);
         }
 
         let schema = TableSchema::new(label.as_str(), table_id, col_defs);
-        let table = NodeTable::from_columns(schema, columns, zone_maps, row_count);
+        let table = NodeTable::from_columns_with_block_stats(
+            schema,
+            columns,
+            zone_maps,
+            block_zone_maps,
+            row_count,
+        );
         node_tables.push(table);
         label_to_table_id.insert(label.clone(), table_id);
         table_id_to_label.push(label);
@@ -288,8 +413,8 @@ fn deserialize_compact_store(data: &[u8]) -> Result<CompactStore, String> {
         for _ in 0..num_props {
             let key_str = read_string(data, &mut pos)?;
             let key = PropertyKey::new(&key_str);
-            let codec =
-                ColumnCodec::read_from(data, &mut pos).map_err(|e| format!("edge codec: {e}"))?;
+            let (codec, _block_stats) = read_codec(data_bytes, &mut pos, version)
+                .map_err(|e| format!("edge codec: {e}"))?;
             let col_type = infer_column_type_from_codec(&codec);
             prop_defs.push(ColumnDef::new(&key_str, col_type));
             properties.insert(key, codec);
@@ -693,6 +818,229 @@ mod tests {
         assert!(section.is_dirty());
         section.mark_clean();
         assert!(!section.is_dirty());
+    }
+
+    /// Phase 2b: confirm the v1 (flat-column) on-disk format still
+    /// round-trips through the v2-aware deserializer, exercising the
+    /// compat path users on 0.5.41 and earlier rely on for one release.
+    #[test]
+    fn nelson_v1_section_reads_through_v2_aware_deserializer() {
+        let store = LpgStore::new().unwrap();
+        let alix = store.create_node(&["Person"]);
+        store.set_node_property(alix, "name", Value::from("Alix"));
+        store.set_node_property(alix, "age", Value::Int64(30));
+
+        let gus = store.create_node(&["Person"]);
+        store.set_node_property(gus, "name", Value::from("Gus"));
+        store.set_node_property(gus, "age", Value::Int64(25));
+
+        store.create_edge(alix, gus, "KNOWS");
+
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let section = CompactStoreSection::new(Arc::new(compact));
+
+        // Force v1 layout (flat columns, version byte = 1).
+        let v1_bytes = section.serialize_with_version(FORMAT_VERSION_V1).unwrap();
+        // First byte after MAGIC must be the v1 marker.
+        assert_eq!(
+            v1_bytes[4], FORMAT_VERSION_V1,
+            "expected v1 marker in version byte"
+        );
+
+        // The v2-aware deserializer must handle both versions.
+        let mut section2 = CompactStoreSection::empty();
+        section2.deserialize(&v1_bytes).unwrap();
+        let restored = section2.store().unwrap();
+
+        assert_eq!(restored.node_count(), 2);
+        assert_eq!(restored.edge_count(), 1);
+        assert_eq!(
+            restored.get_node_property(alix, &PropertyKey::new("name")),
+            Some(Value::String(arcstr::ArcStr::from("Alix")))
+        );
+        assert_eq!(
+            restored.get_node_property(alix, &PropertyKey::new("age")),
+            Some(Value::Int64(30))
+        );
+    }
+
+    // ── Phase 2c: per-block zone maps ────────────────────────────────
+
+    /// The builder must populate per-block zone maps for every column,
+    /// one ZoneMap per block. `1024` rows per block (DEFAULT_BLOCK_ROWS).
+    #[test]
+    fn alix_builder_populates_per_block_zone_maps() {
+        let store = LpgStore::new().unwrap();
+        // 3000 nodes → 3 blocks (1024 + 1024 + 952).
+        for i in 0i64..3000 {
+            let n = store.create_node(&["Person"]);
+            store.set_node_property(n, "age", Value::Int64(i));
+        }
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let table = &compact.node_tables_by_id[0];
+        let block_zms = table
+            .block_zone_maps_for(&PropertyKey::new("age"))
+            .expect("per-block stats present");
+        assert_eq!(block_zms.len(), 3, "3000 rows should produce 3 blocks");
+        assert_eq!(block_zms[0].row_count, 1024);
+        assert_eq!(block_zms[1].row_count, 1024);
+        assert_eq!(block_zms[2].row_count, 952);
+        assert_eq!(block_zms[0].min, Some(Value::Int64(0)));
+        assert_eq!(block_zms[0].max, Some(Value::Int64(1023)));
+        assert_eq!(block_zms[1].min, Some(Value::Int64(1024)));
+        assert_eq!(block_zms[1].max, Some(Value::Int64(2047)));
+        assert_eq!(block_zms[2].min, Some(Value::Int64(2048)));
+        assert_eq!(block_zms[2].max, Some(Value::Int64(2999)));
+    }
+
+    /// v3 round-trip preserves per-block zone maps verbatim.
+    #[test]
+    fn gus_v3_round_trip_preserves_block_zone_maps() {
+        let store = LpgStore::new().unwrap();
+        for i in 0i64..2500 {
+            let n = store.create_node(&["Item"]);
+            store.set_node_property(n, "score", Value::Int64(i));
+        }
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let original = &compact.node_tables_by_id[0];
+        let original_zms = original
+            .block_zone_maps_for(&PropertyKey::new("score"))
+            .expect("original block stats")
+            .to_vec();
+
+        let section = CompactStoreSection::new(Arc::new(compact));
+        let bytes = section.serialize().unwrap();
+        let mut section2 = CompactStoreSection::empty();
+        section2.deserialize(&bytes).unwrap();
+        let restored = section2.store().unwrap();
+        let restored_table = &restored.node_tables_by_id[0];
+        let restored_zms = restored_table
+            .block_zone_maps_for(&PropertyKey::new("score"))
+            .expect("restored block stats");
+
+        assert_eq!(restored_zms.len(), original_zms.len());
+        for (i, (orig, rest)) in original_zms.iter().zip(restored_zms.iter()).enumerate() {
+            assert_eq!(orig.row_count, rest.row_count, "row_count mismatch at {i}");
+            assert_eq!(
+                orig.null_count, rest.null_count,
+                "null_count mismatch at {i}"
+            );
+            assert_eq!(orig.min, rest.min, "min mismatch at {i}");
+            assert_eq!(orig.max, rest.max, "max mismatch at {i}");
+        }
+    }
+
+    /// v2 sections (Phase 2b) carry no per-block zone maps; the v3 reader
+    /// must accept them and leave `block_zone_maps_for` returning `None`.
+    #[test]
+    fn vincent_v2_section_round_trip_leaves_block_zone_maps_empty() {
+        let store = LpgStore::new().unwrap();
+        for i in 0i64..1500 {
+            let n = store.create_node(&["Item"]);
+            store.set_node_property(n, "score", Value::Int64(i));
+        }
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let section = CompactStoreSection::new(Arc::new(compact));
+        let v2_bytes = section.serialize_with_version(FORMAT_VERSION_V2).unwrap();
+        assert_eq!(v2_bytes[4], FORMAT_VERSION_V2);
+
+        let mut section2 = CompactStoreSection::empty();
+        section2.deserialize(&v2_bytes).unwrap();
+        let restored = section2.store().unwrap();
+        let table = &restored.node_tables_by_id[0];
+        assert!(
+            table
+                .block_zone_maps_for(&PropertyKey::new("score"))
+                .is_none(),
+            "v2 stream must not populate block_zone_maps"
+        );
+        // But the column data still survives.
+        assert_eq!(table.len(), 1500);
+    }
+
+    /// v1 sections likewise carry no per-block stats.
+    #[test]
+    fn jules_v1_section_round_trip_leaves_block_zone_maps_empty() {
+        let store = LpgStore::new().unwrap();
+        for i in 0i64..1500 {
+            let n = store.create_node(&["Item"]);
+            store.set_node_property(n, "score", Value::Int64(i));
+        }
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let section = CompactStoreSection::new(Arc::new(compact));
+        let v1_bytes = section.serialize_with_version(FORMAT_VERSION_V1).unwrap();
+        assert_eq!(v1_bytes[4], FORMAT_VERSION_V1);
+
+        let mut section2 = CompactStoreSection::empty();
+        section2.deserialize(&v1_bytes).unwrap();
+        let restored = section2.store().unwrap();
+        let table = &restored.node_tables_by_id[0];
+        assert!(
+            table
+                .block_zone_maps_for(&PropertyKey::new("score"))
+                .is_none(),
+            "v1 stream must not populate block_zone_maps"
+        );
+        assert_eq!(table.len(), 1500);
+    }
+
+    /// String columns also get per-block min/max.
+    #[test]
+    fn mia_block_zone_maps_for_string_column() {
+        let store = LpgStore::new().unwrap();
+        // Use enough nodes to force >= 2 blocks.
+        for i in 0u32..1100 {
+            let n = store.create_node(&["Tag"]);
+            store.set_node_property(n, "name", Value::from(format!("tag_{i:04}")));
+        }
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let table = &compact.node_tables_by_id[0];
+        let block_zms = table
+            .block_zone_maps_for(&PropertyKey::new("name"))
+            .expect("string column block stats");
+        assert_eq!(block_zms.len(), 2);
+        assert_eq!(
+            block_zms[0].min,
+            Some(Value::String(arcstr::ArcStr::from("tag_0000")))
+        );
+        assert_eq!(
+            block_zms[0].max,
+            Some(Value::String(arcstr::ArcStr::from("tag_1023")))
+        );
+        assert_eq!(
+            block_zms[1].min,
+            Some(Value::String(arcstr::ArcStr::from("tag_1024")))
+        );
+        assert_eq!(
+            block_zms[1].max,
+            Some(Value::String(arcstr::ArcStr::from("tag_1099")))
+        );
+    }
+
+    /// Phase 2b: an unsupported version byte must produce a clean error,
+    /// not panic or silently misread the section.
+    #[test]
+    fn rita_unknown_version_returns_clear_error() {
+        let store = LpgStore::new().unwrap();
+        let _ = store.create_node(&["Item"]);
+        let compact = from_graph_store_preserving_ids(&store).unwrap();
+        let section = CompactStoreSection::new(Arc::new(compact));
+        let mut bytes = section.serialize().unwrap();
+        // Strip CRC, flip version byte to a future v9, recompute CRC.
+        let crc_pos = bytes.len() - 4;
+        bytes[4] = 9;
+        let crc = crc32fast::hash(&bytes[..crc_pos]);
+        bytes[crc_pos..].copy_from_slice(&crc.to_le_bytes());
+
+        let mut section2 = CompactStoreSection::empty();
+        let err = section2
+            .deserialize(&bytes)
+            .expect_err("expected version error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported CompactStore section version"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]

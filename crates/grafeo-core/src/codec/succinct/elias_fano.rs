@@ -34,7 +34,7 @@
 //! assert!(!ef.contains(999));
 //! ```
 
-use super::super::BitVector;
+use super::super::{BitVector, BitVectorBuilder};
 use super::rank_select::SuccinctBitVector;
 
 /// Elias-Fano encoding for monotonically increasing u64 sequences.
@@ -107,13 +107,14 @@ impl EliasFano {
         };
 
         // Build lower bits
-        let mut lower = BitVector::with_capacity(n * lower_bits);
+        let mut lower_builder = BitVectorBuilder::with_capacity(n * lower_bits);
         for &val in values {
             let low = val & lower_mask;
             for bit_idx in 0..lower_bits {
-                lower.push((low >> bit_idx) & 1 == 1);
+                lower_builder.push((low >> bit_idx) & 1 == 1);
             }
         }
+        let lower = lower_builder.freeze();
 
         // Build upper bits in unary: for each value, we have (high - prev_high) zeros followed by a 1
         // Total length: n (ones) + max_high (zeros) = n + (max_value >> lower_bits)
@@ -122,7 +123,7 @@ impl EliasFano {
         #[allow(clippy::cast_possible_truncation)]
         let upper_len = n + max_high as usize;
 
-        let mut upper_bits = BitVector::zeros(upper_len);
+        let mut upper_builder = BitVectorBuilder::zeros(upper_len);
         for (i, &val) in values.iter().enumerate() {
             let high = val >> lower_bits;
             // Position = high + i (gap encoding)
@@ -130,11 +131,11 @@ impl EliasFano {
             #[allow(clippy::cast_possible_truncation)]
             let pos = high as usize + i;
             if pos < upper_len {
-                upper_bits.set(pos, true);
+                upper_builder.set(pos, true);
             }
         }
 
-        let upper = SuccinctBitVector::from_bitvec(upper_bits);
+        let upper = SuccinctBitVector::from_bitvec(upper_builder.freeze());
 
         Self {
             n,
@@ -296,7 +297,7 @@ impl EliasFano {
         // Base struct fields
         let base = std::mem::size_of::<Self>();
         // Lower bits
-        let lower_bytes = self.lower.data().len() * 8;
+        let lower_bytes = self.lower.data_bytes().len();
         // Upper bits (includes auxiliary structures)
         let upper_bytes = self.upper.size_bytes();
 

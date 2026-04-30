@@ -4587,7 +4587,11 @@ impl Session {
             .commit_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let query_dir = spill_path.join(format!("query_{query_id}"));
-        let sm = std::sync::Arc::new(grafeo_core::execution::SpillManager::new(&query_dir).ok()?);
+        let sm = std::sync::Arc::new(
+            grafeo_core::execution::SpillManager::new(&query_dir)
+                .ok()?
+                .with_owned_dir(),
+        );
         Some(grafeo_core::execution::OperatorMemoryContext::new(
             std::sync::Arc::clone(bm),
             sm,

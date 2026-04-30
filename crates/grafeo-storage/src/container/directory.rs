@@ -188,6 +188,8 @@ fn read_entry(buf: &[u8]) -> Result<SectionDirectoryEntry> {
         1 => SectionType::Catalog,
         2 => SectionType::LpgStore,
         3 => SectionType::RdfStore,
+        4 => SectionType::CompactStore,
+        5 => SectionType::OverlayDeletions,
         10 => SectionType::VectorStore,
         11 => SectionType::TextIndex,
         12 => SectionType::RdfRing,

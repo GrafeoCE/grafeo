@@ -45,7 +45,21 @@ if [[ -n "$FEATURES" ]]; then
     CARGO_CMD="${CARGO_CMD} ${FEATURES}"
 fi
 echo "  cargo build..."
-eval "$CARGO_CMD" 2>&1 | grep -E "Compiling grafeo-wasm|Finished|warning:" || true
+# Filter cargo's chatter to compile/warn/error lines while preserving its exit
+# status via PIPESTATUS. errexit + pipefail are disabled briefly so neither
+# grep's "no-match" exit (1) nor a cargo failure short-circuits before we read
+# PIPESTATUS[0]. Cannot use `|| true` here because that runs `true` as its own
+# command and clobbers PIPESTATUS to [0].
+set +e +o pipefail
+eval "$CARGO_CMD" 2>&1 \
+    | grep -E "^error|^   --> |Compiling grafeo-wasm|Finished|warning:"
+CARGO_STATUS=${PIPESTATUS[0]}
+set -e -o pipefail
+if [[ "$CARGO_STATUS" -ne 0 ]]; then
+    echo "Error: cargo build failed (exit ${CARGO_STATUS}). Re-run without the filter to see full output:"
+    echo "  ${CARGO_CMD}"
+    exit "$CARGO_STATUS"
+fi
 
 # Determine the output path (profile name maps to directory)
 PROFILE_DIR="${PROFILE}"

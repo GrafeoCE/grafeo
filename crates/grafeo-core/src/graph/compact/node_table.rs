@@ -24,6 +24,11 @@ pub struct NodeTable {
     columns: FxHashMap<PropertyKey, ColumnCodec>,
     /// Per-column min/max statistics for predicate pushdown.
     zone_maps: FxHashMap<PropertyKey, ZoneMap>,
+    /// Per-block min/max statistics, one entry per logical block in each
+    /// column. Populated by the builder and by v3 deserialization; left
+    /// empty after v1/v2 compat reads (Phase 4 will fall back to whole
+    /// column scans in that case).
+    block_zone_maps: FxHashMap<PropertyKey, Vec<ZoneMap>>,
     /// Number of rows (nodes) in the table.
     len: usize,
 }
@@ -36,11 +41,13 @@ impl NodeTable {
             schema,
             columns: FxHashMap::default(),
             zone_maps: FxHashMap::default(),
+            block_zone_maps: FxHashMap::default(),
             len: 0,
         }
     }
 
-    /// Creates a table from pre-built columns and zone maps.
+    /// Creates a table from pre-built columns and zone maps with no
+    /// per-block stats. Used by legacy v1/v2 deserialization paths.
     #[must_use]
     pub fn from_columns(
         schema: TableSchema,
@@ -48,10 +55,24 @@ impl NodeTable {
         zone_maps: FxHashMap<PropertyKey, ZoneMap>,
         len: usize,
     ) -> Self {
+        Self::from_columns_with_block_stats(schema, columns, zone_maps, FxHashMap::default(), len)
+    }
+
+    /// Creates a table from pre-built columns, zone maps, and per-block
+    /// zone maps. Used by the builder and by v3 deserialization.
+    #[must_use]
+    pub fn from_columns_with_block_stats(
+        schema: TableSchema,
+        columns: FxHashMap<PropertyKey, ColumnCodec>,
+        zone_maps: FxHashMap<PropertyKey, ZoneMap>,
+        block_zone_maps: FxHashMap<PropertyKey, Vec<ZoneMap>>,
+        len: usize,
+    ) -> Self {
         Self {
             schema,
             columns,
             zone_maps,
+            block_zone_maps,
             len,
         }
     }
@@ -154,6 +175,21 @@ impl NodeTable {
     #[must_use]
     pub fn zone_maps(&self) -> &FxHashMap<PropertyKey, ZoneMap> {
         &self.zone_maps
+    }
+
+    /// Returns the per-block zone maps for a column, if any have been
+    /// computed. Returns `None` for columns built from a v1 or v2 stream
+    /// (which carry no per-block stats); the planner should fall back
+    /// to whole-column zone-map pruning in that case.
+    #[must_use]
+    pub fn block_zone_maps_for(&self, key: &PropertyKey) -> Option<&[ZoneMap]> {
+        self.block_zone_maps.get(key).map(Vec::as_slice)
+    }
+
+    /// Returns all per-block zone maps (for serialization).
+    #[must_use]
+    pub fn block_zone_maps(&self) -> &FxHashMap<PropertyKey, Vec<ZoneMap>> {
+        &self.block_zone_maps
     }
 
     /// Returns an estimate of heap memory used by all columns in bytes.

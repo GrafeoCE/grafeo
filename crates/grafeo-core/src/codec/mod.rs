@@ -31,6 +31,7 @@
 
 pub mod bitpack;
 pub mod bitvec;
+pub mod block;
 pub mod delta;
 pub mod dictionary;
 #[cfg(feature = "tiered-storage")]
@@ -42,7 +43,8 @@ pub mod succinct;
 
 // Re-export commonly used types
 pub use bitpack::{BitPackedInts, DeltaBitPacked};
-pub use bitvec::BitVector;
+pub use bitvec::{BitVector, BitVectorBuilder};
+pub use block::{BlockEntry, DEFAULT_BLOCK_ROWS};
 pub use delta::{DeltaEncoding, zigzag_decode, zigzag_encode};
 pub use dictionary::{DictionaryBuilder, DictionaryEncoding};
 pub use runlength::{Run, RunLengthAnalyzer, RunLengthEncoding, SignedRunLengthEncoding};

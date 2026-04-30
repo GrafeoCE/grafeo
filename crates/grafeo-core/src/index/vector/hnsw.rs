@@ -53,6 +53,7 @@
 
 use super::VectorAccessor;
 use super::compute_distance;
+use super::paged_topology::{MmapTopology, NeighborsIter as MmapNeighborsIter};
 use crate::index::vector::HnswConfig;
 use grafeo_common::types::NodeId;
 use ordered_float::OrderedFloat;
@@ -105,12 +106,130 @@ impl Ord for FurthestCandidate {
     }
 }
 
+/// Materializes every node's neighbor lists from an [`MmapTopology`]
+/// into the heap representation expected by `snapshot_topology`.
+///
+/// Used only during checkpoint of an mmap-backed index.
+fn snapshot_mmap_topology(topo: &MmapTopology) -> Vec<(NodeId, Vec<Vec<NodeId>>)> {
+    let mut out = Vec::with_capacity(topo.len());
+    for id in topo.iter_node_ids() {
+        let mut layers: Vec<Vec<NodeId>> = Vec::new();
+        let mut layer = 0usize;
+        while let Some(iter) = topo.neighbors_at(id, layer) {
+            layers.push(iter.collect());
+            layer += 1;
+        }
+        out.push((id, layers));
+    }
+    out
+}
+
 /// Node data stored in the HNSW index (topology only, no vector data).
 #[derive(Debug, Clone)]
 struct HnswNode {
     /// Neighbors at each layer (layer 0 is the bottom).
     /// The node's max layer is `neighbors.len() - 1`.
     neighbors: Vec<Vec<NodeId>>,
+}
+
+/// Topology storage backend for [`HnswIndex`].
+///
+/// Two variants: [`Heap`](Self::Heap) is the build/mutation-friendly
+/// representation (HashMap of node neighbor lists); [`Mmap`](Self::Mmap)
+/// is a zero-copy view into a [`MmapTopology`] buffer, used when the
+/// section was loaded from a `.grafeo` mmap. Reads are unified through
+/// [`Self::neighbors_at`]; mutations require [`Self::Heap`].
+enum TopologyBackend {
+    /// Heap-resident, build-and-mutation friendly.
+    Heap(HashMap<NodeId, HnswNode>),
+    /// Zero-copy `Bytes`-backed view (Phase 7c). Read-only — mutations
+    /// will panic.
+    Mmap(MmapTopology),
+}
+
+impl TopologyBackend {
+    fn new_heap() -> Self {
+        Self::Heap(HashMap::new())
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self::Heap(HashMap::with_capacity(capacity))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Heap(map) => map.len(),
+            Self::Mmap(topo) => topo.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Heap(map) => map.is_empty(),
+            Self::Mmap(topo) => topo.is_empty(),
+        }
+    }
+
+    fn contains(&self, id: NodeId) -> bool {
+        match self {
+            Self::Heap(map) => map.contains_key(&id),
+            Self::Mmap(topo) => topo.contains(id),
+        }
+    }
+
+    /// Returns an iterator over the neighbors of `id` at the given
+    /// `layer`, or `None` if absent.
+    fn neighbors_at(&self, id: NodeId, layer: usize) -> Option<HnswNeighborsIter<'_>> {
+        match self {
+            Self::Heap(map) => map.get(&id).and_then(|node| {
+                if layer < node.neighbors.len() {
+                    Some(HnswNeighborsIter::Heap(node.neighbors[layer].iter()))
+                } else {
+                    None
+                }
+            }),
+            Self::Mmap(topo) => topo.neighbors_at(id, layer).map(HnswNeighborsIter::Mmap),
+        }
+    }
+
+    /// Borrow the heap representation for mutation, panicking if the
+    /// backend is in [`Self::Mmap`] mode.
+    fn as_heap_mut(&mut self) -> &mut HashMap<NodeId, HnswNode> {
+        match self {
+            Self::Heap(map) => map,
+            Self::Mmap(_) => {
+                panic!("HNSW topology is in mmap mode; cannot mutate. Reload to RAM first.")
+            }
+        }
+    }
+}
+
+/// Unified iterator over neighbor IDs from either backend.
+///
+/// Yields one [`NodeId`] per neighbor; preserves source order.
+pub enum HnswNeighborsIter<'a> {
+    /// Iterating a heap-stored `Vec<NodeId>`.
+    Heap(std::slice::Iter<'a, NodeId>),
+    /// Iterating an mmap-backed packed neighbor list.
+    Mmap(MmapNeighborsIter<'a>),
+}
+
+impl Iterator for HnswNeighborsIter<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<NodeId> {
+        match self {
+            Self::Heap(iter) => iter.next().copied(),
+            Self::Mmap(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Heap(iter) => iter.size_hint(),
+            Self::Mmap(iter) => iter.size_hint(),
+        }
+    }
 }
 
 /// HNSW (Hierarchical Navigable Small World) index.
@@ -121,8 +240,9 @@ struct HnswNode {
 pub struct HnswIndex {
     /// Index configuration.
     config: HnswConfig,
-    /// Node storage: NodeId -> HnswNode.
-    nodes: RwLock<HashMap<NodeId, HnswNode>>,
+    /// Node storage. May be a heap HashMap (build/mutate path) or a
+    /// zero-copy [`MmapTopology`] view (post-Phase-7c).
+    nodes: RwLock<TopologyBackend>,
     /// Entry point for search (node at the highest layer).
     entry_point: RwLock<Option<NodeId>>,
     /// Current maximum layer in the index.
@@ -137,7 +257,7 @@ impl HnswIndex {
     pub fn new(config: HnswConfig) -> Self {
         Self {
             config,
-            nodes: RwLock::new(HashMap::new()),
+            nodes: RwLock::new(TopologyBackend::new_heap()),
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
             rng: RwLock::new(rand::rngs::StdRng::from_rng(&mut rand::rng())),
@@ -152,7 +272,7 @@ impl HnswIndex {
     pub fn with_capacity(config: HnswConfig, capacity: usize) -> Self {
         Self {
             config,
-            nodes: RwLock::new(HashMap::with_capacity(capacity)),
+            nodes: RwLock::new(TopologyBackend::with_capacity(capacity)),
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
             rng: RwLock::new(rand::rngs::StdRng::from_rng(&mut rand::rng())),
@@ -164,7 +284,7 @@ impl HnswIndex {
     pub fn with_seed(config: HnswConfig, seed: u64) -> Self {
         Self {
             config,
-            nodes: RwLock::new(HashMap::new()),
+            nodes: RwLock::new(TopologyBackend::new_heap()),
             entry_point: RwLock::new(None),
             max_level: RwLock::new(0),
             rng: RwLock::new(rand::rngs::StdRng::seed_from_u64(seed)),
@@ -193,55 +313,102 @@ impl HnswIndex {
     ///
     /// Returns (entry_point, max_level, node_neighbors) where node_neighbors
     /// is a vec of (NodeId, neighbor_layers).
+    ///
+    /// Works on both heap and mmap backends; the mmap path materializes
+    /// neighbor `Vec`s on the fly (used during checkpoint when the
+    /// in-memory index is mmap-backed but needs to be re-serialized).
     #[must_use]
     pub fn snapshot_topology(&self) -> (Option<NodeId>, usize, Vec<(NodeId, Vec<Vec<NodeId>>)>) {
         let nodes = self.nodes.read();
         let entry_point = *self.entry_point.read();
         let max_level = *self.max_level.read();
 
-        let mut node_data: Vec<(NodeId, Vec<Vec<NodeId>>)> = nodes
-            .iter()
-            .map(|(id, node)| (*id, node.neighbors.clone()))
-            .collect();
+        let mut node_data: Vec<(NodeId, Vec<Vec<NodeId>>)> = match &*nodes {
+            TopologyBackend::Heap(map) => map
+                .iter()
+                .map(|(id, node)| (*id, node.neighbors.clone()))
+                .collect(),
+            TopologyBackend::Mmap(topo) => {
+                // Read-out path used during checkpoint of an mmap-backed
+                // index. Iterate every node by binary-searching the
+                // page index. Materializes neighbor Vecs.
+                snapshot_mmap_topology(topo)
+            }
+        };
         node_data.sort_by_key(|(id, _)| *id);
 
         (entry_point, max_level, node_data)
     }
 
     /// Restore topology from a snapshot. Replaces all current data.
+    ///
+    /// Always switches the backend to the heap representation; subsequent
+    /// mutations work without needing a reload. Equivalent to constructing
+    /// a fresh index and calling `insert` for each node, but skips the
+    /// graph-build cost.
     pub fn restore_topology(
         &self,
         entry_point: Option<NodeId>,
         max_level: usize,
         node_data: Vec<(NodeId, Vec<Vec<NodeId>>)>,
     ) {
-        let mut nodes = self.nodes.write();
-        nodes.clear();
+        let mut backend = self.nodes.write();
+        let mut fresh: HashMap<NodeId, HnswNode> = HashMap::with_capacity(node_data.len());
         for (id, neighbors) in node_data {
-            nodes.insert(id, HnswNode { neighbors });
+            fresh.insert(id, HnswNode { neighbors });
         }
+        *backend = TopologyBackend::Heap(fresh);
         *self.entry_point.write() = entry_point;
         *self.max_level.write() = max_level;
     }
 
+    /// Adopt a [`MmapTopology`] as the topology backend (Phase 7c).
+    ///
+    /// Replaces any existing topology with a zero-copy view of the
+    /// given mmap-backed buffer. Reads through the backend will serve
+    /// from the [`bytes::Bytes`] without rebuilding a `HashMap`.
+    /// Mutating operations ([`Self::insert`], [`Self::remove`]) will
+    /// panic until the backend is reloaded into RAM via
+    /// [`Self::restore_topology`].
+    ///
+    /// `entry_point` and `max_level` are taken from the topology header.
+    pub fn adopt_mmap_topology(&self, topo: MmapTopology) {
+        let entry_point = topo.entry_point();
+        let max_level = topo.max_level();
+        let mut backend = self.nodes.write();
+        *backend = TopologyBackend::Mmap(topo);
+        *self.entry_point.write() = entry_point;
+        *self.max_level.write() = max_level;
+    }
+
+    /// Returns true if the backend is currently mmap-backed.
+    #[must_use]
+    pub fn is_mmap_backed(&self) -> bool {
+        matches!(*self.nodes.read(), TopologyBackend::Mmap(_))
+    }
+
     /// Returns estimated heap memory in bytes for the HNSW topology.
+    ///
+    /// In mmap mode, returns only the small struct overhead — the
+    /// neighbor data lives in the mmap.
     #[must_use]
     pub fn heap_memory_bytes(&self) -> usize {
         let nodes = self.nodes.read();
-        // Outer HashMap overhead
-        let map_overhead = nodes.capacity()
-            * (std::mem::size_of::<NodeId>() + std::mem::size_of::<HnswNode>() + 1);
-        // Per-node: neighbor lists at each layer
-        let mut node_bytes = 0usize;
-        for node in nodes.values() {
-            // Vec<Vec<NodeId>>: outer vec capacity
-            node_bytes += node.neighbors.capacity() * std::mem::size_of::<Vec<NodeId>>();
-            // Each layer's neighbor vec
-            for layer in &node.neighbors {
-                node_bytes += layer.capacity() * std::mem::size_of::<NodeId>();
+        match &*nodes {
+            TopologyBackend::Heap(map) => {
+                let map_overhead = map.capacity()
+                    * (std::mem::size_of::<NodeId>() + std::mem::size_of::<HnswNode>() + 1);
+                let mut node_bytes = 0usize;
+                for node in map.values() {
+                    node_bytes += node.neighbors.capacity() * std::mem::size_of::<Vec<NodeId>>();
+                    for layer in &node.neighbors {
+                        node_bytes += layer.capacity() * std::mem::size_of::<NodeId>();
+                    }
+                }
+                map_overhead + node_bytes
             }
+            TopologyBackend::Mmap(_) => std::mem::size_of::<TopologyBackend>(),
         }
-        map_overhead + node_bytes
     }
 
     /// Inserts a vector with the given ID into the index.
@@ -272,34 +439,41 @@ impl HnswIndex {
         let mut entry_point = self.entry_point.write();
         let mut max_level = self.max_level.write();
 
-        // Check capacity under the write lock to prevent concurrent over-insertion.
-        // Skip the check when the ID already exists (same-ID update replaces
-        // the entry without growing the map).
-        if let Some(max) = self.config.max_elements
-            && !nodes.contains_key(&id)
-        {
-            let count = nodes.len();
-            assert!(
-                count < max,
-                "HNSW index is full: max_elements={max}, current={count}"
-            );
-        }
+        // Insert path always operates on the heap backend; calling
+        // `as_heap_mut` panics if the topology is mmap-backed. Reload
+        // to RAM via `restore_topology` first if needed.
 
-        // First insertion
-        if entry_point.is_none() {
-            nodes.insert(id, node);
-            *entry_point = Some(id);
-            *max_level = level;
-            return;
+        // Capacity check + first-insertion path. Scoped so the mutable
+        // borrow ends before the per-layer search loop reborrows `&nodes`.
+        {
+            let nodes_map = nodes.as_heap_mut();
+
+            if let Some(max) = self.config.max_elements
+                && !nodes_map.contains_key(&id)
+            {
+                let count = nodes_map.len();
+                assert!(
+                    count < max,
+                    "HNSW index is full: max_elements={max}, current={count}"
+                );
+            }
+
+            // First insertion
+            if entry_point.is_none() {
+                nodes_map.insert(id, node);
+                *entry_point = Some(id);
+                *max_level = level;
+                return;
+            }
         }
 
         let ep = entry_point.expect("entry_point confirmed Some above");
         let current_max_level = *max_level;
 
-        // Insert the node first so we can reference it
-        nodes.insert(id, node);
+        // Insert the new node so subsequent searches can find it.
+        nodes.as_heap_mut().insert(id, node);
 
-        // Search from top to the level above the new node's max layer
+        // Search from top to the level above the new node's max layer.
         let mut current_ep = ep;
         for lc in (level + 1..=current_max_level).rev() {
             current_ep = self.search_layer_single(&nodes, accessor, vector, current_ep, lc);
@@ -326,60 +500,66 @@ impl HnswIndex {
             // Select neighbors using diversity-aware heuristic
             let selected = self.select_neighbors_heuristic(accessor, &neighbors, m_max);
 
-            // Update the new node's neighbors
-            if let Some(new_node) = nodes.get_mut(&id) {
-                new_node.neighbors[lc].clone_from(&selected);
-            }
-
-            // Add bidirectional links and collect info for pruning
-            // First pass: add links and identify who needs pruning
+            // First pass: link new node + identify who needs pruning.
+            // Scope the mutable borrow tightly.
             let mut needs_pruning: Vec<NodeId> = Vec::new();
+            {
+                let nodes_map = nodes.as_heap_mut();
+                if let Some(new_node) = nodes_map.get_mut(&id) {
+                    new_node.neighbors[lc].clone_from(&selected);
+                }
 
-            for &neighbor_id in &selected {
-                if let Some(neighbor) = nodes.get_mut(&neighbor_id)
-                    && neighbor.neighbors.len() > lc
-                {
-                    neighbor.neighbors[lc].push(id);
+                for &neighbor_id in &selected {
+                    if let Some(neighbor) = nodes_map.get_mut(&neighbor_id)
+                        && neighbor.neighbors.len() > lc
+                    {
+                        neighbor.neighbors[lc].push(id);
 
-                    // Mark for pruning if too many neighbors
-                    if neighbor.neighbors[lc].len() > m_max {
-                        needs_pruning.push(neighbor_id);
+                        if neighbor.neighbors[lc].len() > m_max {
+                            needs_pruning.push(neighbor_id);
+                        }
                     }
                 }
             }
 
-            // Second pass: compute distances for pruning (immutable borrow)
+            // Second pass: compute distances for pruning (immutable read).
             let mut prune_data: Vec<(NodeId, Vec<(NodeId, f32)>)> = Vec::new();
-            for neighbor_id in &needs_pruning {
-                if let Some(neighbor) = nodes.get(neighbor_id)
-                    && neighbor.neighbors.len() > lc
-                {
-                    let Some(base_vec) = accessor.get_vector(*neighbor_id) else {
-                        continue;
-                    };
-                    let distances: Vec<(NodeId, f32)> = neighbor.neighbors[lc]
-                        .iter()
-                        .map(|&nid| {
-                            let dist = accessor
-                                .get_vector(nid)
-                                .map_or(f32::MAX, |v| self.vector_distance(&base_vec, &v));
-                            (nid, dist)
-                        })
-                        .collect();
-                    prune_data.push((*neighbor_id, distances));
+            {
+                let nodes_map = nodes.as_heap_mut();
+                for neighbor_id in &needs_pruning {
+                    if let Some(neighbor) = nodes_map.get(neighbor_id)
+                        && neighbor.neighbors.len() > lc
+                    {
+                        let Some(base_vec) = accessor.get_vector(*neighbor_id) else {
+                            continue;
+                        };
+                        let distances: Vec<(NodeId, f32)> = neighbor.neighbors[lc]
+                            .iter()
+                            .map(|&nid| {
+                                let dist = accessor
+                                    .get_vector(nid)
+                                    .map_or(f32::MAX, |v| self.vector_distance(&base_vec, &v));
+                                (nid, dist)
+                            })
+                            .collect();
+                        prune_data.push((*neighbor_id, distances));
+                    }
                 }
             }
 
-            // Third pass: apply pruning (mutable borrow)
-            for (neighbor_id, distances) in prune_data {
-                if let Some(neighbor) = nodes.get_mut(&neighbor_id)
-                    && neighbor.neighbors.len() > lc
-                {
-                    Self::prune_neighbors_with_distances(
-                        &mut neighbor.neighbors[lc],
-                        &distances,
-                        m_max,
-                    );
+            // Third pass: apply pruning (mutable borrow).
+            {
+                let nodes_map = nodes.as_heap_mut();
+                for (neighbor_id, distances) in prune_data {
+                    if let Some(neighbor) = nodes_map.get_mut(&neighbor_id)
+                        && neighbor.neighbors.len() > lc
+                    {
+                        Self::prune_neighbors_with_distances(
+                            &mut neighbor.neighbors[lc],
+                            &distances,
+                            m_max,
+                        );
+                    }
                 }
             }
 
@@ -566,12 +746,14 @@ impl HnswIndex {
         let mut nodes = self.nodes.write();
         let mut entry_point = self.entry_point.write();
 
-        if nodes.remove(&id).is_none() {
+        let nodes_map = nodes.as_heap_mut();
+
+        if nodes_map.remove(&id).is_none() {
             return false;
         }
 
         // Remove bidirectional links
-        for (_, node) in nodes.iter_mut() {
+        for (_, node) in nodes_map.iter_mut() {
             for neighbors in &mut node.neighbors {
                 neighbors.retain(|&n| n != id);
             }
@@ -579,7 +761,7 @@ impl HnswIndex {
 
         // Update entry point if needed
         if *entry_point == Some(id) {
-            *entry_point = nodes.keys().next().copied();
+            *entry_point = nodes_map.keys().next().copied();
         }
 
         true
@@ -588,7 +770,7 @@ impl HnswIndex {
     /// Returns true if the index contains a vector with the given ID.
     #[must_use]
     pub fn contains(&self, id: NodeId) -> bool {
-        self.nodes.read().contains_key(&id)
+        self.nodes.read().contains(id)
     }
 
     /// Generates a random level for a new node.
@@ -604,7 +786,7 @@ impl HnswIndex {
     /// Single-element greedy search at a layer.
     fn search_layer_single(
         &self,
-        nodes: &HashMap<NodeId, HnswNode>,
+        nodes: &TopologyBackend,
         accessor: &impl VectorAccessor,
         query: &[f32],
         ep: NodeId,
@@ -616,10 +798,8 @@ impl HnswIndex {
         loop {
             let mut changed = false;
 
-            if let Some(node) = nodes.get(&current)
-                && layer < node.neighbors.len()
-            {
-                for &neighbor in &node.neighbors[layer] {
+            if let Some(neighbors) = nodes.neighbors_at(current, layer) {
+                for neighbor in neighbors {
                     let dist = self.node_distance(accessor, query, neighbor);
                     if dist < current_dist {
                         current = neighbor;
@@ -640,7 +820,7 @@ impl HnswIndex {
     /// Beam search at a layer, returning ef nearest neighbors.
     fn search_layer(
         &self,
-        nodes: &HashMap<NodeId, HnswNode>,
+        nodes: &TopologyBackend,
         accessor: &impl VectorAccessor,
         query: &[f32],
         ep: NodeId,
@@ -677,10 +857,8 @@ impl HnswIndex {
             }
 
             // Explore neighbors
-            if let Some(node) = nodes.get(&current.id)
-                && layer < node.neighbors.len()
-            {
-                for &neighbor in &node.neighbors[layer] {
+            if let Some(neighbors) = nodes.neighbors_at(current.id, layer) {
+                for neighbor in neighbors {
                     if visited.contains(&neighbor) {
                         continue;
                     }
@@ -731,7 +909,7 @@ impl HnswIndex {
     #[allow(clippy::too_many_arguments)]
     fn search_layer_filtered(
         &self,
-        nodes: &HashMap<NodeId, HnswNode>,
+        nodes: &TopologyBackend,
         accessor: &impl VectorAccessor,
         query: &[f32],
         ep: NodeId,
@@ -778,10 +956,8 @@ impl HnswIndex {
             }
 
             // Explore neighbors
-            if let Some(node) = nodes.get(&current.id)
-                && layer < node.neighbors.len()
-            {
-                for &neighbor in &node.neighbors[layer] {
+            if let Some(neighbors) = nodes.neighbors_at(current.id, layer) {
+                for neighbor in neighbors {
                     if visited.contains(&neighbor) {
                         continue;
                     }
@@ -2145,5 +2321,334 @@ mod tests {
         }
         // Node 3 should be closest among allowed
         assert_eq!(results[0].0, NodeId::new(3));
+    }
+
+    // ── Phase 7c-2: HnswIndex with mmap-backed topology ─────────────
+
+    use crate::index::vector::paged_topology::{MmapTopology, serialize_topology};
+    use bytes::Bytes;
+
+    /// Build a small index in heap mode, snapshot its topology, swap
+    /// the backend to mmap mode, and verify search returns identical
+    /// results.
+    #[test]
+    fn alix_mmap_backed_search_matches_heap_search() {
+        let config = HnswConfig::new(8, DistanceMetric::Euclidean);
+        let heap_index = HnswIndex::with_seed(config.clone(), 42);
+
+        let map: HashMap<NodeId, Arc<[f32]>> = (1..=20u64)
+            .map(|i| {
+                let v: Arc<[f32]> = (0..8u64)
+                    .map(|j| (i.wrapping_mul(31).wrapping_add(j) % 17) as f32 / 17.0)
+                    .collect::<Vec<_>>()
+                    .into();
+                (NodeId::new(i), v)
+            })
+            .collect();
+        let accessor = |id: NodeId| -> Option<Arc<[f32]>> { map.get(&id).cloned() };
+
+        for (id, v) in &map {
+            heap_index.insert(*id, v, &accessor);
+        }
+
+        // Reference: search results from heap-backed index.
+        let query: Vec<f32> = vec![0.1, 0.4, 0.6, 0.2, 0.8, 0.5, 0.3, 0.7];
+        let heap_results = heap_index.search(&query, 5, &accessor);
+        assert!(!heap_results.is_empty());
+
+        // Snapshot + serialize + load back as mmap topology.
+        let (ep, ml, nodes) = heap_index.snapshot_topology();
+        let bytes = serialize_topology(ep, ml, &nodes);
+        let topo = MmapTopology::from_bytes(Bytes::from(bytes)).expect("from_bytes");
+
+        let mmap_index = HnswIndex::new(config);
+        mmap_index.adopt_mmap_topology(topo);
+        assert!(mmap_index.is_mmap_backed());
+
+        let mmap_results = mmap_index.search(&query, 5, &accessor);
+
+        // Same NodeIds in the same order, same distances.
+        assert_eq!(mmap_results.len(), heap_results.len());
+        for ((id_h, d_h), (id_m, d_m)) in heap_results.iter().zip(mmap_results.iter()) {
+            assert_eq!(id_h, id_m);
+            assert!((d_h - d_m).abs() < 1e-6);
+        }
+    }
+
+    /// Mutating an mmap-backed index must panic with a clear message,
+    /// not silently no-op or corrupt state.
+    #[test]
+    #[should_panic(expected = "mmap mode")]
+    fn gus_mmap_backed_insert_panics() {
+        let config = HnswConfig::new(4, DistanceMetric::Cosine);
+        let nodes = vec![(NodeId::new(1), vec![vec![]])];
+        let bytes = serialize_topology(Some(NodeId::new(1)), 0, &nodes);
+        let topo = MmapTopology::from_bytes(Bytes::from(bytes)).expect("from_bytes");
+
+        let index = HnswIndex::new(config);
+        index.adopt_mmap_topology(topo);
+
+        let map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        let accessor = |id: NodeId| -> Option<Arc<[f32]>> { map.get(&id).cloned() };
+        index.insert(NodeId::new(2), &[0.0, 0.0, 0.0, 0.0], &accessor);
+    }
+
+    /// Removing on an mmap-backed index must panic.
+    #[test]
+    #[should_panic(expected = "mmap mode")]
+    fn vincent_mmap_backed_remove_panics() {
+        let config = HnswConfig::new(4, DistanceMetric::Cosine);
+        let nodes = vec![(NodeId::new(1), vec![vec![]])];
+        let bytes = serialize_topology(Some(NodeId::new(1)), 0, &nodes);
+        let topo = MmapTopology::from_bytes(Bytes::from(bytes)).expect("from_bytes");
+
+        let index = HnswIndex::new(config);
+        index.adopt_mmap_topology(topo);
+        index.remove(NodeId::new(1));
+    }
+
+    /// `restore_topology` after `adopt_mmap_topology` must put the
+    /// index back in heap mode and accept mutations again.
+    #[test]
+    fn jules_restore_topology_returns_to_heap_mode() {
+        let config = HnswConfig::new(4, DistanceMetric::Cosine);
+        let nodes = vec![(NodeId::new(1), vec![vec![]])];
+        let bytes = serialize_topology(Some(NodeId::new(1)), 0, &nodes);
+        let topo = MmapTopology::from_bytes(Bytes::from(bytes)).expect("from_bytes");
+
+        let index = HnswIndex::new(config);
+        index.adopt_mmap_topology(topo);
+        assert!(index.is_mmap_backed());
+
+        index.restore_topology(
+            Some(NodeId::new(1)),
+            0,
+            vec![(NodeId::new(1), vec![vec![]])],
+        );
+        assert!(!index.is_mmap_backed());
+
+        // Now insert should work without panicking.
+        let map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        let accessor = |id: NodeId| -> Option<Arc<[f32]>> { map.get(&id).cloned() };
+        index.insert(NodeId::new(2), &[0.0, 0.0, 0.0, 0.0], &accessor);
+        assert_eq!(index.len(), 2);
+    }
+
+    /// Heap memory savings: an mmap-backed index reports nearly zero
+    /// heap usage (just the small struct), while the heap-backed
+    /// equivalent reports significant overhead.
+    #[test]
+    fn mia_mmap_backed_heap_overhead_is_tiny() {
+        let config = HnswConfig::new(8, DistanceMetric::Euclidean);
+        let heap_index = HnswIndex::with_seed(config.clone(), 42);
+
+        let map: HashMap<NodeId, Arc<[f32]>> = (1..=50u64)
+            .map(|i| {
+                let v: Arc<[f32]> = vec![0.1; 8].into();
+                (NodeId::new(i), v)
+            })
+            .collect();
+        let accessor = |id: NodeId| -> Option<Arc<[f32]>> { map.get(&id).cloned() };
+
+        for (id, v) in &map {
+            heap_index.insert(*id, v, &accessor);
+        }
+        let heap_bytes = heap_index.heap_memory_bytes();
+        assert!(
+            heap_bytes > 1000,
+            "heap-mode should report > 1KB heap usage"
+        );
+
+        let (ep, ml, nodes) = heap_index.snapshot_topology();
+        let bytes = serialize_topology(ep, ml, &nodes);
+        let topo = MmapTopology::from_bytes(Bytes::from(bytes)).expect("from_bytes");
+
+        let mmap_index = HnswIndex::new(config);
+        mmap_index.adopt_mmap_topology(topo);
+        let mmap_bytes = mmap_index.heap_memory_bytes();
+        assert!(
+            mmap_bytes < 256,
+            "mmap-mode heap overhead should be < 256 bytes, got {mmap_bytes}"
+        );
+        assert!(
+            mmap_bytes < heap_bytes / 10,
+            "mmap-mode {mmap_bytes} should be far smaller than heap-mode {heap_bytes}"
+        );
+    }
+
+    // ── Phase 7d: recall regression + variant coverage ──────────────
+
+    /// Builds a 200-vector HNSW deterministically and runs the four
+    /// search variants in both heap and mmap modes. Each variant must
+    /// return identical (id, distance) sequences across modes.
+    #[test]
+    fn shosanna_all_search_variants_match_across_modes() {
+        let config = HnswConfig::new(8, DistanceMetric::Euclidean);
+        let heap_index = HnswIndex::with_seed(config.clone(), 7);
+
+        // Deterministic pseudo-random vectors.
+        let map: HashMap<NodeId, Arc<[f32]>> = (1..=200u64)
+            .map(|i| {
+                let v: Arc<[f32]> = (0..8u64)
+                    .map(|j| {
+                        let s = i.wrapping_mul(37).wrapping_add(j.wrapping_mul(101));
+                        ((s % 1000) as f32) / 1000.0
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                (NodeId::new(i), v)
+            })
+            .collect();
+        let accessor = |id: NodeId| -> Option<Arc<[f32]>> { map.get(&id).cloned() };
+
+        for (id, v) in &map {
+            heap_index.insert(*id, v, &accessor);
+        }
+
+        let (ep, ml, nodes) = heap_index.snapshot_topology();
+        let bytes = serialize_topology(ep, ml, &nodes);
+        let topo = MmapTopology::from_bytes(Bytes::from(bytes)).expect("from_bytes");
+        let mmap_index = HnswIndex::new(config);
+        mmap_index.adopt_mmap_topology(topo);
+
+        let query: Vec<f32> = vec![0.31, 0.42, 0.55, 0.18, 0.77, 0.91, 0.05, 0.62];
+
+        // search()
+        let h = heap_index.search(&query, 10, &accessor);
+        let m = mmap_index.search(&query, 10, &accessor);
+        assert_eq!(h.len(), m.len());
+        for ((hid, hd), (mid, md)) in h.iter().zip(m.iter()) {
+            assert_eq!(hid, mid);
+            assert!((hd - md).abs() < 1e-6);
+        }
+
+        // search_with_ef()
+        let h = heap_index.search_with_ef(&query, 10, 50, &accessor);
+        let m = mmap_index.search_with_ef(&query, 10, 50, &accessor);
+        assert_eq!(h, m);
+
+        // search_with_filter()
+        let allowlist: HashSet<NodeId> = (1..=100u64).map(NodeId::new).collect();
+        let h = heap_index.search_with_filter(&query, 5, &allowlist, &accessor);
+        let m = mmap_index.search_with_filter(&query, 5, &allowlist, &accessor);
+        assert_eq!(h, m);
+
+        // search_with_ef_and_filter()
+        let h = heap_index.search_with_ef_and_filter(&query, 5, 80, &allowlist, &accessor);
+        let m = mmap_index.search_with_ef_and_filter(&query, 5, 80, &allowlist, &accessor);
+        assert_eq!(h, m);
+
+        // batch_search()
+        let queries = vec![query.clone(), vec![0.5; 8], vec![0.0; 8]];
+        let h = heap_index.batch_search(&queries, 5, &accessor);
+        let m = mmap_index.batch_search(&queries, 5, &accessor);
+        assert_eq!(h, m);
+    }
+
+    /// Recall@k: search results from the heap-backed and mmap-backed
+    /// indexes must be identical, so recall is trivially 100%. The
+    /// test exists to fail loudly if a future refactor introduces any
+    /// divergence (e.g. iterator order shift).
+    #[test]
+    fn butch_mmap_recall_at_10_is_100_percent() {
+        let config = HnswConfig::new(16, DistanceMetric::Cosine);
+        let heap_index = HnswIndex::with_seed(config.clone(), 1234);
+
+        let map: HashMap<NodeId, Arc<[f32]>> = (1..=300u64)
+            .map(|i| {
+                let v: Arc<[f32]> = (0..16u64)
+                    .map(|j| {
+                        let s = i.wrapping_mul(53).wrapping_add(j.wrapping_mul(149));
+                        ((s % 997) as f32) / 997.0
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                (NodeId::new(i), v)
+            })
+            .collect();
+        let accessor = |id: NodeId| -> Option<Arc<[f32]>> { map.get(&id).cloned() };
+
+        for (id, v) in &map {
+            heap_index.insert(*id, v, &accessor);
+        }
+
+        let (ep, ml, nodes) = heap_index.snapshot_topology();
+        let bytes = serialize_topology(ep, ml, &nodes);
+        let topo = MmapTopology::from_bytes(Bytes::from(bytes)).expect("from_bytes");
+        let mmap_index = HnswIndex::new(config);
+        mmap_index.adopt_mmap_topology(topo);
+
+        // Run 20 different queries; each must match exactly.
+        for q in 0..20u64 {
+            let query: Vec<f32> = (0..16u64)
+                .map(|j| {
+                    let s = q.wrapping_mul(71).wrapping_add(j.wrapping_mul(211));
+                    ((s % 991) as f32) / 991.0
+                })
+                .collect();
+
+            let heap_results: HashSet<NodeId> = heap_index
+                .search(&query, 10, &accessor)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let mmap_results: HashSet<NodeId> = mmap_index
+                .search(&query, 10, &accessor)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+
+            // Recall@10 = |heap ∩ mmap| / |heap| = 1.0 because results
+            // must be identical (deterministic byte-format read).
+            let intersection = heap_results.intersection(&mmap_results).count();
+            assert_eq!(
+                intersection,
+                heap_results.len(),
+                "query {q}: recall@10 must be 100% (heap={heap_results:?}, mmap={mmap_results:?})"
+            );
+        }
+    }
+
+    /// Empty-allowlist filter must short-circuit cleanly in mmap mode.
+    #[test]
+    fn django_mmap_empty_allowlist_returns_empty() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let heap_index = HnswIndex::with_seed(config.clone(), 99);
+        let map: HashMap<NodeId, Arc<[f32]>> = (1..=10u64)
+            .map(|i| (NodeId::new(i), vec![0.1; 4].into()))
+            .collect();
+        let accessor = |id: NodeId| -> Option<Arc<[f32]>> { map.get(&id).cloned() };
+        for (id, v) in &map {
+            heap_index.insert(*id, v, &accessor);
+        }
+
+        let (ep, ml, nodes) = heap_index.snapshot_topology();
+        let bytes = serialize_topology(ep, ml, &nodes);
+        let topo = MmapTopology::from_bytes(Bytes::from(bytes)).expect("from_bytes");
+        let mmap_index = HnswIndex::new(config);
+        mmap_index.adopt_mmap_topology(topo);
+
+        let allowlist: HashSet<NodeId> = HashSet::new();
+        let results = mmap_index.search_with_filter(&[0.1; 4], 5, &allowlist, &accessor);
+        assert!(results.is_empty());
+    }
+
+    /// Mmap-backed search on an empty index must not panic.
+    #[test]
+    fn beatrix_mmap_empty_topology_search_returns_empty() {
+        let config = HnswConfig::new(4, DistanceMetric::Euclidean);
+        let bytes = serialize_topology(None, 0, &[]);
+        let topo = MmapTopology::from_bytes(Bytes::from(bytes)).expect("from_bytes");
+
+        let mmap_index = HnswIndex::new(config);
+        mmap_index.adopt_mmap_topology(topo);
+
+        let map: HashMap<NodeId, Arc<[f32]>> = HashMap::new();
+        let accessor = |id: NodeId| -> Option<Arc<[f32]>> { map.get(&id).cloned() };
+
+        let results = mmap_index.search(&[0.1; 4], 5, &accessor);
+        assert!(results.is_empty());
+        assert_eq!(mmap_index.len(), 0);
+        assert!(mmap_index.is_empty());
     }
 }

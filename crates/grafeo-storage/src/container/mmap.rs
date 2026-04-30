@@ -10,6 +10,8 @@
 
 use grafeo_common::storage::SectionType;
 
+use super::page_fetcher::AccessHint;
+
 /// A read-only memory-mapped view of a section in the `.grafeo` container.
 ///
 /// Created by [`GrafeoFileManager::mmap_section`](crate::file::GrafeoFileManager::mmap_section).
@@ -80,6 +82,38 @@ impl MmapSection {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.mmap.is_empty()
+    }
+
+    /// Advise the OS about the expected access pattern for a range.
+    ///
+    /// On Unix this delegates to `madvise` via `memmap2`. On Windows
+    /// (and other platforms without a portable equivalent) it is a no-op.
+    /// Out-of-range arguments and underlying errors are silently ignored:
+    /// advice is a hint, not a contract.
+    pub fn advise(&self, offset: usize, len: usize, hint: AccessHint) {
+        // On Windows there is no portable madvise without `unsafe` FFI,
+        // so this is a no-op. The args are intentionally unused there.
+        let _ = (offset, len, hint);
+        #[cfg(unix)]
+        {
+            use memmap2::Advice;
+            // memmap2's safe `Advice` enum exposes only the read-side
+            // hints; `MADV_DONTNEED` lives on `UncheckedAdvice` because
+            // it can zero-fill subsequent reads, so it requires `unsafe`.
+            // Treating `DontNeed` as a no-op here keeps the call safe;
+            // if we ever need real eviction, plumb it through an
+            // `unsafe` path in a dedicated helper.
+            let advice = match hint {
+                AccessHint::Sequential => Some(Advice::Sequential),
+                AccessHint::Random => Some(Advice::Random),
+                AccessHint::WillNeed => Some(Advice::WillNeed),
+                AccessHint::DontNeed => None,
+            };
+            if let Some(advice) = advice {
+                // Out-of-range or otherwise failing advise is best-effort.
+                let _ = self.mmap.advise_range(advice, offset, len);
+            }
+        }
     }
 }
 

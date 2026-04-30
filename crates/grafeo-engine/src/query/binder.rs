@@ -386,19 +386,14 @@ impl Binder {
             LogicalOperator::Merge(merge) => {
                 // First bind the input
                 self.bind_operator(&merge.input)?;
-                // Validate the match property expressions
+                // Match properties are validated against the outer scope: ISO/IEC 39075:2024
+                // §15.5 forbids the MERGE pattern from referencing the variable it introduces.
                 for (_, expr) in &merge.match_properties {
                     self.validate_expression(expr)?;
                 }
-                // Validate the ON CREATE property expressions
-                for (_, expr) in &merge.on_create {
-                    self.validate_expression(expr)?;
-                }
-                // Validate the ON MATCH property expressions
-                for (_, expr) in &merge.on_match {
-                    self.validate_expression(expr)?;
-                }
-                // MERGE introduces a new variable
+                // The MERGE variable is in scope inside ON CREATE / ON MATCH SET, so add it
+                // before validating those action expressions. Without this, expressions like
+                // `ON MATCH SET n.x = coalesce(n.x, 0)` failed with `Undefined variable 'n'`.
                 self.context.add_variable(
                     merge.variable.clone(),
                     VariableInfo {
@@ -408,6 +403,12 @@ impl Binder {
                         is_edge: false,
                     },
                 );
+                for (_, expr) in &merge.on_create {
+                    self.validate_expression(expr)?;
+                }
+                for (_, expr) in &merge.on_match {
+                    self.validate_expression(expr)?;
+                }
                 Ok(())
             }
             LogicalOperator::MergeRelationship(merge_rel) => {
@@ -427,16 +428,11 @@ impl Binder {
                         " in MERGE relationship target",
                     ));
                 }
+                // Match properties cannot reference the edge variable (same rule as MERGE node).
                 for (_, expr) in &merge_rel.match_properties {
                     self.validate_expression(expr)?;
                 }
-                for (_, expr) in &merge_rel.on_create {
-                    self.validate_expression(expr)?;
-                }
-                for (_, expr) in &merge_rel.on_match {
-                    self.validate_expression(expr)?;
-                }
-                // MERGE relationship introduces the edge variable
+                // Edge variable is in scope inside ON CREATE / ON MATCH SET.
                 self.context.add_variable(
                     merge_rel.variable.clone(),
                     VariableInfo {
@@ -446,6 +442,12 @@ impl Binder {
                         is_edge: true,
                     },
                 );
+                for (_, expr) in &merge_rel.on_create {
+                    self.validate_expression(expr)?;
+                }
+                for (_, expr) in &merge_rel.on_match {
+                    self.validate_expression(expr)?;
+                }
                 Ok(())
             }
             LogicalOperator::AddLabel(add_label) => {
@@ -2065,6 +2067,97 @@ mod tests {
         assert!(
             result.is_err(),
             "ON CREATE referencing undefined variable should fail"
+        );
+    }
+
+    // GrafeoDB/grafeo#317: the MERGE variable must be in scope inside
+    // ON CREATE / ON MATCH SET. Before the fix the binder added the variable
+    // *after* validating these clauses, causing `n.x`-style references inside
+    // them to be rejected as undefined.
+
+    #[test]
+    fn test_merge_on_create_can_reference_merge_variable() {
+        use crate::query::plan::MergeOp;
+
+        let plan = LogicalPlan::new(LogicalOperator::Merge(MergeOp {
+            variable: "n".to_string(),
+            labels: vec!["Item".to_string()],
+            match_properties: vec![(
+                "val".to_string(),
+                LogicalExpression::Literal(grafeo_common::types::Value::Int64(1)),
+            )],
+            on_create: vec![(
+                "x".to_string(),
+                LogicalExpression::Property {
+                    variable: "n".to_string(),
+                    property: "val".to_string(),
+                },
+            )],
+            on_match: vec![],
+            input: Box::new(LogicalOperator::Empty),
+        }));
+
+        let mut binder = Binder::new();
+        binder
+            .bind(&plan)
+            .expect("MERGE variable must be in scope inside ON CREATE SET");
+    }
+
+    #[test]
+    fn test_merge_on_match_can_reference_merge_variable() {
+        use crate::query::plan::MergeOp;
+
+        let plan = LogicalPlan::new(LogicalOperator::Merge(MergeOp {
+            variable: "n".to_string(),
+            labels: vec!["Item".to_string()],
+            match_properties: vec![(
+                "val".to_string(),
+                LogicalExpression::Literal(grafeo_common::types::Value::Int64(1)),
+            )],
+            on_create: vec![],
+            on_match: vec![(
+                "x".to_string(),
+                LogicalExpression::Property {
+                    variable: "n".to_string(),
+                    property: "x".to_string(),
+                },
+            )],
+            input: Box::new(LogicalOperator::Empty),
+        }));
+
+        let mut binder = Binder::new();
+        binder
+            .bind(&plan)
+            .expect("MERGE variable must be in scope inside ON MATCH SET");
+    }
+
+    #[test]
+    fn test_merge_match_properties_cannot_reference_merge_variable() {
+        // ISO §15.5: the variable bound by the pattern is not in scope inside
+        // the pattern's own property predicates. Match-property validation
+        // must run *before* the variable is added to the binding context.
+        use crate::query::plan::MergeOp;
+
+        let plan = LogicalPlan::new(LogicalOperator::Merge(MergeOp {
+            variable: "n".to_string(),
+            labels: vec!["Item".to_string()],
+            match_properties: vec![(
+                "val".to_string(),
+                LogicalExpression::Property {
+                    variable: "n".to_string(), // self-reference inside the pattern: invalid
+                    property: "val".to_string(),
+                },
+            )],
+            on_create: vec![],
+            on_match: vec![],
+            input: Box::new(LogicalOperator::Empty),
+        }));
+
+        let mut binder = Binder::new();
+        let result = binder.bind(&plan);
+        assert!(
+            result.is_err(),
+            "match properties must not see the MERGE variable"
         );
     }
 
