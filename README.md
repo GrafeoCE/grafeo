@@ -16,7 +16,9 @@
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/jrgMD2Zj3)
 
-# Grafeo
+# Grafeo CE
+
+Grafeo CE is the community maintained version of Grafeo. It is intended as a temporary stop-gap measure to prevent the nascent Grafeo community diverging whilst the primary author of Grafeo is uncontactable. The goal is for everything here to make it's way back to Grafeo eventually.
 
 Grafeo is a graph database built in Rust from the ground up for speed and low memory use. It runs embedded as a library or as a standalone server, with in-memory or persistent storage and full ACID transactions.
 
