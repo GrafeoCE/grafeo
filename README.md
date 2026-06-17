@@ -18,7 +18,7 @@
 
 # Grafeo CE
 
-Grafeo CE is the community maintained version of Grafeo. It is intended as a temporary stop-gap measure to prevent the nascent Grafeo community diverging whilst the primary author of Grafeo is uncontactable. The goal is for everything here to make it's way back to Grafeo eventually.
+Grafeo CE is the community maintained version of Grafeo. It is intended as a temporary stop-gap measure to prevent the nascent Grafeo community diverging whilst the primary author of Grafeo is uncontactable. The goal is to merge everything back into Grafeo upon their return. 
 
 Grafeo is a graph database built in Rust from the ground up for speed and low memory use. It runs embedded as a library or as a standalone server, with in-memory or persistent storage and full ACID transactions.
 
